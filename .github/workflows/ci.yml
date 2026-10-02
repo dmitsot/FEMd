@@ -1,0 +1,65 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.os }}, Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: FFTW
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y libfftw3-dev
+          else brew install fftw; fi
+
+      - name: Build and install FEMd
+        run: python -m pip install -v .
+
+      - name: Import
+        run: python -c "import femd as fd; print('fftw', fd.has_fftw(), 'openmp', fd.has_openmp())"
+
+      - name: Run the example notebooks
+        env:
+          MPLBACKEND: Agg
+        run: |
+          python -m pip install matplotlib nbconvert ipykernel
+          for nb in examples/*.ipynb; do
+            echo "== $nb"
+            python -m jupyter nbconvert --to notebook --execute "$nb" --output-dir /tmp/nb --ExecutePreprocessor.timeout=1200
+          done
+
+  openmp:
+    name: ubuntu-latest, OpenMP
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build and install FEMd with OpenMP
+        run: python -m pip install -v . -C cmake.define.FEMD_OPENMP=ON
+      - name: Run the example notebooks with OpenMP
+        env:
+          MPLBACKEND: Agg
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          python -c "import femd as fd; assert fd.has_openmp()"
+          python -m pip install matplotlib nbconvert ipykernel
+          for nb in examples/*.ipynb; do
+            echo "== $nb"
+            python -m jupyter nbconvert --to notebook --execute "$nb" --output-dir /tmp/nb --ExecutePreprocessor.timeout=1200
+          done

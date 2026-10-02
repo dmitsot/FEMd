@@ -1,0 +1,29 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "femd"
+version = "0.1.0"
+description = "FEMd, a Finite Element Library: B-spline, Lagrange and DG elements in 1D; Lagrange, DG, Raviart-Thomas and Nedelec elements in 2D; forms, sparse solvers and time stepping"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [{name = "D. Mitsotakis"}]
+dependencies = ["numpy>=1.22", "scipy>=1.8"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+examples = ["matplotlib", "jupyter"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["python/femd"]
+cmake.define.FEMD_BUILD_PYTHON = "ON"
+cmake.define.FEMD_BUILD_TESTS = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+# importlib mode: the old tests (tests/python/old) and new ones may share file names
+addopts = "--import-mode=importlib"
