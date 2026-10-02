@@ -79,8 +79,6 @@ The notebooks in [`examples/`](examples) run as they are after installation.
 
 FEMd is released under the [MIT License](LICENSE).
 
-FFTW is not part of FEMd and is not distributed with it. It is licensed under the GNU GPL (version 2 or later). FEMd uses it only if you have it installed when you build. A build linked with FFTW is then covered by the GPL as a whole, which matters only if you redistribute that build. The MIT License of FEMd is compatible with this. Without FFTW everything works except the FFT solver backend.
-
 ## Author
 
 FEMd was designed and developed by D. Mitsotakis (Victoria University of Wellington). The Delaunay mesh generator was developed in collaboration with T. Katsaounis.
