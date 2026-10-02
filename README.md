@@ -65,6 +65,7 @@ The notebooks in [`examples/`](examples) run as they are after installation.
 | [example0](examples/example0.ipynb) | $-u'' + u = f$ with Dirichlet conditions, cubic splines, errors |
 | [example1](examples/example1.ipynb) | the same with a Dirichlet and a Neumann condition |
 | [example2](examples/example2.ipynb) | $-u'' + u^3 = f$ with Newton's method and Newton-Krylov |
+| [example3](examples/example3.ipynb) | the BBM equation, a solitary wave with periodic cubic splines, RK4 and a Gauss method |
 
 ## Documentation
 
