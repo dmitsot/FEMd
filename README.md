@@ -67,6 +67,7 @@ The notebooks in [`examples/`](examples) run as they are after installation.
 | [example2](examples/example2.ipynb) | $-u'' + u^3 = f$ with Newton's method and Newton-Krylov |
 | [example3](examples/example3.ipynb) | the BBM equation, a solitary wave with periodic cubic splines, RK4 and a Gauss method |
 | [example4](examples/example4.ipynb) | the Bona-Smith system, a solitary wave reflected by a wall ($\eta_x = 0$, $u = 0$), a system of two fields |
+| [example5](examples/example5.ipynb) | $-\Delta u + u = f$ in 2D on a square with a hole, $P_2$ elements, Dirichlet outside and free on the hole |
 
 ## Documentation
 
