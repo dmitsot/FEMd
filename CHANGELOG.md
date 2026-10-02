@@ -2,6 +2,11 @@
 
 Each version is in `include/femd/version.hpp`, and `fd.__version__` shows the installed one.
 
+## 0.1.1 (2026-10-03)
+
+- `SparseMatrix.ordering("rcm" | "amd" | "natural")`, `SparseMatrix.bandwidth(p)` and `SparseMatrix.permuted(p)`, so the C++ orderings are reachable without the internal module. `examples/example8.ipynb` uses them.
+- `examples/example3.ipynb` runs without FFTW, using the cyclic banded solver for $M$, and the OpenMP job of the GitHub build installs FFTW.
+
 ## 0.1.0 (2026-10-02)
 
 First public release, under the GNU General Public License, version 3 or later.

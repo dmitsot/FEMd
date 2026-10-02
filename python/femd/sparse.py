@@ -48,6 +48,8 @@ class SparseMatrix:
     A + B, A - B, a*A, A.T, A @ B arithmetic, sharing the pattern where the patterns agree
     .solver(backend)              SparseSolver: "superlu" (default), "cg", "gmres", "dense"
     .preconditioner(kind)         "jacobi", "ssor" or "ilu0", for fd.cg / fd.gmres
+    .ordering(kind)               a renumbering: "rcm" (narrow band), "amd" (little fill), "natural"
+    .bandwidth(p), .permuted(p)   the half-bandwidth in the order p, and P A P^T
     """
 
     def __init__(self, K: _C.CSRMatrix, space=None, row_space=None):
@@ -95,6 +97,49 @@ class SparseMatrix:
     def tocoo(self) -> sp.coo_matrix: return self.tocsr().tocoo()
     def toarray(self) -> np.ndarray: return self._K.dense()
     def diagonal(self) -> np.ndarray: return self._K.diagonal()
+
+    # ---- orderings -----------------------------------------------------------------
+    def ordering(self, kind: str = "rcm") -> np.ndarray:
+        """A renumbering of the unknowns, computed in C++ from the pattern of A (symmetrized).
+        p[k] is the unknown that becomes number k, so A.permuted(p) is P A P^T.
+
+        kind: "rcm"      reverse Cuthill-McKee, which gathers the entries in a narrow band
+              "amd"      approximate minimum degree, little fill in a Cholesky factor
+              "natural"  the identity, the numbering of the space"""
+        n = self._square("ordering")
+        k = str(kind).lower()
+        if k == "rcm":
+            return np.asarray(_C.rcm_order(self._K), dtype=np.int64)
+        if k == "amd":
+            return np.asarray(_C.amd_order(self._K), dtype=np.int64)
+        if k == "natural":
+            return np.arange(n, dtype=np.int64)
+        raise ValueError(f"ordering: kind is 'rcm', 'amd' or 'natural', got {kind!r}")
+
+    def bandwidth(self, p=None) -> int:
+        """The half-bandwidth max |i - j| over the stored entries, in the order p (the natural one
+        when p is None)."""
+        self._square("bandwidth")
+        return int(_C.bandwidth(self._K, [] if p is None else self._permutation(p).tolist()))
+
+    def permuted(self, p) -> "SparseMatrix":
+        """P A P^T, a new matrix whose row and column k are row and column p[k] of A.  It no longer
+        follows the numbering of a space, so .space is None."""
+        p = self._permutation(p)
+        return SparseMatrix.from_scipy(self.tocsr()[p][:, p], symmetric=self.symmetric)
+
+    def _square(self, what) -> int:
+        if self.shape[0] != self.shape[1]:
+            raise ValueError(f"{what}: the matrix must be square, it is {self.shape[0]} x {self.shape[1]}")
+        return self.shape[0]
+
+    def _permutation(self, p) -> np.ndarray:
+        n = self._square("permutation")
+        p = np.asarray(p)
+        if p.ndim != 1 or p.size != n or not np.issubdtype(p.dtype, np.integer) \
+                or not np.array_equal(np.sort(p), np.arange(n)):
+            raise ValueError(f"p must be a permutation of 0, ..., {n - 1}")
+        return p.astype(np.int64)
 
     # ---- products ------------------------------------------------------------------
     def matvec(self, x, out=None) -> np.ndarray:

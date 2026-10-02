@@ -107,6 +107,9 @@ one. Second derivatives are refused on the $C^0$ space.
 | `A + B`, `A - B`, `a * A`, `A / a`, `-A`, `A.T`, `A += B` | | `SparseMatrix` | Arithmetic, on the shared pattern when there is one. |
 | `is_symmetric(tol=1e-12)` | float | bool | Measured symmetry. |
 | `copy()` | none | `SparseMatrix` | A copy of the values (the pattern stays shared). |
+| `ordering(kind="rcm")` | `"rcm"`, `"amd"` or `"natural"` | int array `p` | A renumbering from the pattern (symmetrized), computed in C++. `p[k]` is the unknown that becomes number `k`. Reverse Cuthill-McKee gives a narrow band, approximate minimum degree little fill in a Cholesky factor. |
+| `bandwidth(p=None)` | permutation | int | The half-bandwidth $\max \lvert i - j \rvert$ over the stored entries, in the order `p` (natural when `None`). |
+| `permuted(p)` | permutation | `SparseMatrix` | $P A P^T$, row and column `k` being row and column `p[k]` of $A$. A new matrix with `space = None`. |
 | `solver(backend="auto", **options)` | str | `SparseSolver` | See [L.4](#l4-sparsesolver). |
 | `preconditioner(kind="ilu0", omega=1.0, ordering="rcm")` | str, float, str | `Preconditioner` | See [L.5](#l5-preconditionera-kindilu0-omega10-orderingrcm). |
 | `SparseMatrix.from_scipy(A, space=None, row_space=None, symmetric=None)` | scipy matrix | `SparseMatrix` | A copy into the store. |
