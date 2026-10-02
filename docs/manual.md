@@ -884,6 +884,16 @@ The pipeline is Bowyer-Watson for the initial Delaunay triangulation, midpoint s
 
 The arrays are views onto the C++ mesh that owns them, so they cost nothing to take and must not be written to; `.copy()` one if you want to edit it. Full argument list in [the API reference](reference/meshing-2d.md#j-2d-meshing).
 
+**Markers.** The outer boundary gets the marker `marker` (1 by default) and the holes `marker+1, marker+2, ...` in the order they are given, or the markers in `hole_markers=`. To give the edges of the outer polygon their own markers, list one per edge with `edge_markers=`, where edge $i$ joins vertex $i$ and vertex $i+1$ and the last edge closes the polygon. The holes then get the numbers after the largest edge marker:
+
+```python
+m = fd.triangulate([(-15, -6), (20, -6), (20, 6), (-15, 6)],     # bottom, right, top, left
+                   holes=[fd.circle(4, 0, 1.0, 48)],             # marker 5
+                   edge_markers=[1, 2, 3, 4], max_edge=0.3)
+```
+
+`np.unique(m.segment_markers)` lists the markers of a mesh, and `m.remark(rule)` changes them afterwards by a rule on the side midpoints.
+
 ### 10.1 Smoothing a mesh you already have
 
 `smooth(mesh, passes)` runs Laplacian smoothing on a mesh without retriangulating it. `triangulate(..., smooth=n)` does the same as its final step, so this is for when you want more passes than you asked for, or want to smooth a mesh that has been refined since.

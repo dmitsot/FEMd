@@ -229,7 +229,7 @@ def _as_ring(pts):
 
 
 def triangulate(boundary, holes=None, *, min_angle=20.0, max_area=None, max_edge=None,
-                smooth=0, marker=1, hole_markers=None, vertex_markers=None,
+                smooth=0, marker=1, hole_markers=None, vertex_markers=None, edge_markers=None,
                 interior_vertex=False, max_points=500_000, check=False):
     """
     Mesh a polygonal region with a quality-guaranteed Delaunay triangulation.
@@ -265,9 +265,18 @@ def triangulate(boundary, holes=None, *, min_angle=20.0, max_area=None, max_edge
         Marker for the outer boundary's vertices and segments.  0 is reserved
         for interior vertices, so boundary markers start at 1.
     hole_markers : sequence of int, optional
-        One marker per hole; defaults to 2, 3, 4, ...
+        One marker per hole; defaults to marker+1, marker+2, ..., or with
+        edge_markers to the numbers after the largest edge marker.
     vertex_markers : (n,) array_like of int, optional
         Per-vertex markers for the outer boundary, overriding ``marker``.
+        They mark the vertices only; the sides keep ``marker``.
+    edge_markers : (n,) array_like of int, optional
+        One marker per edge of the outer polygon, overriding ``marker``.  Edge i
+        joins boundary[i] and boundary[i+1] (the last joins the last vertex and
+        the first), in the order given.  Every boundary segment of the mesh on
+        that edge gets the marker, and the point markers follow the sides, a
+        boundary vertex taking the marker of the side leaving it counter-clockwise.
+        Not combined with ``vertex_markers``.
     interior_vertex : bool
         Require every triangle to have at least one vertex OFF the boundary.
 
@@ -297,6 +306,17 @@ def triangulate(boundary, holes=None, *, min_angle=20.0, max_area=None, max_edge
     """
     d = Domain()
     b = _as_ring(boundary)
+    em = None
+    if edge_markers is not None:
+        if vertex_markers is not None:
+            raise ValueError("give edge_markers or vertex_markers, not both: with edge_markers the "
+                             "vertex markers follow the sides")
+        em = np.asarray(edge_markers).ravel().astype(np.int64)
+        if em.shape[0] != b.shape[0]:
+            raise ValueError(f"edge_markers must have one entry per edge of the boundary ({b.shape[0]}; "
+                             f"edge i joins boundary[i] and boundary[i+1]), got {em.shape[0]}")
+        if np.any(em <= 0):
+            raise ValueError("edge_markers must be positive (0 is reserved for interior vertices)")
     vm = [] if vertex_markers is None else [int(v) for v in np.asarray(vertex_markers).ravel()]
     if vm and len(vm) != b.shape[0]:
         raise ValueError("vertex_markers must have one entry per boundary point")
@@ -304,7 +324,8 @@ def triangulate(boundary, holes=None, *, min_angle=20.0, max_area=None, max_edge
 
     holes = list(holes or [])
     if hole_markers is None:
-        hole_markers = [marker + 1 + i for i in range(len(holes))]
+        first = (int(em.max()) if em is not None else marker) + 1
+        hole_markers = [first + i for i in range(len(holes))]
     if len(hole_markers) != len(holes):
         raise ValueError("hole_markers must have one entry per hole")
     for h, hm in zip(holes, hole_markers):
@@ -312,7 +333,30 @@ def triangulate(boundary, holes=None, *, min_angle=20.0, max_area=None, max_edge
 
     core, report = _C.triangulate(d, float(min_angle), float(max_edge or 0.0), float(max_area or 0.0),
                                   int(smooth), int(max_points), bool(check), bool(interior_vertex))
-    return Mesh2D(core, report)
+    m = Mesh2D(core, report)
+    if em is not None:
+        m = _mark_outer_edges(m, b, em, int(marker))
+    return m
+
+
+def _mark_outer_edges(m, ring, em, marker):
+    """The mesh m with each boundary segment of the outer ring marked by the input edge it lies on."""
+    S = np.array(m.segments)
+    P = np.array(m.points)
+    old = np.array(m.segment_markers).astype(np.int64)
+    A, B = ring, np.roll(ring, -1, axis=0)
+    mid = 0.5 * (P[S[:, 0]] + P[S[:, 1]])
+    d = B - A                                                    # (n, 2)
+    L2 = np.maximum(np.einsum("ij,ij->i", d, d), np.finfo(float).tiny)
+    s = np.clip(np.einsum("kij,ij->ki", mid[:, None, :] - A[None], d) / L2, 0.0, 1.0)
+    dist = np.linalg.norm(mid[:, None, :] - (A[None] + s[..., None] * d[None]), axis=2)    # (k, n)
+    edge = np.argmin(dist, axis=1)
+    diag = np.linalg.norm(ring.max(axis=0) - ring.min(axis=0))
+    on_outer = (old == marker) & (dist[np.arange(S.shape[0]), edge] <= 1e-9 * diag)
+    new = np.where(on_outer, em[edge], old)
+    out = mesh_from_arrays(P, np.array(m.triangles), S, new)
+    out.report = dict(m.report)
+    return out
 
 
 def circle(cx, cy, r, n=32, clockwise=False):

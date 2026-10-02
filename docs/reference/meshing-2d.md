@@ -27,7 +27,7 @@ and refines, coarsens and smooths the result ([manual, Section 10](../manual.md#
 Every function that takes a mesh returns a **new** `Mesh2D` and leaves the one
 passed in untouched, since the arrays of a mesh are borrowed views.
 
-### J.1 `triangulate(boundary, holes=None, *, min_angle=20.0, max_area=None, max_edge=None, smooth=0, marker=1, hole_markers=None, vertex_markers=None, interior_vertex=False, max_points=500_000, check=False)`
+### J.1 `triangulate(boundary, holes=None, *, min_angle=20.0, max_area=None, max_edge=None, smooth=0, marker=1, hole_markers=None, vertex_markers=None, edge_markers=None, interior_vertex=False, max_points=500_000, check=False)`
 
 **Inputs**
 
@@ -40,8 +40,9 @@ passed in untouched, since the arrays of a mesh are borrowed views.
 | `max_edge` | float or `None` | `None` | Longest edge. `None` is unbounded. Independent of `max_area`. |
 | `smooth` | int | `0` | Laplacian smoothing passes after refinement, as `smooth()` with `restore_delaunay=True`, with the moves also kept within `max_area` and `max_edge` and a final refinement pass, so every bound still holds ([manual, Section 10.1](../manual.md#101-smoothing-a-mesh-you-already-have)). |
 | `marker` | int | `1` | Marker of the outer boundary's vertices and segments. `0` is reserved for interior vertices. |
-| `hole_markers` | sequence of int | `None` | One marker per hole, default `marker+1, marker+2, ...`. |
-| `vertex_markers` | `(n,)` array_like of int | `None` | One marker per outer-boundary vertex, overriding `marker`. Vertices inserted on a segment inherit the marker of the segment's ring. |
+| `hole_markers` | sequence of int | `None` | One marker per hole, default `marker+1, marker+2, ...`, or with `edge_markers` the numbers after the largest edge marker. |
+| `vertex_markers` | `(n,)` array_like of int | `None` | One marker per outer-boundary vertex, overriding `marker`. Vertices inserted on a segment inherit the marker of the segment's ring. The sides keep `marker`. |
+| `edge_markers` | `(n,)` array_like of int | `None` | One marker per edge of the outer polygon, overriding `marker`. Edge `i` joins `boundary[i]` and `boundary[i+1]`, the last one joins the last vertex and the first. Every side of the mesh on that edge gets the marker, and a boundary vertex takes the marker of the side leaving it counter-clockwise. Not combined with `vertex_markers`. |
 | `interior_vertex` | bool | `False` | Require every triangle to have a vertex off the boundary, so no element has all three vertices constrained. Halves the reachable `min_angle`. |
 | `max_points` | int | `500_000` | Vertex budget. Refinement stops with `RuntimeError` past it. |
 | `check` | bool | `False` | Run `Mesh2D.validate()` before returning and raise if it reports a fault. |
