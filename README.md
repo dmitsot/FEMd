@@ -2,7 +2,7 @@
 
 ![FEMd](docs/mascot/femd_logo.jpg)
 
-**Version 0.1.0** · [Changes](CHANGELOG.md) · [MIT License](LICENSE)
+**Version 0.1.0** · [Changes](CHANGELOG.md) · [License: GPL v3 or later](LICENSE)
 
 **FEMd** is a Finite Element Library for problems in one and two space dimensions. Its core is header-only C++17 and is used from Python. You give a domain, a polynomial degree and boundary conditions, write the equations in weak form, and FEMd assembles and solves them. The form language follows FEniCS, so FEniCS users will find the workflow familiar.
 
@@ -78,7 +78,9 @@ The notebooks in [`examples/`](examples) run as they are after installation.
 
 ## License
 
-FEMd is released under the [MIT License](LICENSE).
+Copyright (C) 2026 D. Mitsotakis.
+
+FEMd is free software: you can redistribute it and/or modify it under the terms of the [GNU General Public License](LICENSE) as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. FEMd is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY, without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 ## Author
 

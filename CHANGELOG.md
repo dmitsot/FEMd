@@ -4,7 +4,7 @@ Each version is in `include/femd/version.hpp`, and `fd.__version__` shows the in
 
 ## 0.1.0 (2026-10-02)
 
-First public release.
+First public release, under the GNU General Public License, version 3 or later.
 
 - 1D: B-spline, Lagrange and DG spaces with built-in Dirichlet, Neumann, clamped, periodic and Robin conditions, and banded, cyclic and FFT solvers.
 - 2D: Delaunay mesh generation with refinement and coarsening, structured meshes and Gmsh import. $P_k$ and $Q_k$ Lagrange elements, vector and mixed spaces, Raviart-Thomas, Nédélec and DG elements on triangles. Dirichlet, natural, periodic and slip conditions. VTK output.

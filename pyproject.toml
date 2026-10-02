@@ -9,6 +9,7 @@ description = "FEMd, a Finite Element Library: B-spline, Lagrange and DG element
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
+classifiers = ["License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)"]
 authors = [{name = "D. Mitsotakis"}]
 dependencies = ["numpy>=1.22", "scipy>=1.8"]
 
