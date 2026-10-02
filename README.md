@@ -71,6 +71,7 @@ The notebooks in [`examples/`](examples) run as they are after installation.
 | [example6](examples/example6.ipynb) | the BBM-BBM system in 2D, a solitary wave in a channel with a cylinder, $P_1$ for $\eta$ and $P_2$ for $u$ with slip walls |
 | [example7](examples/example7.ipynb) | the same problem with OpenMP, timing on 1, 2, 4, ... threads |
 | [example8](examples/example8.ipynb) | the matrix of $-\Delta u + u$ on a general triangulation reordered by reverse Cuthill-McKee, sparsity patterns, bandwidth and Cholesky fill against AMD |
+| [example9](examples/example9.ipynb) | a nonsymmetric system, convection-diffusion in a recirculating flow (double glazing), GMRES stagnating where LGMRES with ILU(0) converges |
 
 ## Documentation
 

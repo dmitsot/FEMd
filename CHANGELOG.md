@@ -2,6 +2,11 @@
 
 Each version is in `include/femd/version.hpp`, and `fd.__version__` shows the installed one.
 
+## Unreleased
+
+- `examples/example9.ipynb`, convection-diffusion in a recirculating flow, GMRES against LGMRES.
+- Fix: `fd.lgmres` returned NaN when `maxiter` ended the iteration in the middle of a restart cycle. It now returns the best iterate from the columns it formed.
+
 ## 0.1.1 (2026-10-03)
 
 - `SparseMatrix.ordering("rcm" | "amd" | "natural")`, `SparseMatrix.bandwidth(p)` and `SparseMatrix.permuted(p)`, so the C++ orderings are reachable without the internal module. `examples/example8.ipynb` uses them.

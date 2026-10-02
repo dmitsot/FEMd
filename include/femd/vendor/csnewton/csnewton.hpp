@@ -19,13 +19,13 @@
 //   https://link.springer.com/article/10.1007/s00211-025-01471-w
 
 // ---------------------------------------------------------------------------
-// VENDORED into Poseidon from the upstream repository
+// VENDORED into FEMd from the upstream repository
 //   Work/Github/Complex-step-Newton-method  (src/csnewton/csnewton.hpp)
-//   upstream commit b0f77b2.  License: MIT (D. Mitsotakis).
+//   upstream b0f77b2 plus the LGMRES fix of 2026-10-03.  License: MIT (D. Mitsotakis).
 // Verbatim copy, kept under namespace csnewton.  Make fixes UPSTREAM and
-// re-copy rather than editing here, so the two stay in sync.  Poseidon-side
-// glue (Poseidon matrices/solvers -> matvec/precon callables) lives in
-// poseidon/krylov/adapters.hpp, not in this file.
+// re-copy rather than editing here, so the two stay in sync.  FEMd-side
+// glue (FEMd matrices/solvers -> matvec/precon callables) lives in
+// femd/krylov/adapters.hpp, not in this file.
 // ---------------------------------------------------------------------------
 
 #pragma once
@@ -350,6 +350,7 @@ lgmres(Operator&& matvec, Precond&& precon,
         s[0] = Scalar(beta);
 
         int  final_j   = m - 1;
+        int  built     = 0;      // columns of H actually formed this cycle
         bool converged = false;
 
         // ---- Phase 1: standard Arnoldi (inner steps) -------------------------
@@ -375,9 +376,10 @@ lgmres(Operator&& matvec, Precond&& precon,
             generate_givens(H[j + j*ldh], H[(j+1) + j*ldh], cs[j], sn[j]);
             apply_givens(H[j + j*ldh], H[(j+1) + j*ldh], cs[j], sn[j]);
             apply_givens(s[j], s[j + 1], cs[j], sn[j]);
+            built = j + 1;
 
             if (std::abs(s[j + 1]) / normb < tol || h_next == R(0)) {
-                final_j = j; converged = true; break;
+                final_j = j; converged = true; ++total_iters; break;
             }
         }
 
@@ -408,12 +410,17 @@ lgmres(Operator&& matvec, Precond&& precon,
                 generate_givens(H[j + j*ldh], H[(j+1) + j*ldh], cs[j], sn[j]);
                 apply_givens(H[j + j*ldh], H[(j+1) + j*ldh], cs[j], sn[j]);
                 apply_givens(s[j], s[j + 1], cs[j], sn[j]);
+                built = j + 1;
 
                 if (std::abs(s[j + 1]) / normb < tol || h_next == R(0)) {
-                    final_j = j; converged = true; break;
+                    final_j = j; converged = true; ++total_iters; break;
                 }
             }
         }
+
+        // A cycle cut short by max_iter has fewer than m columns: solve with those
+        // only, since the unformed ones have a zero diagonal.
+        if (!converged) final_j = built - 1;
 
         // ---- Solve upper triangular system for y -----------------------------
         std::vector<Scalar> y(s.begin(), s.begin() + final_j + 1);
