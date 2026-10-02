@@ -389,6 +389,7 @@ A = a.assemble(); A.symmetric = True                # the assembler cannot see b
 sol = A.solver().solve(L.assemble())                # a ProductFunction
 c1, c2 = sol.split()                                # per-field Functions
 W_ = fd.Functions(P)                                 # a known field on P, one global vector
+W_.project([f1, f2])                                 # set it field by field, L2 projection (or interpolate)
 (w1, w2) = W_                                        # its components for forms
 ```
 

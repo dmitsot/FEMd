@@ -1039,19 +1039,31 @@ class ProductFunction:
         return self
 
     def project(self, f, degree=None):
-        """L2 projection of per-block data onto the space (2D systems, see ProductSpace2D.project).
-        Returns self."""
-        if not hasattr(self.product, "project"):
-            raise TypeError("project(): the space of this ProductFunction has no project()")
-        self.vector[:] = self.product.project(f, degree)
+        """L2 projection of per-field data onto the space, one entry per field (per block on a 2D
+        system, see ProductSpace2D.project).  In 1D each entry is anything Function.project takes,
+        an expression in fd.x or a callable, or None for zero; degree is then the number of Gauss
+        points (npts).  Returns self."""
+        if hasattr(self.product, "project"):
+            self.vector[:] = self.product.project(f, degree)
+        else:
+            self.vector[:] = self._per_field(f, lambda g, V: Function(V, "_", None, _infer=False).project(g, degree))
         return self
 
     def interpolate(self, f):
-        """Nodal interpolation of per-block data (2D systems).  Returns self."""
-        if not hasattr(self.product, "interpolate"):
-            raise TypeError("interpolate(): the space of this ProductFunction has no interpolate()")
-        self.vector[:] = self.product.interpolate(f)
+        """Nodal interpolation of per-field data (per block on a 2D system), one entry per field,
+        None for zero.  Returns self."""
+        if hasattr(self.product, "interpolate"):
+            self.vector[:] = self.product.interpolate(f)
+        else:
+            self.vector[:] = self._per_field(f, lambda g, V: Function(V, "_", None, _infer=False).interpolate(g))
         return self
+
+    def _per_field(self, f, make):
+        fields = self.product.fields
+        if not isinstance(f, (list, tuple)) or len(f) != len(fields):
+            raise ValueError(f"expected a list with one entry per field ({len(fields)}), got {f!r}")
+        return self.product.gather([np.zeros(V.dim) if g is None else make(g, V).vector
+                                    for g, V in zip(f, fields)])
 
     def copy(self, name=None):
         return _product_function(self.product, name or self.name, self.vector.copy())

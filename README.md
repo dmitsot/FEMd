@@ -15,7 +15,7 @@
 You need a C++17 compiler, Python 3.10 or later, NumPy and SciPy. Matplotlib is optional and is used by the plots and the examples.
 
 ```bash
-git clone <repository URL>      # or Code > Download ZIP
+git clone https://github.com/dmitsot/FEMd      # or Code > Download ZIP
 cd FEMd
 pip install .
 ```
@@ -66,6 +66,7 @@ The notebooks in [`examples/`](examples) run as they are after installation.
 | [example1](examples/example1.ipynb) | the same with a Dirichlet and a Neumann condition |
 | [example2](examples/example2.ipynb) | $-u'' + u^3 = f$ with Newton's method and Newton-Krylov |
 | [example3](examples/example3.ipynb) | the BBM equation, a solitary wave with periodic cubic splines, RK4 and a Gauss method |
+| [example4](examples/example4.ipynb) | the Bona-Smith system, a solitary wave reflected by a wall ($\eta_x = 0$, $u = 0$), a system of two fields |
 
 ## Documentation
 

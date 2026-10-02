@@ -86,6 +86,7 @@ A known field on a `ProductSpace`. Build it with `Functions`.
 | `U[i]` | `i` int | symbol | Component `i`. |
 | `split()` | none | tuple of `Function` | One Function per field, copies of the current coefficients, named `name[i]`. |
 | `assign(other)` | `other` an array or `ProductFunction` of length `P.dim` | `self` | Overwrites the global vector. |
+| `project(f, degree=None)`, `interpolate(f)` | `f` a list with one entry per field, each an expression in `fd.x`, a callable or `None` (zero). `degree` the number of Gauss points | `self` | Sets each field by $L^2$ projection or interpolation in its own space. |
 
 ### C.3 `mixed_mass(W, V)`
 
