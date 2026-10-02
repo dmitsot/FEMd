@@ -1,6 +1,4 @@
-# FEMd 2026.1 manual
-
-![FEMd](mascot/femd_logo.jpg)
+# FEMd 0.1.0 manual
 
 FEMd is a Finite Element Library for problems in one and two space dimensions. Its core is header-only C++17 and is used from Python through bindings. The user provides a domain, a polynomial degree and boundary conditions, writes the equations in weak form using inner products, and FEMd does the rest. The design follows the FEniCS project, so users familiar with FEniCS will find the form language and the workflow familiar.
 
@@ -29,6 +27,8 @@ pip install .                      # builds the C++ extension, installs `femd`
 ```
 
 Run `pip install .` again after changing anything under `include/`, `python/src/` or `python/femd/`. Editing your own scripts or the examples needs nothing. `pip` installs into the Python it belongs to, so run it from the environment your notebook kernel uses, then restart the kernel.
+
+`fd.__version__` gives the installed version, for example `python -c "import femd; print(femd.__version__)"`. The C++ header `femd/version.hpp` has the same number as `FEMD_VERSION`, and [CHANGELOG.md](../CHANGELOG.md) lists what changed in each version.
 
 ### 1.1 OpenMP
 

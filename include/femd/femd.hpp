@@ -1,6 +1,8 @@
 //  femd.hpp -- umbrella header for the core (no FFTW).
 #ifndef FEMD_FEMD_HPP
 #define FEMD_FEMD_HPP
+
+#include "femd/version.hpp"
 #include "femd/mesh/mesh1d.hpp"
 #include "femd/mesh/predicates.hpp"
 #include "femd/mesh/mesh2d.hpp"

@@ -246,6 +246,7 @@ void bind_2d(nb::module_ &m);     // femd_bindings_2d.cpp
 NB_MODULE(_femd, m)
 {
     m.doc() = "FEMd core bindings";
+    m.attr("__version__") = FEMD_VERSION;
     // Spaces keep Python objects in their __dict__ (boundary data given as callables, caches), so
     // a script's globals and its spaces can form reference cycles that the interpreter breaks only
     // after nanobind has checked for leaks at exit.  Those objects are collected normally while the

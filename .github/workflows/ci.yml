@@ -30,7 +30,8 @@ jobs:
         run: python -m pip install -v .
 
       - name: Import
-        run: python -c "import femd as fd; print('fftw', fd.has_fftw(), 'openmp', fd.has_openmp())"
+        run: |
+          python -c "import femd as fd, importlib.metadata as m; assert fd.__version__ == m.version('femd'); print('femd', fd.__version__, 'fftw', fd.has_fftw(), 'openmp', fd.has_openmp())"
 
       - name: Run the example notebooks
         env:
@@ -63,3 +64,23 @@ jobs:
             echo "== $nb"
             python -m jupyter nbconvert --to notebook --execute "$nb" --output-dir /tmp/nb --ExecutePreprocessor.timeout=1200
           done
+
+  # Pushing a tag such as v0.1.0 makes a GitHub release with the CHANGELOG entry, once the builds pass.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, openmp]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag against the version and take the notes from CHANGELOG.md
+        run: |
+          V=$(sed -n 's/^#define FEMD_VERSION "\(.*\)"/\1/p' include/femd/version.hpp)
+          test "v$V" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, but version.hpp says $V"; exit 1; }
+          awk -v v="## $V " 'index($0, v) == 1 {f = 1; next} /^## / {f = 0} f' CHANGELOG.md > notes.md
+          cat notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: FEMd ${{ github.ref_name }}
+          body_path: notes.md

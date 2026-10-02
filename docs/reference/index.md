@@ -35,7 +35,7 @@ method.
 | F | [Linear solvers](linalg.md#f-linear-solvers) | `LinearSolver`, `Solver`, `solve`, `gmres`, `lgmres`, `KrylovInfo`, `eigs`, `EigenResult` |
 | G | [Nonlinear solvers and time stepping](time-stepping.md#g-nonlinear-solvers-and-time-stepping) | `newton`, `NewtonInfo`, `newton_system`, `csnewton`, `CSNewtonInfo`, `IRK`, `butcher` |
 | H | [Low-level assembly](forms.md#h-low-level-assembly) | `QuadratureCache`, `assemble`, `assemble_vector`, `assemble_block_vector`, `assemble_scalar` |
-| I | [Build and threading](build-cpp.md#i-build-and-threading) | `has_fftw`, `has_openmp`, `set_num_threads`, `get_num_threads`, `omp_threshold` |
+| I | [Build and threading](build-cpp.md#i-build-and-threading) | `__version__`, `has_fftw`, `has_openmp`, `set_num_threads`, `get_num_threads`, `omp_threshold` |
 | J | [2D meshing](meshing-2d.md#j-2d-meshing) | `triangulate`, `circle`, `Mesh2D`, `smooth`, `restore_delaunay`, `split_triangles`, `bisect_triangles`, `refine_triangles`, `Domain`, `orient2d`, `incircle` |
 | K | [C++ core](build-cpp.md#k-c-core) | the header-only library underneath |
 | L | [Finite elements on triangles and quadrilaterals](elements-2d.md#l-finite-elements-on-triangles) | `LagrangeSpace` on a `Mesh2D` or `QuadMesh`, `LagrangeSpace2D`, `LagrangeSpaceQ`, `QuadMesh`, `quadrangulate`, `VectorFunctionSpace`, `ProductSpace2D`, `grad`, `div`, `dot`, `Dx`, `FacetNormal`, `ds(marker)`, `SparseMatrix`, `SparseSolver`, `Preconditioner`, `cg`, `write_vtk`, `VTKSeries`, `read_gmsh`, `RTSpace`, `N1curlSpace`, `DGSpace2D`, `VectorElementFunction`, `curl` |

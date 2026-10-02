@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "femd"
-version = "0.1.0"
+dynamic = ["version"]
 description = "FEMd, a Finite Element Library: B-spline, Lagrange and DG elements in 1D; Lagrange, DG, Raviart-Thomas and Nedelec elements in 2D; forms, sparse solvers and time stepping"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,6 +22,11 @@ build-dir = "build/{wheel_tag}"
 wheel.packages = ["python/femd"]
 cmake.define.FEMD_BUILD_PYTHON = "ON"
 cmake.define.FEMD_BUILD_TESTS = "OFF"
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "include/femd/version.hpp"
+regex = '#define FEMD_VERSION "(?P<value>[^"]+)"'
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

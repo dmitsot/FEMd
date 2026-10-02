@@ -43,7 +43,7 @@ __all__ = [
     "sign", "max_value", "min_value", "VertexLimiter",
 ]
 
-__version__ = "0.1.0"
+__version__ = _C.__version__     # from include/femd/version.hpp, as is the package metadata
 
 # The package is split into modules; everything public is re-exported here, so
 # `import femd as fd` sees one flat namespace, as it always has.
