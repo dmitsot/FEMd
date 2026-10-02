@@ -36,7 +36,7 @@ Solves $R(u; v) = 0$ for every test function $v$ (manual, Sections [7.2](../manu
 | `maxiter` | int | `50` | Newton iterations. |
 | `line_search` | bool | `True` | Armijo backtracking by halving. `False` takes full steps. |
 | `linear` | str | `"direct"` | `"direct"` (banded or cyclic factorization), `"gmres"` or `"lgmres"`. |
-| `jv` | str | `"assembled"` | Jacobian-vector product for the Krylov modes: `"assembled"`, `"exact"` (matrix-free action of `R.derivative(u)`), `"complex-step"` ($J v = \operatorname{Im} R(u + i h v)/h$, one complex residual per product, exact to rounding) or `"fd"`. Must be `"assembled"` with `linear="direct"`. `linear="gmres"`, `jv="complex-step"` and `precond=None` together are the complex-step Newton-Krylov method, with no Jacobian matrix formed. |
+| `jv` | str | `"assembled"` | Jacobian-vector product for the Krylov modes: `"assembled"`, `"exact"` (matrix-free action of `R.derivative(u)`), `"complex-step"` ($J v = \mathrm{Im}\, R(u + i h v)/h$, one complex residual per product, exact to rounding) or `"fd"`. Must be `"assembled"` with `linear="direct"`. `linear="gmres"`, `jv="complex-step"` and `precond=None` together are the complex-step Newton-Krylov method, with no Jacobian matrix formed. |
 | `precond` | str, `None`, `LinearSolver`, `Matrix` or callable | `"frozen"` | Left preconditioner for the Krylov modes: `"frozen"` (Jacobian at the first iterate, refactored when the iteration count grows), `"linear"` (the constant-coefficient part, factored once), `"jacobian"` (every step), `None`, or an operator. `"frozen"`, `"linear"` and `"jacobian"` assemble (part of) the Jacobian; `None` does not. |
 | `backend` | `Solver` or name | `"Auto"` | Direct solver backend, for the Newton systems and the preconditioner. |
 | `krylov_tol` | float | `1e-8` | Preconditioned relative tolerance of each Krylov solve. |
@@ -121,7 +121,7 @@ Newton's method for $F(x) = 0$, with the same line search and stopping test as
 ### G.4 `csnewton(F, x0, M=None, *, tol=1e-10, maxiter=50, h=1e-20, restart=20, krylov_maxiter=200, krylov_tol=1e-6, method="gmres", k_aug=2, warn=True)`
 
 The vendored complex-step Newton-Krylov solver. Each step solves $J s = F$ by
-GMRES or LGMRES with $J v = \operatorname{Im} F(x + ihv)/h$. For a residual form
+GMRES or LGMRES with $J v = \mathrm{Im}\, F(x + ihv)/h$. For a residual form
 use `newton`.
 
 **Inputs**

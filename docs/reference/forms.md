@@ -79,7 +79,7 @@ rules, so `D(w*w)` expands to `D(w)*w + w*D(w)` and `D(fd.sin(w))` to
 and `max_value(a, b)`, `min_value(a, b)`, written as $(a + b \pm |a - b|)/2$.
 
 Each is differentiated symbolically (for `D`, `Dx`, `grad` and the Jacobians), with
-$\operatorname{sech}' = -\operatorname{sech}\,\tanh$ and $|z|' = \operatorname{sign} z$ (so numerical
+$\mathrm{sech}' = -\mathrm{sech}\,\tanh$ and $|z|' = \mathrm{sign}\, z$ (so numerical
 fluxes with `abs` and `max_value` have Jacobians). `sech` is evaluated as
 $2e^{-|z|}/(1 + e^{-2|z|})$, which does not overflow for large arguments, so a
 solitary wave such as `A * fd.sech(k * (fd.x - x0))**2` can be written directly

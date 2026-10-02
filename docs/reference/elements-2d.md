@@ -132,7 +132,7 @@ of its unconstrained companion with `lift=`, as `LinearSolver.solve` does
 
 | kind | $M$ |
 |---|---|
-| `"jacobi"` | $\operatorname{diag}(A)$ |
+| `"jacobi"` | $\mathrm{diag}(A)$ |
 | `"ssor"` | $\frac{\omega}{2-\omega}(D/\omega + L)(D/\omega)^{-1}(D/\omega + U)$, $0 < \omega < 2$ |
 | `"ilu0"` | $LU$ on the pattern of $A$ with no fill |
 
