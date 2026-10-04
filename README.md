@@ -72,6 +72,7 @@ The notebooks in [`examples/`](examples) run as they are after installation.
 | [example7](examples/example7.ipynb) | the same problem with OpenMP, timing on 1, 2, 4, ... threads |
 | [example8](examples/example8.ipynb) | the matrix of $-\Delta u + u$ on a general triangulation reordered by reverse Cuthill-McKee, sparsity patterns, bandwidth and Cholesky fill against AMD |
 | [example9](examples/example9.ipynb) | a nonsymmetric system, convection-diffusion in a recirculating flow (double glazing), GMRES stagnating where LGMRES with ILU(0) converges |
+| [example10](examples/example10.ipynb) | solitary waves of the Whitham equation, a nonlocal Fourier multiplier with a dense Jacobian, complex-step Newton-Krylov (`fd.csnewton`) against Newton with the dense Jacobian |
 
 ## Documentation
 

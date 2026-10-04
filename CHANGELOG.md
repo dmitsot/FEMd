@@ -5,6 +5,7 @@ Each version is in `include/femd/version.hpp`, and `fd.__version__` shows the in
 ## Unreleased
 
 - `examples/example9.ipynb`, convection-diffusion in a recirculating flow, GMRES against LGMRES.
+- `examples/example10.ipynb`, solitary waves of the Whitham equation, complex-step Newton-Krylov against Newton with a dense Jacobian.
 - Fix: `fd.lgmres` returned NaN when `maxiter` ended the iteration in the middle of a restart cycle. It now returns the best iterate from the columns it formed.
 
 ## 0.1.1 (2026-10-03)
