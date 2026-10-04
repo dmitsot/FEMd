@@ -677,7 +677,8 @@ class _Data2D:
             return any(cls._timedep(v) for v in g.values())
         if isinstance(g, (list, tuple)):
             return any(cls._timedep(v) for v in g)
-        return callable(g) and _arity(g) in (1, 3)
+        from .forms import Expr
+        return callable(g) and not isinstance(g, Expr) and _arity(g) in (1, 3)
 
     @classmethod
     def _at(cls, g, t, rate):
@@ -688,7 +689,8 @@ class _Data2D:
             return type(g)(cls._at(v, t, rate) for v in g)
         if g is None:
             return None
-        if not callable(g):
+        from .forms import Expr
+        if not callable(g) or isinstance(g, Expr):
             return 0.0 if rate else g
         n = _arity(g)
         if n == 3:

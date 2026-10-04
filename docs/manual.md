@@ -1,4 +1,4 @@
-# FEMd 0.1.1 manual
+# FEMd 0.1.2 manual
 
 FEMd is a Finite Element Library for problems in one and two space dimensions. Its core is header-only C++17 and is used from Python through bindings. The user provides a domain, a polynomial degree and boundary conditions, writes the equations in weak form using inner products, and FEMd does the rest. The design follows the FEniCS project, so users familiar with FEniCS will find the form language and the workflow familiar.
 
@@ -767,6 +767,26 @@ Each method is a convex combination of forward Euler steps. A property forward E
 
 For Burgers with $\sin(2\pi x)$ on 100 elements and $M = 50$: before the shock the limited and unlimited solutions are identical (errors $2.5\cdot 10^{-3}$, $1.4\cdot 10^{-4}$, $4.3\cdot 10^{-6}$ for $p = 1, 2, 3$), and after it the solution stays in $\left[-0.96, 0.96\right]$ for every degree with the mass conserved to round-off. The Lobatto basis gives the same numbers.
 
+**`fd.SlopeLimiter(V, limiter, reconstruction)`** gives a DG space the reconstructions of finite volume schemes. On every element the mean $W_j$ is kept, the slope is replaced by a limited slope $S_j$ of the means and the higher modes are dropped, so the end values are the reconstructed interface values $W_j + \tfrac12 S_j$ and $W_j - \tfrac12 S_j$. Each of the four limiters works with either reconstruction.
+
+- **TVD2** applies the limiter to the differences of the means, $S_j = \phi(r_j)\, d_{j+1/2} W$ with $r_j = d_{j-1/2} W / d_{j+1/2} W$ and $d_{j+1/2} W = W_{j+1} - W_j$.
+- **UNO2** applies it to the differences corrected by the second differences, $S_j = \phi(r_j)\, S_j^+$ with $r_j = S_j^- / S_j^+$, $S_j^\pm = d_{j\pm1/2} W \mp \tfrac12 D_{j\pm1/2} W$, $D_{j+1/2} W = m(D_j W, D_{j+1} W)$, $D_j W = W_{j+1} - 2W_j + W_{j-1}$ and $m$ the minmod function. With minmod this is $S_j = m(S_j^+, S_j^-)$, the reconstruction of Harten and Osher.
+
+| `limiter` | | $\phi(r)$ |
+|---|---|---|
+| `"minmod"` | minmod | $\max\left(0, \min(1, r)\right)$ |
+| `"vanleer"` | Van Leer | $(r + \lvert r\rvert)/(1 + \lvert r\rvert)$ |
+| `"mc"` | monotonized central | $\max\left(0, \min\left((1 + r)/2, 2, 2r\right)\right)$ |
+| `"vanalbada"` | Van Albada | $(r + r^2)/(1 + r^2)$ |
+
+On a nonuniform grid the same formulas are used with divided differences. With elements of degree 1 and the default `troubled="all"`, the means evolve exactly as the cell averages of a finite volume scheme to round-off. So TVD2 is first order at smooth extrema and UNO2 second order. For $u_t + u_x = 0$ with $\sin 2\pi x$ on 40 to 320 elements, the maximum error decreases at a rate between 1 and 1.6 with TVD2 and at the rate 2 with UNO2, for every limiter.
+
+```python
+lim = fd.SlopeLimiter(V, "vanalbada", "uno2")             # every element, as in the finite volume scheme
+lim = fd.SlopeLimiter(V, "mc", troubled="tvb", M=50.0)    # TVD2, only on the elements the TVB test flags
+rk = fd.SSPRK(fd.form(u*v*dx), R, dt, order=3, limiter=lim)
+```
+
 ### 7.9 Classical explicit Runge-Kutta
 
 **`fd.ERK(M, rhs, dt, method="rk4")`** advances $M u' = f(t, u)$ by an explicit Runge-Kutta method, for problems that are not stiff. It takes `M` and `rhs` exactly as `fd.IRK` does, but needs no Jacobian and no Newton iteration. Each stage is one evaluation of $f$ and one solve with $M$, factored once. The stage loop runs in C++ (`include/femd/timestep/explicit_rk.hpp`).
@@ -1107,10 +1127,11 @@ Data are carried by a lift, a Function of `V.unconstrained` that holds the bound
 ```python
 ug = V.lift(0.5)                             # the same value on every Dirichlet side
 ug = V.lift(lambda x, y: x * y)              # g(x, y), vectorized over arrays
+ug = V.lift(fd.x * fd.y)                     # the same, as an expression in fd.x and fd.y
 ug = V.lift({1: 0.0, 3: g3})                 # per marker, sides left out get zero data
 ```
 
-Data given with the space, `dirichlet={marker: data}` or `data=` (anything `V.lift` takes), are used by every `fd.solve`, `fd.newton` and `fd.IRK` on the space and by `V.lift()`. Data given to a call, `fd.solve(a, L, dirichlet=...)`, apply to that call only and replace them. A callable $g(x, y, t)$ or $g(t)$ is data in time for `fd.IRK`.
+Data given with the space, `dirichlet={marker: data}` or `data=` (anything `V.lift` takes), are used by every `fd.solve`, `fd.newton` and `fd.IRK` on the space and by `V.lift()`. Data given to a call, `fd.solve(a, L, dirichlet=...)`, apply to that call only and replace them. A callable $g(x, y, t)$ or $g(t)$ is data in time for `fd.IRK`. An expression in `fd.x`, `fd.y`, numbers and Constants, such as the inflow profile `(4*y*(1 - y), 0.0)` of a vector block, is data constant in time, and `V.interpolate` takes one too.
 
 The solution of $a(u, v) = L(v)$ with this data is $u = u_0 + u_g$ with $u_0$ in $V$ solving $a(u_0, v) = L(v) - a(u_g, v)$, exactly as in [Section 4.1](#41-lifting-step-by-step). `fd.solve(a, L, dirichlet=...)` does those steps and returns a Function of `V.unconstrained`. Without `dirichlet=` it returns a Function of `V` with homogeneous data. Where two sides with different data meet, the corner takes the data of the larger marker.
 

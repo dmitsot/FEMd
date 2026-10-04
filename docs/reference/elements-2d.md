@@ -61,9 +61,9 @@ match node for node.
 | `node_coordinates()` | none | `(raw_dim, 2)` array | Coordinates of every node. |
 | `boundary_nodes(marker=None)` | marker(s) | int array | Raw indices of the nodes on those sides (every exterior side for `None`). |
 | `prolongate(c)`, `restrict(raw)` | array or Function | array | Adapted to raw (zeros on eliminated nodes) and back. |
-| `interpolate(f)` | callable `f(x, y)` or values | array | Nodal interpolant. |
+| `interpolate(f)` | callable `f(x, y)`, an expression in `fd.x` and `fd.y`, or values | array | Nodal interpolant. |
 | `project(f, degree=None)` | callable, number or expression | array | $L^2$ projection onto `V`. |
-| `lift(g)` | number, callable or `{marker: data}` | Function of `unconstrained` | Dirichlet data on the eliminated nodes. |
+| `lift(g)` | number, callable `g(x, y)`, expression in `fd.x`, `fd.y` and Constants, or `{marker: data}` | Function of `unconstrained` | Dirichlet data on the eliminated nodes. |
 | `evaluate(c, x, y=None, deriv=0)` | coefficients, points | array | Values or `deriv="x"` / `"y"` derivatives, NaN outside. |
 | `mass_matrix(lumped=False)` | bool | `SparseMatrix` | $\int u v$. With `lumped=True` a diagonal matrix: the tensor Gauss-Lobatto rule at the nodes of $Q_k$ with `nodes="lobatto"`, the row sums otherwise. Raises `ValueError` when a row sum is not positive ($P_k$ triangles from $k = 2$). |
 | `cache(degree=None, rule="gauss", npts=None)`, `boundary_cache(degree=None, marker=None)` | int, marker(s) | `Cache2D` | Quadrature points on the cells or the sides. `rule="lobatto"` (quadrilaterals only) gives the tensor Gauss-Lobatto rule with `npts` points per direction, default $k+1$. |

@@ -19,12 +19,16 @@ and every higher mode is dropped; the mean is untouched, so the limiter conserve
 M = 0 is the plain minmod limiter (TVDM), which also flattens smooth extrema and costs an
 order of accuracy there; M of the size of |u''| near the extrema keeps full order.
 At the ends of a non-periodic space the missing difference is left out of the minmod.
+
+fd.SlopeLimiter(V, limiter, reconstruction) replaces the slope by a finite volume slope of the cell
+means instead: the limiters minmod, Van Leer, monotonized central and Van Albada, each with the TVD2
+or the UNO2 reconstruction, as in Dutykh, Katsaounis and Mitsotakis (J. Comput. Phys. 230, 2011).
 """
 from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["TVBLimiter", "VertexLimiter", "minmod"]
+__all__ = ["TVBLimiter", "SlopeLimiter", "limited_slope", "VertexLimiter", "minmod"]
 
 
 def minmod(*args):
@@ -146,6 +150,171 @@ class TVBLimiter:
 
     def __repr__(self):
         return f"TVBLimiter(M={self.M:g}, on {self.V!r})"
+
+
+# ============================================================================ 1D: finite volume slope limiters (TVD2, UNO2)
+
+_LIMITERS = {"minmod": "minmod", "mm": "minmod",
+             "vanleer": "vanleer", "van leer": "vanleer", "vl": "vanleer",
+             "mc": "mc", "monotonized central": "mc",
+             "vanalbada": "vanalbada", "van albada": "vanalbada", "va": "vanalbada"}
+_RECONSTRUCTIONS = ("tvd2", "uno2")
+
+
+def _phi_slope(limiter, a, b):
+    """phi(a/b) b, the limiter applied to a left difference a and a right difference b, elementwise."""
+    if limiter == "minmod":                    # phi(r) = max(0, min(1, r))
+        return minmod(a, b)
+    if limiter == "mc":                        # phi(r) = max(0, min((1 + r)/2, 2, 2r))
+        return minmod(2.0 * a, 0.5 * (a + b), 2.0 * b)
+    if limiter == "vanleer":                   # phi(r) = (r + |r|)/(1 + |r|)
+        den = np.abs(a) + np.abs(b)
+        return np.where(den > 0, (a * np.abs(b) + np.abs(a) * b) / np.where(den > 0, den, 1.0), 0.0)
+    den = a * a + b * b                        # vanalbada: phi(r) = (r + r^2)/(1 + r^2), as in DKM (2011)
+    return np.where(den > 0, a * b * (a + b) / np.where(den > 0, den, 1.0), 0.0)
+
+
+def limited_slope(limiter, sm, sp, reconstruction="tvd2", Dm=None, D0=None, Dp=None, dm=None, dp=None):
+    """The limited slope of one cell, elementwise, from its left and right slopes sm, sp (divided
+    differences of the means). limiter: "minmod", "vanleer", "mc" or "vanalbada".
+
+    reconstruction="tvd2":  S = phi(r) sp with r = sm/sp.
+    reconstruction="uno2":  S = phi(r) S+ with r = S-/S+, where S+- = s+- -+ (d+-/2) m(D_j, D_{j+-1})
+                            are the slopes corrected by the second divided differences Dm, D0, Dp of
+                            the cells j-1, j, j+1, and dm, dp the distances from the center of cell j
+                            to its neighbors'. With minmod this is UNO2 of Harten and Osher."""
+    key = _LIMITERS[str(limiter).lower()]
+    sm, sp = np.asarray(sm, dtype=np.float64), np.asarray(sp, dtype=np.float64)
+    if reconstruction == "tvd2":
+        return _phi_slope(key, sm, sp)
+    if reconstruction != "uno2":
+        raise ValueError("limited_slope: reconstruction must be 'tvd2' or 'uno2'")
+    Splus = sp - 0.5 * dp * minmod(D0, Dp)
+    Sminus = sm + 0.5 * dm * minmod(Dm, D0)
+    return _phi_slope(key, Sminus, Splus)
+
+
+class _SlopeFieldLimiter(_FieldLimiter):
+    """A finite volume slope limiter on one DGSpace."""
+
+    def __init__(self, V, limiter, reconstruction, M, troubled):
+        super().__init__(V, M)
+        self.limiter, self.reconstruction, self.troubled_rule = limiter, reconstruction, troubled
+        grid = np.asarray(V.grid, dtype=np.float64)
+        self.h = np.diff(grid)
+        h = self.h
+        if self.periodic:
+            self.dp = 0.5 * (h + np.roll(h, -1))     # center of cell j to center of cell j+1
+            self.dm = 0.5 * (h + np.roll(h, 1))
+        else:
+            self.dp, self.dm = np.empty_like(h), np.empty_like(h)
+            self.dp[:-1] = self.dm[1:] = 0.5 * (h[:-1] + h[1:])
+            self.dp[-1], self.dm[0] = self.dm[-1], self.dp[0]
+
+    def limit(self, c):
+        p, ne = self.p, self.ne
+        C = np.asarray(c, dtype=np.float64).reshape(ne, p + 1)
+        C = C @ self.to_modal.T if self.to_modal is not None else C.copy()
+        if p == 0 or ne < 2:
+            return (C @ self.to_nodal.T if self.to_nodal is not None else C).ravel(), 0
+        mean = C[:, 0]
+        if self.periodic:
+            Dp_, Dm_ = np.roll(mean, -1) - mean, mean - np.roll(mean, 1)
+        else:
+            Dp_, Dm_ = np.empty(ne), np.empty(ne)
+            Dp_[:-1] = Dm_[1:] = mean[1:] - mean[:-1]
+            Dp_[-1], Dm_[0] = Dm_[-1], Dp_[0]        # one-sided at the ends, as in TVBLimiter
+        if self.troubled_rule == "all":
+            bad = np.ones(ne, dtype=bool)
+        else:                                        # the Cockburn-Shu test with the TVB constant M
+            right = C.sum(axis=1) - mean
+            left = mean - C @ (-1.0) ** np.arange(p + 1)
+            thr = self.M * self.h2
+            tvb = lambda a: np.where(np.abs(a) <= thr, a, minmod(a, Dp_, Dm_))
+            bad = (tvb(right) != right) | (tvb(left) != left)
+        if bad.any():
+            sp, sm = Dp_ / self.dp, Dm_ / self.dm    # right and left slopes
+            s = limited_slope(self.limiter, sm, sp)
+            if self.reconstruction == "uno2":
+                D = 2.0 * (sp - sm) / (self.dm + self.dp)          # second divided differences
+                if self.periodic:
+                    s = limited_slope(self.limiter, sm, sp, "uno2", np.roll(D, 1), D, np.roll(D, -1),
+                                      self.dm, self.dp)
+                elif ne >= 5:                                      # TVD2 in the two cells next to each end
+                    j = slice(2, ne - 2)
+                    s[j] = limited_slope(self.limiter, sm[j], sp[j], "uno2", D[1:ne - 3], D[j], D[3:ne - 1],
+                                         self.dm[j], self.dp[j])
+            C[bad, 1] = 0.5 * self.h[bad] * s[bad]                 # the Legendre slope, P_1(1) = 1
+            C[bad, 2:] = 0.0
+        if self.to_nodal is not None:
+            C = C @ self.to_nodal.T
+        return C.ravel(), int(bad.sum())
+
+
+class SlopeLimiter(TVBLimiter):
+    """Finite volume slope limiters for DG spaces in 1D: the limiters minmod, Van Leer, monotonized
+    central and Van Albada, each with the TVD2 or the UNO2 reconstruction.
+
+        lim = fd.SlopeLimiter(V, "vanleer", "uno2")   # V a DGSpace, or a ProductSpace with DG fields
+        rk = fd.SSPRK(M, R, dt, limiter=lim)
+
+    On every element (or only on the troubled ones) the mean is kept, the slope is replaced by the
+    limited slope S_j of the cell means and the higher modes are dropped, so the end values are the
+    reconstructed interface values of Dutykh, Katsaounis and Mitsotakis (J. Comput. Phys. 230, 2011,
+    eqs. 3.10 and 3.11),  u(x_{j+1/2}^-) = W_j + S_j h_j/2,  u(x_{j-1/2}^+) = W_j - S_j h_j/2,  with
+
+        TVD2:  S_j = phi(r_j) s_j^+,  r_j = s_j^- / s_j^+,
+        UNO2:  S_j = phi(r_j) S_j^+,  r_j = S_j^- / S_j^+,  S_j^+- = s_j^+- -+ (d_j^+-/2) m(D_j, D_{j+-1}),
+
+        minmod     phi(r) = max(0, min(1, r))
+        vanleer    phi(r) = (r + |r|)/(1 + |r|)
+        mc         phi(r) = max(0, min((1 + r)/2, 2, 2r))
+        vanalbada  phi(r) = (r + r^2)/(1 + r^2)
+
+    where s_j^+- are the divided differences of the means to the right and to the left, d_j^+- the
+    distances between the cell centers, D_j the second divided differences and m the minmod
+    function. UNO2 with minmod is the reconstruction of Harten and Osher. On a uniform grid these
+    are the formulas of the paper. With degree 1 and the default troubled="all", the means evolve
+    exactly as in the finite volume scheme of the paper with the same numerical flux: TVD2 is first
+    order at smooth extrema, UNO2 second order.
+
+    V:              a DGSpace (either basis, any degree >= 1), or a ProductSpace whose DG fields are
+                    limited one by one.
+    limiter:        "minmod" ("mm"), "vanleer" ("vl"), "mc" or "vanalbada" ("va").
+    reconstruction: "tvd2" (default) or "uno2".
+    troubled:       "all" (default) replaces the slope of every element. "tvb" replaces it only on
+                    the elements that the Cockburn-Shu test of TVBLimiter flags, and keeps the DG
+                    solution elsewhere, which keeps the full order of a degree p >= 2 away from
+                    discontinuities. The order at smooth extrema is then set by M.
+    M:              the TVB constant of that test (troubled="tvb" only).
+    fields:         on a ProductSpace, the indices of the fields to limit (default: every DG field).
+
+    The means never change, so the limiter conserves mass. Van Albada, as written in the paper,
+    is not zero where the slopes change sign, so it is not TVD. At the ends of a non-periodic
+    space the missing difference is replaced by the other one, and UNO2 falls back to TVD2 in the
+    two cells next to each end. lim(u), limit(c) and troubled are as for TVBLimiter."""
+
+    def __init__(self, V, limiter: str = "minmod", reconstruction: str = "tvd2", M: float = 0.0,
+                 fields=None, troubled: str = "all"):
+        key = str(limiter).lower()
+        if key not in _LIMITERS:
+            raise ValueError(f"SlopeLimiter: unknown limiter {limiter!r}, use minmod, vanleer, mc or vanalbada")
+        rec = str(reconstruction).lower()
+        if rec not in _RECONSTRUCTIONS:
+            raise ValueError(f"SlopeLimiter: unknown reconstruction {reconstruction!r}, use tvd2 or uno2")
+        if troubled not in ("tvb", "all"):
+            raise ValueError("SlopeLimiter: troubled must be 'tvb' or 'all'")
+        self.limiter, self.reconstruction, self.troubled_rule = _LIMITERS[key], rec, troubled
+        super().__init__(V, M, fields)
+        make = lambda W: _SlopeFieldLimiter(W, self.limiter, rec, M, troubled)
+        if self._lims is None:
+            self._lim = make(V)
+        else:
+            self._lims = {i: make(V.fields[i]) for i in self._lims}
+
+    def __repr__(self):
+        return (f"SlopeLimiter({self.limiter!r}, {self.reconstruction!r}, M={self.M:g}, "
+                f"troubled={self.troubled_rule!r}, on {self.V!r})")
 
 
 # ============================================================================ 2D: the vertex-based limiter

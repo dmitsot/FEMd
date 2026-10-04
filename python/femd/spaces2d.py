@@ -284,9 +284,13 @@ class _Lagrange2D:
         return out.reshape(shape)
 
     def interpolate(self, f) -> np.ndarray:
-        """Nodal interpolant: f(x, y) at dof_coordinates() (f vectorized over arrays), or the values."""
+        """Nodal interpolant: f(x, y) at dof_coordinates() (f vectorized over arrays), an expression in
+        fd.x and fd.y, or the values."""
+        from .forms import Expr
         pts = self.dof_coordinates()
-        if callable(f):
+        if isinstance(f, Expr):                          # an expression in fd.x, fd.y and Constants
+            vals = np.array(_values(f, pts), dtype=np.float64)
+        elif callable(f):
             vals = np.asarray(f(pts[:, 0], pts[:, 1]), dtype=np.float64)
             vals = np.broadcast_to(vals, (pts.shape[0],)).copy()
         else:
@@ -452,12 +456,20 @@ def _is_zero(g):
 
 
 def _values(g, xy):
+    from .forms import Expr, Argument, _Context, evaluate, collect_arguments
+    if isinstance(g, Expr):                      # an expression in fd.x, fd.y and Constants
+        args = []
+        collect_arguments(g, args)
+        if any(isinstance(a, Argument) for a in args):
+            raise TypeError("boundary data: an expression may contain fd.x, fd.y, numbers and Constants, "
+                            "not Functions or test and trial functions")
+        ctx = _Context(np.ascontiguousarray(xy[:, 0], dtype=np.float64), {})
+        ctx.ys = np.ascontiguousarray(xy[:, 1], dtype=np.float64)
+        v = np.asarray(evaluate(g, ctx), dtype=np.float64)
+        return np.broadcast_to(v, (xy.shape[0],))
     if callable(g):
         v = np.asarray(g(xy[:, 0], xy[:, 1]), dtype=np.float64)
         return np.broadcast_to(v, (xy.shape[0],))
-    from .forms import Expr
-    if isinstance(g, Expr):
-        raise TypeError("lift(): data is a number or a callable g(x, y); interpolate an expression with a lambda")
     return float(g)
 
 
@@ -898,8 +910,9 @@ class ProductSpace2D:
                 kw.setdefault("quiver", quiver)
             return self._fields[idx[0]].plot(parts[idx[0]], ax=ax, **kw)
         fs = [self._fields[i] for i in idx]
-        tri, vx = fs[0].triangulation(parts[idx[0]], kw.pop("refine", None))
-        _, vy = fs[1].triangulation(parts[idx[1]], None if kw.get("refine") is None else kw["refine"])
+        refine = kw.pop("refine", None)
+        tri, vx = fs[0].triangulation(parts[idx[0]], refine)
+        _, vy = fs[1].triangulation(parts[idx[1]], refine)
         kw.setdefault("shading", "gouraud")
         colorbar = kw.pop("colorbar", True)
         art = ax.tripcolor(tri, np.hypot(vx, vy), **kw)
@@ -943,7 +956,8 @@ def _short(f):
 def _timeless(g):
     """True unless g is a callable of more than two arguments, g(x, y, t), or of one, g(t)."""
     import inspect
-    if not callable(g):
+    from .forms import Expr
+    if not callable(g) or isinstance(g, Expr):          # an expression in fd.x, fd.y is constant in time
         return True
     try:
         return len(inspect.signature(g).parameters) == 2

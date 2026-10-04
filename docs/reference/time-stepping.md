@@ -18,6 +18,8 @@
 | `VertexLimiter` | class | the vertex-based slope limiter for DG on triangles |
 | `ERK` | class | classical explicit Runge-Kutta stepper (RK2, RK4, ...) for non-stiff $M u' = f(t, u)$ |
 | `TVBLimiter` | class | the Cockburn-Shu TVB minmod limiter for DG spaces |
+| `SlopeLimiter` | class | the minmod, Van Leer, MC and Van Albada slope limiters with the TVD2 or UNO2 reconstruction, for DG spaces in 1D |
+| `limited_slope(limiter, sm, sp, reconstruction, ...)` | function | the slope of one of these limiters |
 | `minmod(*args)` | function | elementwise minmod |
 
 ### G.1 `newton(R, u, left=None, right=None, *, tol=1e-10, rtol=0, maxiter=50, line_search=True, linear="direct", jv="assembled", precond="frozen", backend="Auto", krylov_tol=1e-8, restart=30, krylov_maxiter=1000, cs_h=1e-20, verbose=False, warn=True)`
@@ -273,6 +275,35 @@ The Cockburn-Shu TVB minmod limiter ([manual, Section 7.8](../manual.md#78-expli
 
 `minmod(a, b, ...)` returns, elementwise, the argument of smallest magnitude when
 all have one sign, and 0 otherwise.
+
+### G.9b `SlopeLimiter(V, limiter="minmod", reconstruction="tvd2", M=0.0, fields=None, troubled="all")`
+
+The limiters minmod, Van Leer, monotonized central and Van Albada, each with the TVD2 or the UNO2 reconstruction, as in Dutykh, Katsaounis and Mitsotakis, J. Comput. Phys. 230 (2011) ([manual, Section 7.8](../manual.md#78-explicit-ssp-runge-kutta-and-limiting)).
+
+**Inputs**
+
+| argument | type | default | meaning |
+|---|---|---|---|
+| `V` | `DGSpace` or `ProductSpace` | required | A DG space of degree $p \ge 1$ and either basis, or a `ProductSpace` whose DG fields are limited one by one. |
+| `limiter` | str | `"minmod"` | `"minmod"` (`"mm"`), `"vanleer"` (`"vl"`), `"mc"` or `"vanalbada"` (`"va"`). |
+| `reconstruction` | str | `"tvd2"` | `"tvd2"`, the limiter applied to the differences of the means, or `"uno2"`, applied to the differences corrected by the second differences. |
+| `M` | float | `0.0` | The TVB constant of the troubled-element test, used with `troubled="tvb"`. |
+| `fields` | list of int or `None` | `None` | On a `ProductSpace`, the fields to limit. Default every DG field. |
+| `troubled` | str | `"all"` | `"all"` replaces the slope of every element. `"tvb"` only that of the elements flagged by the Cockburn-Shu test of `TVBLimiter`. |
+
+**Members**
+
+| member | inputs | returns | meaning |
+|---|---|---|---|
+| `lim(u)` | `u` a Function or `ProductFunction` (limited in place), or an array | `u`, or a limited copy of the array | On every chosen element the mean is kept, the slope becomes the limited slope $S_j$ of the means and the higher modes are dropped. |
+| `limit(c)` | `c` array, length `V.dim` | array | A limited copy. |
+| `troubled` | attribute | int | Elements changed by the last call. |
+| `limiter`, `reconstruction` | attribute | str | The choices. |
+
+`limited_slope(limiter, sm, sp, reconstruction="tvd2", Dm=None, D0=None, Dp=None, dm=None, dp=None)`
+returns, elementwise, the limited slope of a cell from its left and right divided differences `sm`, `sp`.
+UNO2 also takes the second divided differences of the cells $j-1$, $j$, $j+1$ and the distances
+`dm`, `dp` from the center of the cell to its neighbors' centers.
 
 ### G.9a `VertexLimiter(V, fields=None)`
 

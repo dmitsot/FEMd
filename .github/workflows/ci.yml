@@ -23,7 +23,7 @@ jobs:
 
       - name: FFTW
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y libfftw3-dev
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y libfftw3-dev libglu1-mesa libxcursor1 libxft2 libxinerama1
           else brew install fftw; fi
 
       - name: Build and install FEMd
@@ -37,7 +37,7 @@ jobs:
         env:
           MPLBACKEND: Agg
         run: |
-          python -m pip install matplotlib nbconvert ipykernel
+          python -m pip install matplotlib nbconvert ipykernel gmsh
           for nb in examples/*.ipynb; do
             echo "== $nb"
             python -m jupyter nbconvert --to notebook --execute "$nb" --output-dir /tmp/nb --ExecutePreprocessor.timeout=1200
@@ -52,7 +52,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: FFTW
-        run: sudo apt-get update && sudo apt-get install -y libfftw3-dev
+        run: sudo apt-get update && sudo apt-get install -y libfftw3-dev libglu1-mesa libxcursor1 libxft2 libxinerama1
       - name: Build and install FEMd with OpenMP
         run: python -m pip install -v . -C cmake.define.FEMD_OPENMP=ON
       - name: Run the example notebooks with OpenMP
@@ -61,7 +61,7 @@ jobs:
           OPENBLAS_NUM_THREADS: "1"
         run: |
           python -c "import femd as fd; assert fd.has_openmp() and fd.has_fftw()"
-          python -m pip install matplotlib nbconvert ipykernel
+          python -m pip install matplotlib nbconvert ipykernel gmsh
           for nb in examples/*.ipynb; do
             echo "== $nb"
             python -m jupyter nbconvert --to notebook --execute "$nb" --output-dir /tmp/nb --ExecutePreprocessor.timeout=1200

@@ -31,7 +31,7 @@ __all__ = [
     "TestFunction", "TrialFunction", "Function", "ProductFunction", "TestFunctions", "TrialFunctions", "Functions", "Constant",
     "D", "dx", "ds", "dS", "jump", "avg", "x", "form", "Form", "Transfer", "mixed_mass", "solve",
     "gmres", "lgmres", "cg", "csnewton", "KrylovInfo", "CSNewtonInfo", "newton", "NewtonInfo", "residual_function",
-    "newton_system", "IRK", "SSPRK", "ERK", "butcher", "TVBLimiter", "minmod",
+    "newton_system", "IRK", "SSPRK", "ERK", "butcher", "TVBLimiter", "SlopeLimiter", "limited_slope", "minmod",
     "sin", "cos", "exp", "log", "tanh", "sqrt", "sinh", "cosh", "sech",
     "LagrangeSpace2D", "SparseMatrix", "SparseSolver", "Preconditioner",
     "y", "Dx", "grad", "div", "dot", "inner", "as_vector", "FacetNormal",
@@ -60,7 +60,7 @@ from .transfer import Transfer, mixed_mass  # noqa: E402
 from .krylov import gmres, lgmres, cg, csnewton, KrylovInfo, CSNewtonInfo  # noqa: E402
 from .newton import newton, NewtonInfo, residual_function  # noqa: E402
 from .timestep import newton_system, IRK, SSPRK, ERK, butcher  # noqa: E402
-from .limiters import TVBLimiter, VertexLimiter, minmod  # noqa: E402
+from .limiters import TVBLimiter, SlopeLimiter, limited_slope, VertexLimiter, minmod  # noqa: E402
 from .mesh2d import (Mesh2D, triangulate, circle, split_triangles, bisect_triangles, refine_triangles,  # noqa: E402
                      remove_vertices, smooth, restore_delaunay, mesh_from_arrays, rectangle_mesh, mapped_mesh)
 from .sparse import SparseMatrix, SparseSolver, Preconditioner  # noqa: E402

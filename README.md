@@ -2,7 +2,7 @@
 
 ![FEMd](docs/mascot/femd_logo.jpg)
 
-**Version 0.1.1** · [Changes](CHANGELOG.md) · [License: GPL v3 or later](LICENSE)
+**Version 0.1.2** · [Changes](CHANGELOG.md) · [License: GPL v3 or later](LICENSE)
 
 **FEMd** is a Finite Element Library for problems in one and two space dimensions. Its core is header-only C++17 and is used from Python. You give a domain, a polynomial degree and boundary conditions, write the equations in weak form, and FEMd assembles and solves them. The form language follows FEniCS, so FEniCS users will find the workflow familiar.
 
@@ -73,6 +73,13 @@ The notebooks in [`examples/`](examples) run as they are after installation.
 | [example8](examples/example8.ipynb) | the matrix of $-\Delta u + u$ on a general triangulation reordered by reverse Cuthill-McKee, sparsity patterns, bandwidth and Cholesky fill against AMD |
 | [example9](examples/example9.ipynb) | a nonsymmetric system, convection-diffusion in a recirculating flow (double glazing), GMRES stagnating where LGMRES with ILU(0) converges |
 | [example10](examples/example10.ipynb) | solitary waves of the Whitham equation, a nonlocal Fourier multiplier with a dense Jacobian, complex-step Newton-Krylov (`fd.csnewton`) against Newton with the dense Jacobian |
+| [example11](examples/example11.ipynb) | the inviscid Burgers equation $u_t + u u_x = 0$ with DG elements and the Lax-Friedrichs flux up to $t = 1$, the formation of a shock, SSP Runge-Kutta with and without the TVB limiter |
+| [example12](examples/example12.ipynb) | the slope limiters minmod, Van Leer, MC and Van Albada with the TVD2 and UNO2 reconstructions for DG, a square wave and a smooth hump advected once around |
+| [example13](examples/example13.ipynb) | the heat equation $u_t = \Delta u$ on the unit square with $P_2$ elements and zero boundary values, backward Euler with a factored matrix against the exact solution, and Radau IIA with `fd.IRK` |
+| [example14](examples/example14.ipynb) | the steady Navier-Stokes equations, flow around a cylinder at $Re = 20$ (DFG benchmark 2D-1), Taylor-Hood $P_2/P_1$ elements and Newton's method, drag, lift and pressure difference |
+| [example15](examples/example15.ipynb) | vortex shedding behind a cylinder at $Re = 100$ (DFG benchmark 2D-2), the time-dependent Navier-Stokes equations with Radau IIA (`fd.IRK`), vorticity, drag, lift and Strouhal number (about 4 minutes) |
+| [example16](examples/example16.ipynb) | output for ParaView: the heat equation in a plate with a hole, temperature and heat flux on quadratic VTK cells, a time series with `fd.VTKSeries` and the mesh with its boundary markers |
+| [example17](examples/example17.ipynb) | a mesh from Gmsh (`pip install gmsh`): a plate with a circular inclusion, named sides and regions read with `fd.read_gmsh`, a piecewise constant conductivity from the regions, heat flux and output for ParaView |
 
 ## Documentation
 
