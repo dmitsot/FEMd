@@ -1,4 +1,4 @@
-# FEMd 0.1.2 manual
+# FEMd 0.1.3 manual
 
 FEMd is a Finite Element Library for problems in one and two space dimensions. Its core is header-only C++17 and is used from Python through bindings. The user provides a domain, a polynomial degree and boundary conditions, writes the equations in weak form using inner products, and FEMd does the rest. The design follows the FEniCS project, so users familiar with FEniCS will find the form language and the workflow familiar.
 

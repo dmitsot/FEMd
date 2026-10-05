@@ -161,13 +161,28 @@ class SparseMatrix:
         if v.ndim != 1:
             return self.tocsr() @ v
         y = self._kernel(np.ascontiguousarray(v))
-        if self.row_space is not None:
+        # A Function in, a Function out.  A plain array in, a plain array out: wrapping the
+        # result costs as much as a fifth of the product, and an ndarray @ VectorFunction fails.
+        if self.row_space is not None and hasattr(x, "vector"):
             return _adopt(self.row_space, "product", y)
         return y
 
     def rmatvec(self, x) -> np.ndarray:
         """A^T x."""
         return self._K.rmatvec(np.ascontiguousarray(_vector(x), dtype=np.float64))
+
+    def inner(self, x, y=None) -> float:
+        """y^T A x, or x^T A x when y is None, without forming A x and without BLAS.
+
+        An energy  0.5 * M.inner(u),  a dissipation rate  nu * K.inner(u),  or the
+        cross term  M.inner(k, u)  in one pass over the matrix.  The rows are added in
+        an ordered chunked sum, so the result has the same bits for any number of threads.
+        x has as many entries as A has columns, y as many as A has rows."""
+        xv = np.ascontiguousarray(_vector(x), dtype=np.float64)
+        yv = xv if y is None else np.ascontiguousarray(_vector(y), dtype=np.float64)
+        if y is None and self.shape[0] != self.shape[1]:
+            raise ValueError("inner(x): x^T A x needs a square matrix; give y")
+        return self._K.inner(xv, yv)
 
     # ---- arithmetic ----------------------------------------------------------------
     def _check(self, o, what):

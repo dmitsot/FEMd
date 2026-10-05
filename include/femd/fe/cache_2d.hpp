@@ -236,6 +236,58 @@ public:
         return eval(r, m, true);
     }
 
+    /// @brief Several derivative codes of a scalar field in one pass over the points, written to
+    ///        out[i * nent * nq + e * nq + q] for codes[i] (0 value, 1 d/dx, 2 d/dy).  The
+    ///        coefficients (dim of them, or raw_dim with raw) are read in place, each cell's are
+    ///        gathered once, and J^{-1} is read once per point for both derivatives.  Every value is
+    ///        summed in the same order as at_points, so the two agree bit for bit.  Not for vector
+    ///        families (Raviart-Thomas, Nedelec).
+    void eval_multi(const double *c, bool raw, const int *codes, int ncodes, double *out) const
+    {
+        if (vector_) throw std::invalid_argument("eval_multi: scalar spaces only");
+        bool deriv = false;
+        for (int i = 0; i < ncodes; ++i)
+        {
+            if (codes[i] < 0 || codes[i] > 2) throw std::invalid_argument("derivative code is 0 (value), 1 (d/dx) or 2 (d/dy)");
+            deriv = deriv || codes[i] > 0;
+        }
+        const int n = nloc_;
+        const std::size_t np = static_cast<std::size_t>(nent_) * nq_;
+        FEMD_OMP_PARALLEL_IF(detail::parallel_elements(nent_, nq_))
+        {
+        std::vector<double> loc(static_cast<std::size_t>(n));
+        FEMD_OMP_FOR
+        for (int e = 0; e < nent_; ++e)
+        {
+            const int *d = raw ? raw_dofs(e) : dofs(e);
+            for (int l = 0; l < n; ++l) loc[l] = d[l] >= 0 ? c[d[l]] : 0.0;
+            for (int q = 0; q < nq_; ++q)
+            {
+                const double *R = ref(var_[e], q);
+                const std::size_t k = static_cast<std::size_t>(e) * nq_ + q;
+                double s[3] = {0.0, 0.0, 0.0};
+                if (!deriv)
+                    for (int l = 0; l < n; ++l) s[0] += R[l] * loc[l];
+                else
+                {
+                    const double *Ji = &Ji_[4 * k];
+                    const double ax = Ji[0], bx = Ji[2], ay = Ji[1], by = Ji[3];
+                    for (int l = 0; l < n; ++l)
+                    {
+                        s[0] += R[l] * loc[l];
+                        const double rx = ax * R[n + l] + bx * R[2 * n + l];
+                        s[1] += rx * loc[l];
+                        const double ry = ay * R[n + l] + by * R[2 * n + l];
+                        s[2] += ry * loc[l];
+                    }
+                }
+                for (int i = 0; i < ncodes; ++i) out[static_cast<std::size_t>(i) * np + k] = s[codes[i]];
+            }
+        }
+        }
+    }
+    bool is_vector() const { return vector_; }
+
 private:
     std::vector<double> eval(const std::vector<double> &c, int m, bool raw) const
     {

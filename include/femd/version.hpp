@@ -11,8 +11,8 @@
 
 #define FEMD_VERSION_MAJOR 0
 #define FEMD_VERSION_MINOR 1
-#define FEMD_VERSION_PATCH 2
-#define FEMD_VERSION "0.1.2"
+#define FEMD_VERSION_PATCH 3
+#define FEMD_VERSION "0.1.3"
 
 namespace femd {
 inline constexpr const char* version = FEMD_VERSION;

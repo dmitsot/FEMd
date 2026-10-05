@@ -126,6 +126,16 @@ struct AssembledMatrix {
         for (std::size_t k = 0; k < ov.size(); ++k) y[oi[k]] += ov[k] * x[oj[k]];
     }
 
+    /// @brief y^T K x: the band rows times x, each multiplied by y[i], added in the ordered
+    ///        chunked sum, plus the periodic corners.  Nothing is allocated.
+    double inner(const double *x, const double *y) const
+    {
+        double s = detail::ordered_sum(static_cast<std::size_t>(n), [&](std::size_t i) {
+            return row_dot(static_cast<int>(i), x) * y[i]; });
+        for (std::size_t k = 0; k < ov.size(); ++k) s += ov[k] * x[oj[k]] * y[oi[k]];
+        return s;
+    }
+
     /// @brief Row i of the band times x, clipped to the columns 0..n-1 (the generic loop).
     double row_dot(int i, const double *x) const
     {

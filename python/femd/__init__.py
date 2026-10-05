@@ -19,6 +19,7 @@ from __future__ import annotations
 from . import _femd as _C
 from ._femd import Mesh1D, BoundaryCondition, BCSpec, QuadratureCache, has_fftw, Solver
 from ._femd import has_openmp, set_num_threads, get_num_threads, omp_threshold
+from ._femd import ddot as _ddot
 from ._femd import Domain, orient2d, incircle
 
 __all__ = [
@@ -40,10 +41,29 @@ __all__ = [
     "QuadMesh", "quad_mesh_from_arrays", "quad_mesh_from_triangles", "rectangle_quad_mesh", "mapped_quad_mesh", "quadrangulate", "LagrangeSpaceQ",
     "write_vtk", "VTKSeries", "read_gmsh",
     "RTSpace", "N1curlSpace", "DGSpace2D", "VectorElementFunction", "curl", "rot", "eigs", "EigenResult",
-    "sign", "max_value", "min_value", "VertexLimiter",
+    "sign", "max_value", "min_value", "VertexLimiter", "ddot",
 ]
 
 __version__ = _C.__version__     # from include/femd/version.hpp, as is the package metadata
+
+
+def ddot(x, y):
+    """The dot product sum_i x_i y_i of two coefficient vectors (arrays or Functions of one space).
+
+    Computed in C++ as an ordered chunked sum, with the same bits for any number of threads,
+    and without BLAS.  NumPy's  x @ y  goes to the BLAS, and the OpenBLAS of some builds
+    threads even a dot product of 10^4 entries across every core, which on a laptop can
+    take hundreds of microseconds instead of a few.  Energies, dissipation rates and
+    relaxation parameters are sums of such products, so a time loop can spend most of its
+    time there.  For x^T A y see Matrix.inner and SparseMatrix.inner."""
+    import numpy as _np
+    xv = _np.asarray(getattr(x, "vector", x))
+    yv = _np.asarray(getattr(y, "vector", y))
+    if xv.ndim != 1 or yv.ndim != 1:
+        raise ValueError("ddot: two vectors")
+    if _np.iscomplexobj(xv) or _np.iscomplexobj(yv):
+        raise TypeError("ddot: real vectors only; use numpy for complex ones")
+    return _ddot(_np.ascontiguousarray(xv, dtype=_np.float64), _np.ascontiguousarray(yv, dtype=_np.float64))
 
 # The package is split into modules; everything public is re-exported here, so
 # `import femd as fd` sees one flat namespace, as it always has.

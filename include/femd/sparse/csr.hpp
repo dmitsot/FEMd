@@ -179,6 +179,19 @@ struct CSRMatrix {
             y[i] = s;
         }
     }
+    /// @brief y^T K x without forming K x: each row's product is multiplied by y[i] as it is
+    ///        computed, and the rows are added in the ordered chunked sum (the same bits for any
+    ///        number of threads).  x has ncols entries and y has nrows.
+    double inner(const double *x, const double *y) const
+    {
+        const int *ip = indptr(), *ix = indices();
+        const double *v = data.data();
+        return detail::ordered_sum(static_cast<std::size_t>(nrows()), [&](std::size_t i) {
+            double s = 0.0;
+            for (int p = ip[i]; p < ip[i + 1]; ++p) s += v[p] * x[ix[p]];
+            return s * y[i];
+        });
+    }
     std::vector<double> apply(const std::vector<double> &x) const
     {
         if (static_cast<int>(x.size()) != ncols()) throw std::invalid_argument("CSRMatrix::apply: length mismatch");

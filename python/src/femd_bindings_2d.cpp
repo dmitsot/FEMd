@@ -67,6 +67,20 @@ std::vector<Point> points(const PArr &a)
     return p;
 }
 
+// at_points of a scalar space without copying the coefficients or the result.
+Vec at_points_scalar(const Cache2D &Q, const DArr &c, int d, bool raw)
+{
+    const std::size_t want = static_cast<std::size_t>(raw ? Q.space().raw_dim() : Q.space().dim());
+    if (c.shape(0) != want)
+        throw std::invalid_argument(raw ? "at_points_raw: coefficient length != raw_dim" : "at_points: coefficient length != dim");
+    if (d < 0 || d > 2) throw std::invalid_argument("derivative code is 0 (value), 1 (d/dx) or 2 (d/dy)");
+    const std::size_t np = static_cast<std::size_t>(Q.nent()) * Q.nq();
+    double *p = new double[np];
+    nb::capsule owner(p, [](void *v) noexcept { delete[] static_cast<double *>(v); });
+    { GilRelease g; Q.eval_multi(c.data(), raw, &d, 1, p); }
+    return Vec(p, {np}, owner);
+}
+
 } // namespace
 
 void bind_2d(nb::module_ &m)
@@ -122,6 +136,12 @@ void bind_2d(nb::module_ &m)
                 if (x.shape(0) != static_cast<std::size_t>(K.ncols()) || y.shape(0) != static_cast<std::size_t>(K.nrows()))
                     throw std::invalid_argument("matvec_into: length mismatch");
                 GilRelease r; if (K.nrows() > 0) K.apply(x.data(), y.data()); }, "x"_a, "y"_a)
+        .def("inner", [](const CSRMatrix &K, DArr x, DArr y) {
+                if (x.shape(0) != static_cast<std::size_t>(K.ncols()) || y.shape(0) != static_cast<std::size_t>(K.nrows()))
+                    throw std::invalid_argument("inner(x, y): x needs ncols entries and y nrows");
+                if (K.nrows() == 0) return 0.0;
+                GilRelease r; return K.inner(x.data(), y.data()); }, "x"_a, "y"_a,
+             "y^T K x without forming K x; an ordered sum, the same bits for any thread count.")
         .def("rmatvec", [](const CSRMatrix &K, DArr x) {
                 if (x.shape(0) != static_cast<std::size_t>(K.nrows())) throw std::invalid_argument("rmatvec: length mismatch");
                 std::vector<double> y(static_cast<std::size_t>(K.ncols()));
@@ -484,9 +504,20 @@ void bind_2d(nb::module_ &m)
         .def("cells", [](const Cache2D &Q) { std::vector<int> c(Q.nent()); for (int e = 0; e < Q.nent(); ++e) c[e] = Q.cell(e); return np1(c); })
         .def("markers", [](const Cache2D &Q) { return np1(Q.markers()); })
         .def("at_points", [](const Cache2D &Q, DArr c, int d) {
+                if (!Q.is_vector()) return at_points_scalar(Q, c, d, false);
                 std::vector<double> cv = vec(c), out; { GilRelease g; out = Q.at_points(cv, d); } return np1(out); }, "c"_a, "deriv"_a = 0)
         .def("at_points_raw", [](const Cache2D &Q, DArr r, int d) {
-                std::vector<double> rv = vec(r), out; { GilRelease g; out = Q.at_points_raw(rv, d); } return np1(out); }, "raw"_a, "deriv"_a = 0);
+                if (!Q.is_vector()) return at_points_scalar(Q, r, d, true);
+                std::vector<double> rv = vec(r), out; { GilRelease g; out = Q.at_points_raw(rv, d); } return np1(out); }, "raw"_a, "deriv"_a = 0)
+        .def("at_points_multi", [](const Cache2D &Q, DArr c, std::vector<int> codes, bool raw) {
+                const std::size_t want = static_cast<std::size_t>(raw ? Q.space().raw_dim() : Q.space().dim());
+                if (c.shape(0) != want) throw std::invalid_argument("at_points_multi: coefficient length != dim (raw_dim with raw=True)");
+                const std::size_t np = static_cast<std::size_t>(Q.nent()) * Q.nq();
+                double *p = new double[codes.size() * np];
+                nb::capsule owner(p, [](void *v) noexcept { delete[] static_cast<double *>(v); });
+                { GilRelease g; Q.eval_multi(c.data(), raw, codes.data(), static_cast<int>(codes.size()), p); }
+                return Mat(p, {codes.size(), np}, owner); }, "c"_a, "codes"_a, "raw"_a = false,
+             "Values (code 0), d/dx (1) and d/dy (2) of a scalar field at every point, one row per code, in one pass.");
 
     // ---- kernels -------------------------------------------------------------------
     nb::class_<InteriorFacetCache2D>(m, "InteriorFacetCache2D", "Gauss points on the interior facets of a 2D space (dS), both sides.")

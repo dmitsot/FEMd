@@ -650,6 +650,16 @@ NB_MODULE(_femd, m)
                  if (K.n > 0) { GilRelease release; K.apply(x.data(), y.data()); }
              },
              "x"_a, "out"_a, "out[:] = K x, no allocation.")
+        .def("inner",
+             [](const AssembledMatrix &K, DArr x, DArr y)
+             {
+                 if (static_cast<int>(x.shape(0)) != K.n || static_cast<int>(y.shape(0)) != K.n)
+                     throw std::invalid_argument("inner(x, y): x and y must both have length " + std::to_string(K.n));
+                 if (K.n == 0) return 0.0;
+                 GilRelease release;
+                 return K.inner(x.data(), y.data());
+             },
+             "x"_a, "y"_a, "y^T K x without forming K x; an ordered sum, the same bits for any thread count.")
         .def("combine", [](const AssembledMatrix &A, const AssembledMatrix &B, double alpha, double beta)
              { return combine(A, B, alpha, beta); }, "B"_a, "alpha"_a, "beta"_a, "alpha*self + beta*B.",
              nb::call_guard<GilRelease>())
@@ -853,6 +863,12 @@ NB_MODULE(_femd, m)
         .value("SymBand", Solver::SymBand).value("Cyclic", Solver::Cyclic).value("SymCyclic", Solver::SymCyclic)
         .value("Circulant", Solver::Circulant).value("Diagonal", Solver::Diagonal);
     m.def("has_fftw", &has_fftw, "Whether this build links FFTW (needed for Solver.Circulant).");
+    m.def("ddot", [](DArr x, DArr y) {
+              if (x.shape(0) != y.shape(0))
+                  throw std::invalid_argument("ddot: lengths differ, " + std::to_string(x.shape(0)) + " and " + std::to_string(y.shape(0)));
+              GilRelease release;
+              return femd::ddot(x.data(), y.data(), x.shape(0));
+          }, "x"_a, "y"_a, "sum_i x[i] y[i], an ordered chunked sum in C++ (no BLAS), the same bits for any thread count.");
     m.def("has_openmp", []() {
 #ifdef _OPENMP
         return true;

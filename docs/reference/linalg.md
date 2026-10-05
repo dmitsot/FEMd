@@ -10,6 +10,7 @@
 | `RectMatrix` | class | a rectangular block between two spaces on one grid |
 | `block(blocks, space=None, symmetric=None)` | function | assembles blocks into one banded `Matrix` on a `ProductSpace` |
 | `MatrixInfo` | class | the measured structure of a `Matrix`, from `Matrix.classify()` |
+| `ddot(x, y)` | function | the dot product of two coefficient vectors, in C++ without BLAS (E.5) |
 
 ### E.1 `Matrix`
 
@@ -43,6 +44,7 @@ periodic space.
 | `A @ B` | `B` a `Matrix` | `Matrix` | Matrix product, half-bandwidth $p_A + p_B$, never flagged symmetric. |
 | `A @ B` | `B` a `RectMatrix` whose row space is `A.space` | `RectMatrix` | Product with a block. |
 | `matvec(x, out=None)` | `x` a vector or Function. `out` a C-contiguous `float64` array of length `n` that does not overlap `x`. | array | $Ax$ as a plain array. With `out` it is written there and nothing is allocated. |
+| `inner(x, y=None)` | `x`, `y` vectors or Functions of length `n` | float | $y^{\mathsf T}Ax$, or $x^{\mathsf T}Ax$ without `y`, straight off the band without forming $Ax$ and without BLAS (E.5). An energy is `0.5 * M.inner(u)`. |
 | `tocsr()`, `tocoo()` | none | SciPy sparse matrix | A copy in CSR or COO format. |
 | `copy()` | none | `Matrix` | An independent copy. Take one before updating in place a matrix returned by a constant form, since the form returns the same cached object each time. |
 | `T` | attribute | `Matrix` | The transpose. For a skew matrix `A.T` equals `-A`. |
@@ -130,6 +132,18 @@ Returned by `Matrix.classify(tol)`. Every number is measured from the entries.
 | `auto_backend` | str | The backend `Auto` picks: the measured structure with the `symmetric` flag. It differs from `backend` only when the flag disagrees with the measured symmetry, or for `Circulant`. |
 | `warnings` | list of str | Disagreements worth acting on, such as a wrong symmetry flag or unused diagonals. |
 | `tol` | float | The tolerance used. |
+
+### E.5 `ddot(x, y)`
+
+The dot product $\sum_i x_iy_i$ of two coefficient vectors, arrays or Functions of one space, computed in C++.
+
+NumPy's `x @ y` goes to the BLAS, and the OpenBLAS that some NumPy builds ship (Anaconda's on Apple silicon, for one) threads a dot product of more than 10 000 entries across every core. The hand-off can cost hundreds of microseconds for a few microseconds of work, and the threads keep spinning afterwards and slow everything else down. A time loop whose energies, dissipation rates and relaxation parameters are such dot products can spend most of its time there: the Navier-Stokes notebook of the Hamiltonian project took 96 s on an M4 instead of 20 s. `fd.ddot` does the sum in chunks of 4096 entries, each with eight interleaved partial sums held in vector registers, the chunk sums added in order, so it costs a few microseconds and gives the same bits for any number of threads. With OpenMP it is threaded from $2^{20}$ entries on.
+
+| argument | type | meaning |
+|---|---|---|
+| `x`, `y` | arrays or Functions of the same length, real | The two vectors. Complex vectors raise `TypeError`; use NumPy for them. |
+
+**Output.** A float. `Matrix.inner`, `RectMatrix` through `fd.ddot(y, B @ x)`, and `SparseMatrix.inner` ([L.3](elements-2d.md#l3-sparsematrix)) give $y^{\mathsf T}Ax$ in one pass over the matrix.
 
 ---
 

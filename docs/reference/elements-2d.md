@@ -104,6 +104,7 @@ one. Second derivatives are refused on the $C^0$ space.
 | `tocoo()`, `toarray()`, `diagonal()` | none | | Conversions. |
 | `A @ x` | vector or Function | Function or array | C++ matvec. A `SparseMatrix` operand gives the product. |
 | `matvec(x, out=None)`, `rmatvec(x)` | vector | array | $Ax$ and $A^T x$. |
+| `inner(x, y=None)` | vectors or Functions, `x` of `ncols` and `y` of `nrows` entries | float | $y^{\mathsf T}Ax$, or $x^{\mathsf T}Ax$ for a square matrix without `y`, without forming $Ax$ and without BLAS ([E.5](linalg.md#e5-ddotx-y)). `0.5 * M.inner(u)` is an energy, `nu * K.inner(u)` a dissipation rate. |
 | `A + B`, `A - B`, `a * A`, `A / a`, `-A`, `A.T`, `A += B` | | `SparseMatrix` | Arithmetic, on the shared pattern when there is one. |
 | `is_symmetric(tol=1e-12)` | float | bool | Measured symmetry. |
 | `copy()` | none | `SparseMatrix` | A copy of the values (the pattern stays shared). |

@@ -1457,7 +1457,8 @@ class _Context:
             memo[key] = v
         return v
 
-    def _func_values(self, a: Argument):
+    def _source(self, a: Argument):
+        """The coefficient vector of the known field a reads: an override, a value, or the owner's."""
         ov = self.owner_values
         if ov and a.owner is not None and id(a.owner) in ov:
             vals = ov[id(a.owner)]
@@ -1468,7 +1469,10 @@ class _Context:
             vals = a.owner.vector
         else:
             raise KeyError(f"no value supplied for Function '{a.name}'")
-        vals = np.asarray(vals)
+        return np.asarray(vals)
+
+    def _func_values(self, a: Argument):
+        vals = self._source(a)
         if np.iscomplexobj(vals):
             # every map from coefficients to values is real and linear: take the parts apart
             return self._real_values(a, vals.real) + 1j * self._real_values(a, vals.imag)
@@ -1507,6 +1511,42 @@ class _Context2D(_Context):
         self.ys = np.asarray(Q.y())
         self.normals = (np.asarray(Q.normal_x()), np.asarray(Q.normal_y())) if Q.on_facets else None
         self._form, self._Q, self._key, self._node_space = form_, Q, key, node_space
+
+    def _func_values(self, a: Argument):
+        """A scalar field on the form's mesh: the value and the derivatives the form reads of it are
+        computed together, in one pass over the points (Cache2D.at_points_multi), and kept for the
+        other slots of the same field."""
+        Q = self._fast_cache(a)
+        if Q is None:
+            return super()._func_values(a)
+        key = (a.slot()[0], a.field, a.side)
+        fields = self.__dict__.setdefault("_fields", {})
+        got = fields.setdefault(key, {})
+        code = a.code()
+        if code not in got:
+            need = getattr(self._form, "_codes2d", {}).get(key, ())
+            codes = sorted(({code} | set(need)) - set(got))
+            vals = self._source(a)
+            if np.iscomplexobj(vals):
+                rows = self._multi(Q, a, vals.real, codes) + 1j * self._multi(Q, a, vals.imag, codes)
+            else:
+                rows = self._multi(Q, a, vals, codes)
+            got.update(zip(codes, rows))
+        return got[code]
+
+    def _fast_cache(self, a):
+        if a.comp is not None or getattr(a.space, "tdim", 1) != 2 or a.space.mesh is not self._node_space.mesh:
+            return None
+        Q = self._form._cache2d(a.space, self._key)
+        if getattr(Q, "ncodes", 0) != 3 or not hasattr(Q, "at_points_multi"):
+            return None
+        return Q
+
+    @staticmethod
+    def _multi(Q, a, vals, codes):
+        if a.product is not None:
+            vals = a.product.split(np.ascontiguousarray(vals, dtype=np.float64))[a.field]
+        return Q.at_points_multi(np.ascontiguousarray(vals, dtype=np.float64), codes)
 
     def _real_values(self, a, vals):
         if a.product is not None:
@@ -1689,6 +1729,12 @@ class Form:
             if a.kind == "func":
                 funcs.setdefault(a.slot()[0], a)
         self._funcs = funcs                                   # slot key -> a representative Argument
+        codes2d = {}                                          # (field key, field, side) -> codes read (2D)
+        for a in args:
+            if a.kind == "func" and a.comp is None:
+                k = a.slot()
+                codes2d.setdefault((k[0], a.field, a.side), set()).add(a.code())
+        self._codes2d = codes2d
         self.functions = sorted({a.name for a in funcs.values()})
         owners = [a.owner for a in funcs.values() if a.owner is not None]
         consts = []
@@ -1875,6 +1921,7 @@ class Form:
         out = np.zeros(T.dim, dtype=np.complex128 if cplx else np.float64) if rank == 1 else 0.0
         side = lambda a: 1 if a.side == "+" else 0                               # noqa: E731
         ctxs = {}                                # one context per point set: field values computed once
+        fields_by_key = {}                       # field values shared by the contexts of one mesh and rule
         for key, (Ts, toff), (Rs, roff), ts in groups.values():
             Q = self._cache2d(Ts, key)
             if key[0] == "dS":
@@ -1916,6 +1963,9 @@ class Form:
             ctx = ctxs.get(ck)
             if ctx is None:
                 ctx = ctxs[ck] = _Context2D(self, Q, key, Ts, values, owner_values)
+                # the values of a field depend on its own cache only, so contexts on the same mesh
+                # and point set (the components of a vector space) share them
+                ctx._fields = fields_by_key.setdefault((key, id(Ts.mesh)), {})
             npts = Q.nent * Q.nq
             cs = []
             for t in ts:

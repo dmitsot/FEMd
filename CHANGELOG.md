@@ -2,6 +2,12 @@
 
 Each version is in `include/femd/version.hpp`, and `fd.__version__` shows the installed one.
 
+## 0.1.3 (2026-10-05)
+
+- `SparseMatrix @ x` with an array `x` now returns an array, as `A.matvec(x)` does. A Function still gives a Function. Wrapping the product in a Function cost up to a fifth of the matvec, and `x @ (A @ x)` failed on vector spaces. Code that reads `(A @ x).vector` with an array `x` should use `A @ x` directly.
+- Faster assembly of 2D forms that read known fields. The value and the first derivatives of a scalar field are computed in one pass over the quadrature points (`Cache2D.at_points_multi`), each field is evaluated once per assembly instead of once per component of a vector test space, and `Cache2D.at_points` no longer copies the coefficients or the result. The assembled numbers are unchanged bit for bit. The Navier-Stokes vector field of `ns_exact_dissipation.ipynb` assembles in 5.0 ms instead of 7.1 ms.
+- `fd.ddot(x, y)`, `Matrix.inner(x, y=None)` and `SparseMatrix.inner(x, y=None)`: dot products and $y^{\mathsf T}Ax$ in C++ without BLAS, as ordered chunked sums with the same bits for any number of threads. The OpenBLAS of Anaconda's NumPy on Apple silicon threads a dot product of 16130 entries across 10 cores and takes 500 µs for it instead of 3 µs, which made the time loop of the Navier-Stokes notebook five times slower than its parts. `detail::ordered_sum` takes the parallel threshold as an argument.
+
 ## 0.1.2 (2026-10-04)
 
 - `examples/example9.ipynb`, convection-diffusion in a recirculating flow, GMRES against LGMRES.

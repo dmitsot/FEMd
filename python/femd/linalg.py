@@ -243,6 +243,20 @@ class Matrix:
             return Function._adopt(self.space, "product", y)
         return y
 
+    def inner(self, x, y=None) -> float:
+        """y^T A x, or x^T A x when y is None, straight off the band, without forming A x
+        and without BLAS (see fd.ddot).  The rows are added in an ordered chunked sum."""
+        xv = x.vector if isinstance(x, Function) else x
+        xv = np.ascontiguousarray(np.asarray(xv), dtype=np.float64)
+        if y is None:
+            yv = xv
+        else:
+            yv = y.vector if isinstance(y, Function) else y
+            yv = np.ascontiguousarray(np.asarray(yv), dtype=np.float64)
+        if self._K is None or not hasattr(self._K, "inner"):
+            return float(yv @ (self.tocsr() @ xv))
+        return self._K.inner(xv, yv)
+
     def matvec(self, x, out=None) -> np.ndarray:
         """y = A x as a plain array, through the banded kernel.
 
