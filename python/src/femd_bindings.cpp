@@ -723,13 +723,29 @@ NB_MODULE(_femd, m)
           {
               std::size_t n = b.shape(0);
               if (x0.shape(0) != n) throw std::invalid_argument("cg: x0 and b differ in length");
-              KOp Aop = as_operator(A, n), Mop = as_precon(M, n);
+              KOp Aop = as_operator(A, n);
               std::vector<double> x = to_vec(x0), bv = to_vec(b);
+              // None and the Jacobi preconditioner take the fused path of krylov::cg_jacobi, which
+              // never forms z = M^{-1} r; everything else goes through the generic callable.
+              const double *inv = nullptr;
+              bool jacobi = M.is_none();
+              if (!jacobi && nb::isinstance<SparsePreconditioner>(M))
+              {
+                  const SparsePreconditioner *P = nb::cast<const SparsePreconditioner *>(M);
+                  if (static_cast<std::size_t>(P->size()) != n) throw std::invalid_argument("krylov: preconditioner and right-hand side differ in size");
+                  if (auto *J = dynamic_cast<const JacobiPreconditioner *>(P)) { inv = J->inverse_diagonal().data(); jacobi = true; }
+              }
+              KOp Mop = jacobi ? krylov::identity() : as_precon(M, n);
               krylov::CGResult r;
               {
                   // callables re-enter Python, so the GIL is kept unless both are native
                   bool native = !nb::isinstance<nb::callable>(A) && (M.is_none() || !nb::isinstance<nb::callable>(M));
-                  if (native) { GilRelease release; r = krylov::cg(Aop, Mop, x, bv, max_iter, tol); }
+                  if (native)
+                  {
+                      GilRelease release;
+                      r = jacobi ? krylov::cg_jacobi(Aop, inv, x, bv, max_iter, tol) : krylov::cg(Aop, Mop, x, bv, max_iter, tol);
+                  }
+                  else if (jacobi) r = krylov::cg_jacobi(Aop, inv, x, bv, max_iter, tol);
                   else r = krylov::cg(Aop, Mop, x, bv, max_iter, tol);
               }
               return nb::make_tuple(to_np(std::move(x)), r.converged, r.iterations, r.residual, r.breakdown);

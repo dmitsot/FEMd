@@ -28,7 +28,7 @@ pip install .                      # builds the C++ extension, installs `femd`
 
 Run `pip install .` again after changing anything under `include/`, `python/src/` or `python/femd/`. Editing your own scripts or the examples needs nothing. `pip` installs into the Python it belongs to, so run it from the environment your notebook kernel uses, then restart the kernel.
 
-`fd.__version__` gives the installed version, for example `python -c "import femd; print(femd.__version__)"`. The C++ header `femd/version.hpp` has the same number as `FEMD_VERSION`, and [CHANGELOG.md](../CHANGELOG.md) lists what changed in each version.
+`fd.__version__` gives the installed version, for example `python -c "import femd; print(femd.__version__)"`. The C++ header `femd/version.hpp` has the same number as `FEMD_VERSION`.
 
 ### 1.1 OpenMP
 
@@ -414,7 +414,7 @@ The two spaces of a rectangular form must share the grid. Across grids, use `fd.
 
 ### 6.7 Quadrature
 
-The rule is inferred per form from the polynomial degree of its terms, so $u\,u_x\,v$ at $p=3$ gets 5 points and is exact, while a non-polynomial term gets $p+2$. `dx(quad_degree=n)`, or `dx(n)`, overrides it with $n$ Gauss points per element. On a 2D mesh $n$ is the degree of exactness instead ([Section 12.2](#122-the-form-language-in-2d)). Each form builds its own quadrature caches at its first assembly and keeps them.
+The rule is inferred per form from the polynomial degree of its terms, so $u\,u_x\,v$ at $p=3$ gets 5 points and is exact. A non-polynomial function, of the data ($\sin x$) or of a field ($\sin u$), counts as a polynomial of degree $p+1$: its interpolant of degree $p$ plus the leading term of the remainder. So $f\,v$ is integrated exactly for degree $2p+1$ and an error norm $(u_h - u)^2$ for degree $2p+2$, which is what the square of the leading error term needs. This is the lowest rule that leaves the convergence order and the measured errors unchanged; raise it with `dx(quad_degree=n)` when the data vary on a scale below the mesh. To use one rule in every form of a code, call `fd.set_quadrature_degree(n)` once: every form made afterwards takes $n$ on all its measures, as if each carried `quad_degree=n` ($n$ Gauss points per element in 1D, the degree of exactness in 2D), a measure with its own `quad_degree=` still wins, and `fd.set_quadrature_degree(None)` returns to the inferred rules. `fd.quadrature_degree()` reads the setting. `dx(quad_degree=n)`, or `dx(n)`, overrides it with $n$ Gauss points per element. On a 2D mesh $n$ is the degree of exactness instead ([Section 12.2](#122-the-form-language-in-2d)). Each form builds its own quadrature caches at its first assembly and keeps them.
 
 **Lumped mass.** `dx(scheme="lobatto")` integrates with the Gauss-Lobatto rule instead, and `dx(n, scheme="lobatto")` with $n \ge 2$ points per element. Without $n$ the rule has $p+1$ points, where $p$ is the highest degree of the term's test and trial spaces. These points are the nodes of `LagrangeSpace(grid, p, nodes="lobatto")`, so on that space `u*v*dx(scheme="lobatto")` is exactly diagonal. This is the lumped mass. `V.mass_matrix(lumped=True)` returns the same matrix, and on the other spaces the row sums of the mass matrix, $d_i = \sum_j M_{ij}$. A diagonal matrix is solved by the `Diagonal` backend, so an explicit time stepper needs no factorization. The rule is exact to degree $2p-1$, so the lumped mass is not the exact $\int u v$, but the eigenvalues of $-u''$ keep their order $2p$. Row sums are refused when one of them is not positive, which happens for equispaced Lagrange nodes at $p = 8$ and from $p = 10$. On a 2D mesh it is the tensor Gauss-Lobatto rule on quadrilaterals, so `u*v*dx(scheme="lobatto")` is exactly diagonal on a $Q_k$ space with `nodes="lobatto"`, and `mass_matrix(lumped=True)` works the same way ([Section 12.3](#123-matrices-and-solvers)). Triangles have no such rule.
 
@@ -1173,7 +1173,7 @@ Neumann and Robin data are natural, written with `ds`.
 
 A Function is evaluated with `u.at(points)` for an `(n, 2)` array, or `u.at(x, y)` with arrays of any shape. `deriv="x"` or `deriv="y"` gives a derivative, and points outside the mesh give NaN. `u.plot()` draws it, and `V.triangulation(u)` returns a matplotlib `Triangulation` with the values for custom plots. A Function of a space on another mesh can enter a form. It is then evaluated at the quadrature points by point location.
 
-The quadrature degree is inferred from the polynomial degree of every term, as in 1D. Low degrees use symmetric rules (1, 3 and 7 points, exact to degrees 1, 2 and 5). Higher degrees use a collapsed Gauss rule, exact at any degree. `dx(8)` or `ds(2, quad_degree=6)` override the inference.
+The quadrature degree is inferred from the polynomial degree of every term, as in 1D, with a non-polynomial function counted as degree $k+1$ ([Section 6.7](#67-quadrature)). Low degrees use symmetric rules (1, 3 and 7 points, exact to degrees 1, 2 and 5). Higher degrees use a collapsed Gauss rule, exact at any degree. `dx(8)` or `ds(2, quad_degree=6)` override the inference.
 
 ### 12.3 Matrices and solvers
 

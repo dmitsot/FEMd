@@ -30,7 +30,7 @@ method.
 | A | [Spaces and 1D meshes](spaces.md#a-spaces-and-1d-meshes) | `SplineSpace`, `LagrangeSpace`, `ProductSpace`, `Mesh1D` |
 | B | [Boundary conditions](spaces.md#b-boundary-conditions) | the `bc=` argument, `BoundaryCondition`, `BCSpec`, `Robin`, `Derivative` |
 | C | [Functions and transfer between spaces](functions.md#c-functions-and-transfer-between-spaces) | `Function`, `ProductFunction`, `Functions`, `Transfer`, `mixed_mass` |
-| D | [Form language](forms.md#d-form-language) | `TrialFunction(s)`, `TestFunction(s)`, `D`, `x`, pointwise functions, `dx`, `ds`, `form`, `Form` |
+| D | [Form language](forms.md#d-form-language) | `TrialFunction(s)`, `TestFunction(s)`, `D`, `x`, pointwise functions, `dx`, `ds`, `set_quadrature_degree`, `form`, `Form` |
 | E | [Matrices](linalg.md#e-matrices) | `Matrix`, `RectMatrix`, `block`, `MatrixInfo` |
 | F | [Linear solvers](linalg.md#f-linear-solvers) | `LinearSolver`, `Solver`, `solve`, `gmres`, `lgmres`, `KrylovInfo`, `eigs`, `EigenResult` |
 | G | [Nonlinear solvers and time stepping](time-stepping.md#g-nonlinear-solvers-and-time-stepping) | `newton`, `NewtonInfo`, `newton_system`, `csnewton`, `CSNewtonInfo`, `IRK`, `butcher` |

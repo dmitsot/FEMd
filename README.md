@@ -2,7 +2,7 @@
 
 ![FEMd](docs/mascot/femd_logo.jpg)
 
-**Version 0.1.3** · [Changes](CHANGELOG.md) · [License: GPL v3 or later](LICENSE)
+**Version 0.1.3** · [License: GPL v3 or later](LICENSE)
 
 **FEMd** is a Finite Element Library for problems in one and two space dimensions. Its core is header-only C++17 and is used from Python. You give a domain, a polynomial degree and boundary conditions, write the equations in weak form, and FEMd assembles and solves them. The form language follows FEniCS, so FEniCS users will find the workflow familiar.
 
@@ -24,7 +24,7 @@ pip install .
 
 - **FFTW (optional).** If FFTW 3 is found at build time (`brew install fftw`, or `apt install libfftw3-dev`), the FFT solver backend is enabled. `fd.has_fftw()` tells you.
 - **OpenMP (optional).** `pip install . -C cmake.define.FEMD_OPENMP=ON`. On macOS run `brew install libomp` first. See Section 1.1 of the manual.
-- **Version.** `fd.__version__` gives the installed version, and [CHANGELOG.md](CHANGELOG.md) lists what changed in each one.
+- **Version.** `fd.__version__` gives the installed version.
 - **Updating.** After downloading a new version, run `pip install .` again and restart the Python kernel.
 
 The library has been developed on macOS. It is built and tested on Linux and macOS at every change.

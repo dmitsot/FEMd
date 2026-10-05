@@ -30,7 +30,8 @@ __all__ = [
     "SplineSpace", "LagrangeSpace", "DGSpace", "FunctionSpace", "ProductSpace",
     "has_fftw", "has_openmp", "set_num_threads", "get_num_threads", "omp_threshold", "Robin", "Derivative", "Matrix", "MatrixInfo", "assemble", "assemble_vector", "assemble_block_vector", "assemble_scalar",
     "TestFunction", "TrialFunction", "Function", "ProductFunction", "TestFunctions", "TrialFunctions", "Functions", "Constant",
-    "D", "dx", "ds", "dS", "jump", "avg", "x", "form", "Form", "Transfer", "mixed_mass", "solve",
+    "D", "dx", "ds", "dS", "jump", "avg", "x", "form", "Form", "set_quadrature_degree", "quadrature_degree",
+    "Transfer", "mixed_mass", "solve",
     "gmres", "lgmres", "cg", "csnewton", "KrylovInfo", "CSNewtonInfo", "newton", "NewtonInfo", "residual_function",
     "newton_system", "IRK", "SSPRK", "ERK", "butcher", "TVBLimiter", "SlopeLimiter", "limited_slope", "minmod",
     "sin", "cos", "exp", "log", "tanh", "sqrt", "sinh", "cosh", "sech",
@@ -88,6 +89,7 @@ from .spaces2d import LagrangeSpace2D, LagrangeSpaceQ, ProductSpace2D, VectorFun
 from .quadmesh import QuadMesh, quad_mesh_from_arrays, quad_mesh_from_triangles, rectangle_quad_mesh, mapped_quad_mesh, quadrangulate  # noqa: E402
 from .io import write_vtk, VTKSeries, read_gmsh  # noqa: E402
 from .forms import curl, rot, VectorElementFunction, sign, max_value, min_value  # noqa: E402
+from .forms import set_quadrature_degree, quadrature_degree  # noqa: E402
 from .forms import abs_ as abs  # noqa: E402,A001  (fd.abs; not in __all__, so a star import keeps the builtin)
 from .elements2d import RTSpace, N1curlSpace, DGSpace2D  # noqa: E402
 from .eigen import eigs, EigenResult  # noqa: E402

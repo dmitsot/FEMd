@@ -95,6 +95,8 @@ public:
         for (int i = 0; i < n_; ++i) z[i] = inv_[i] * r[i];
     }
     std::string name() const override { return "jacobi"; }
+    /// 1 / a_ii, for krylov::cg_jacobi, which applies D^{-1} inside its fused update.
+    const std::vector<double> &inverse_diagonal() const { return inv_; }
 private:
     std::vector<double> inv_;
 };

@@ -1407,6 +1407,62 @@ def poly_degree(e):
     return None
 
 
+_default_quad_degree = None
+
+
+def set_quadrature_degree(degree=None):
+    """Use one quadrature rule in every form created from now on, instead of inferring it per form.
+
+    `degree` is what `dx(degree)` would set on each measure of the form: on a 2D mesh the degree of
+    exactness of the rule on the cells, the sides and the interior facets, on a 1D mesh the number of
+    Gauss points per element (exact to degree 2n - 1). A measure with its own `quad_degree=` still
+    wins, and `dx(scheme="lobatto")` is not affected. `set_quadrature_degree(None)` returns to the
+    inferred rules. Forms made earlier keep their rule."""
+    global _default_quad_degree
+    if degree is None:
+        _default_quad_degree = None
+        return
+    n = int(degree)
+    if n != degree or n < 1:
+        raise ValueError(f"set_quadrature_degree: degree must be a positive integer or None, got {degree!r}")
+    _default_quad_degree = n
+
+
+def quadrature_degree():
+    """The degree set by `set_quadrature_degree`, or None when the rules are inferred per form."""
+    return _default_quad_degree
+
+
+def _measure_degree(measure):
+    """The degree a measure asks for: its own quad_degree, else the global default, else None."""
+    if measure.quad_degree is not None:
+        return int(measure.quad_degree)
+    return _default_quad_degree
+
+
+def quad_degree_estimate(e, kmax):
+    """Degree of the polynomial that stands in for a pointwise expression when choosing the quadrature
+    rule. Polynomial parts count exactly. A non-polynomial expression of the data alone (sin x,
+    exp(-x**2) * sin y, ...) counts as degree kmax, and so does a non-polynomial function of a field
+    (sin u, sqrt(w)). The callers pass kmax = k + 1 for a space of degree k: the interpolant of degree k
+    plus the leading term of its remainder, which is a polynomial of degree k + 1 on each element. So
+    f v is integrated exactly for degree 2k + 1 and the error norm (w - exact)**2 for degree 2k + 2,
+    which is what the square of the leading error term needs."""
+    d = poly_degree(e)
+    if d is not None: return d
+    if not collect_arguments(e, []): return kmax           # data alone: one function to interpolate
+    if isinstance(e, Argument): return _arg_degree(e)
+    if isinstance(e, Sum):
+        return max((quad_degree_estimate(t, kmax) for t in e.terms), default=0)
+    if isinstance(e, Prod):
+        return sum(quad_degree_estimate(f, kmax) for f in e.factors)
+    if isinstance(e, Pow):
+        if float(e.n).is_integer() and e.n >= 0:
+            return int(e.n) * quad_degree_estimate(e.base, kmax)
+        return kmax
+    return kmax
+
+
 def diff(e, slot):
     """Symbolic derivative of a pointwise expression w.r.t. the Function slot (name, field, k)."""
     if isinstance(e, (Const, Constant, Spatial, Normal)):
@@ -1790,16 +1846,20 @@ class Form:
         for t in self.terms:
             if t.measure.kind != "dx" or t.measure.scheme == "lobatto":
                 continue
-            if t.measure.quad_degree is not None:
-                m = max(m, int(t.measure.quad_degree)); continue
+            if _measure_degree(t.measure) is not None:
+                m = max(m, _measure_degree(t.measure)); continue
             d = poly_degree(t.coeff)
             for a in (t.test, t.trial):
                 if a is not None and d is not None:
                     d += max(a.space.degree - a.deriv, 0)
             if d is None:
-                m = max(m, max(s.degree for s in self.spaces.values()) + 2)
-            else:
-                m = max(m, d // 2 + 1)
+                # a non-polynomial function of the data or of a field counts as degree p + 1, the
+                # interpolant plus the leading term of its remainder (quad_degree_estimate)
+                d = quad_degree_estimate(t.coeff, max(s.degree for s in self.spaces.values()) + 1)
+                for a in (t.test, t.trial):
+                    if a is not None:
+                        d += max(a.space.degree - a.deriv, 0)
+            m = max(m, d // 2 + 1)
         self.quad_degree = max(m, 1)
         self._caches = {}
         self._constant_result = None
@@ -1853,11 +1913,13 @@ class Form:
             k = t.measure.kind
             if k == "dx" and t.measure.scheme == "lobatto":
                 continue
-            if t.measure.quad_degree is not None:
-                deg[k] = max(deg[k], int(t.measure.quad_degree)); continue
+            if _measure_degree(t.measure) is not None:
+                deg[k] = max(deg[k], _measure_degree(t.measure)); continue
             d = poly_degree(t.coeff)
             arg_d = sum(_arg_degree(a) for a in (t.test, t.trial) if a is not None)
-            deg[k] = max(deg[k], arg_d + (kmax + 2 if d is None else d))
+            if d is None:
+                d = quad_degree_estimate(t.coeff, kmax + 1)  # non-polynomial parts count as degree kmax + 1
+            deg[k] = max(deg[k], arg_d + d)
         self.quad_degree = max(deg["dx"], 1)
         self.facet_degree = max(deg["ds"], 1)
         self.interior_degree = max(deg["dS"], 1)
