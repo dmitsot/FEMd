@@ -15,9 +15,15 @@
 //  "rk3" (Kutta's third order), "rk4" (the classical fourth order method) and "3/8"
 //  (Kutta's 3/8 rule, order 4).  Any other explicit tableau goes in as (A, b, c).
 //
+//  The vector updates of a step run in parallel with OpenMP above
+//  detail::vector_par_threshold entries (one statement per entry, no reduction, so the
+//  result has the same bits for any number of threads).  The work of a stage is in the
+//  rate, assembly and mass solve, not here.
+//
 #ifndef FEMD_TIMESTEP_EXPLICIT_RK_HPP
 #define FEMD_TIMESTEP_EXPLICIT_RK_HPP
 
+#include "femd/util/omp.hpp"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -101,6 +107,8 @@ public:
     void step(std::vector<double> &u, double t, double dt, Rate &&rate)
     {
         const std::size_t n = u.size();
+        const long nl = static_cast<long>(n);
+        const bool par = n > detail::vector_par_threshold;
         const int s = T_.s;
         if (k_.size() != static_cast<std::size_t>(s)) k_.assign(static_cast<std::size_t>(s), std::vector<double>());
         U_.resize(n);
@@ -112,8 +120,10 @@ public:
             {
                 const double w = dt * T_.a(i, j);
                 if (w == 0.0) continue;
-                const std::vector<double> &kj = k_[j];
-                for (std::size_t q = 0; q < n; ++q) U_[q] += w * kj[q];
+                const double *kj = k_[j].data();
+                double *U = U_.data();
+                FEMD_OMP_FOR_IF(par)
+                for (long q = 0; q < nl; ++q) U[q] += w * kj[q];
             }
             rate(t + T_.c[i] * dt, U_, k_[i]);
             if (k_[i].size() != n) throw std::invalid_argument("explicit RK: the rate returned the wrong length");
@@ -122,8 +132,10 @@ public:
         {
             const double w = dt * T_.b[i];
             if (w == 0.0) continue;
-            const std::vector<double> &ki = k_[i];
-            for (std::size_t q = 0; q < n; ++q) u[q] += w * ki[q];
+            const double *ki = k_[i].data();
+            double *uu = u.data();
+            FEMD_OMP_FOR_IF(par)
+            for (long q = 0; q < nl; ++q) uu[q] += w * ki[q];
         }
     }
 

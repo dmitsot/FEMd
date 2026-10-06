@@ -16,6 +16,7 @@ Weak forms are written with symbols and measures and compiled by `form`
 | `Constant(value, name=None)` | class | a number read at assembly, for time and parameters |
 | `sin`, `cos`, `exp`, `log`, `tanh`, `sqrt` | function | pointwise functions of known fields and `x` |
 | `dx` | measure | integral over the interval |
+| `set_quadrature_degree(n)`, `quadrature_degree()` | function | one rule for every form of a code, or the inferred rules |
 | `ds` | measure | evaluation at the ends |
 | `dS` | measure | the interior facets (vertices between elements, and the periodic seam) |
 | `e('-')`, `e('+')` | restriction | the value from the left or the right element on a facet |
@@ -121,6 +122,16 @@ must be restricted, and so must a Function of a broken space (DG, RT, N1curl) or
 A tensor restricts componentwise (`grad(u)('-')`, `as_vector([...])('+')`). A
 restriction to one side of an expression already restricted to the other raises
 `ValueError`.
+
+### D.4a `set_quadrature_degree(degree=None)` and `quadrature_degree()`
+
+One quadrature rule for every form created afterwards, instead of a rule inferred per form.
+
+| argument | type | default | meaning |
+|---|---|---|---|
+| `degree` | positive int or `None` | `None` | What `dx(degree)` would set on each measure of a form: on a 1D mesh the number of Gauss points per element (exact to degree $2n-1$), on a 2D mesh the degree of exactness on the cells, the sides and the interior facets. `None` returns to the inferred rules. |
+
+A measure with its own `quad_degree=` keeps it, `dx(scheme="lobatto")` is not affected, and forms made before the call keep their rule. **Raises** `ValueError` for a degree that is not a positive integer. `quadrature_degree()` returns the current setting, `None` when the rules are inferred ([manual, Section 6.7](../manual.md#67-quadrature)).
 
 ### D.5 `form(expr, space=None)`
 
