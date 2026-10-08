@@ -161,7 +161,7 @@ use `newton`.
 | `krylov_iterations` | int | Krylov iterations over all steps. |
 | `residual` | float | $\lVert F(x) \rVert_2$ at the end. |
 
-### G.6 `IRK(M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0, left=None, right=None, dirichlet=None, newton="exact", tol=1e-12, rtol=0, xtol=1e-12, maxiter=20, line_search=False, backend="Auto")`
+### G.6 `IRK(M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0, left=None, right=None, dirichlet=None, newton="exact", tol=1e-12, rtol=0, xtol=1e-12, maxiter=20, line_search=False, backend="Auto", refresh="auto")`
 
 Implicit Runge-Kutta stepper for $M u' = f(t, u)$, with optional time-dependent
 data on the built-in boundary conditions (manual, Sections [7.6](../manual.md#76-implicit-runge-kutta-time-stepping-and-algebraic-systems) and [7.7](../manual.md#77-tolerances-round-off-and-conservation)). On a 2D mesh see [L.11](elements-2d.md#l11-irk-on-2d-meshes)
@@ -181,12 +181,13 @@ data on the built-in boundary conditions (manual, Sections [7.6](../manual.md#76
 | `time` | `Constant` or `None` | `None` | The Constant that stands for $t$ in the forms of `rhs`. Set to the stage time before each evaluation of $f$ and $f'$, and to the new time after each step. |
 | `t0` | float | `0.0` | The initial time. |
 | `left`, `right` | number, tuple, callable of $t$, or `None` | `None` | Data on the conditions built into $V$ at each end, one value per built-in functional. On a `ProductSpace`, a list with one such entry per field (`None` for none). The state is then a Function of `V.unconstrained` carrying the data, and the stages solve $M c' = f(t, u_g + Pc) - M u_g'$ for the coefficients in $V$. The derivative of callable data is taken by the complex step, or by a central difference when the callable refuses a complex $t$. Without them, the data given with the space are used, if any. |
-| `newton` | str | `"exact"` | `"exact"` re-evaluates the stage Jacobian at every iteration. `"simplified"` factors it once per step at $u^n$. |
+| `newton` | str | `"exact"` | `"exact"` re-evaluates the stage Jacobian at every iteration. `"simplified"` factors it once per step at $u^n$. `"frozen"` keeps that factorization from step to step and renews it as `refresh` says, or at once when Newton fails. A misspelled mode raises `ValueError` naming the closest one. |
 | `tol`, `rtol` | float | `1e-12`, `0` | Absolute and relative tolerances on the stage residual. |
 | `xtol` | float | `1e-12` | Step-based stopping test of `newton_system`, which ends the iteration at the round-off floor. `0` switches it off. |
 | `maxiter` | int | `20` | Newton iterations per step. |
-| `line_search` | bool | `False` | Armijo backtracking in the stage solve. |
+| `line_search` | bool | `False` | Armijo backtracking in the stage solve: the Newton step is halved until the stage residual decreases. |
 | `backend` | `Solver` or name | `"Auto"` | Backend for the stage Jacobian. |
+| `refresh` | `"auto"` or int | `"auto"` | With `newton="frozen"`, when to factor anew at the next step. `"auto"`: after a step with more than `maxiter // 2` iterations, or after a step on an older factorization with more than the last new one's count plus half of it (at least 2 more). An int `k`: after a step with more than `k` iterations. The same rule in 1D and 2D. |
 
 **Output.** An `IRK` object.
 
@@ -199,6 +200,8 @@ data on the built-in boundary conditions (manual, Sections [7.6](../manual.md#76
 | `times()` | none | array, length $s$ | The stage times $t + c_i \Delta t$ of the next step. |
 | `dt` | attribute | float | Current step. |
 | `history` | attribute | list of int | Newton iterations of each step. |
+| `factorizations` | attribute | int | Factorizations of the stage Jacobian so far. |
+| `refresh` | attribute | `"auto"` or int | The `refresh=` rule, can be changed between steps. |
 | `A`, `b`, `c` | attribute | arrays | The Butcher tableau. |
 | `s` | attribute | int | Number of stages. |
 | `M`, `V`, `P` | attribute | | The mass matrix, its space, and the `ProductSpace` of the stages, every field of $V$ once per stage. |

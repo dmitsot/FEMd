@@ -335,6 +335,26 @@ class _Data:
         return self.V.lift(left=self._each(self._rate, self.left, t), right=self._each(self._rate, self.right, t)).vector
 
 
+_NEWTON_MODES = ("exact", "simplified", "frozen")
+
+
+def _check_newton(newton):
+    """newton= must be one of _NEWTON_MODES; a misspelling gets the closest one suggested."""
+    if newton in _NEWTON_MODES:
+        return newton
+    import difflib
+    close = difflib.get_close_matches(str(newton), _NEWTON_MODES, n=1)
+    hint = f" (did you mean '{close[0]}'?)" if close else ""
+    raise ValueError(f"IRK: newton must be 'exact', 'simplified' or 'frozen', got {newton!r}{hint}")
+
+
+def _check_refresh(refresh):
+    if not (refresh == "auto" or (isinstance(refresh, (int, np.integer)) and not isinstance(refresh, bool)
+                                  and refresh >= 1)):
+        raise ValueError("IRK: refresh must be 'auto' or a positive number of Newton iterations")
+    return refresh
+
+
 class IRK:
     """An implicit Runge-Kutta stepper for  M u' = f(t, u).
 
@@ -363,7 +383,12 @@ class IRK:
     method, stages: "gauss" (Gauss-Legendre, order 2s, conserves quadratic invariants) or
       "radau" (Radau IIA, order 2s-1, L-stable), s = 1, 2, 3; or method=(A, b).
     newton: "exact" re-evaluates the stage Jacobian at every iteration (classical Newton,
-      quadratic convergence); "simplified" factors it once per step at (t_n, u^n) and reuses it.
+      quadratic convergence); "simplified" factors it once per step at (t_n, u^n) and reuses it;
+      "frozen" keeps that factorization from step to step, renewed at once when Newton fails and
+      at the next step when it slows down (refresh="auto": the step took more than maxiter/2
+      iterations, or more than 1.5 times those of the last new factorization; refresh=k: more
+      than k).  irk.factorizations counts the factorizations.
+    line_search: halve the Newton step until the stage residual decreases (Armijo).
     tol, xtol: Newton stops when ||F|| <= tol, or when the error left in the stages is estimated
       below xtol ||K|| from the contraction rate of the steps, which catches the round-off floor
       of ||F|| on large problems, where it can exceed tol (3e-10 for KdV at n = 8000).
@@ -397,7 +422,7 @@ class IRK:
 
     def __init__(self, M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0,
                  left=None, right=None, dirichlet=None, newton="exact", tol=1e-12, rtol=0.0, xtol=1e-12, maxiter=20,
-                 line_search=False, backend="Auto"):
+                 line_search=False, backend="Auto", refresh="auto"):
         from . import Matrix, Form, ProductSpace, Transfer
         from .forms import Function
         if dirichlet is not None:
@@ -418,8 +443,8 @@ class IRK:
         else:
             self.A, self.b, self.c = butcher(method, stages)
             self.method = f"{method}, {self.b.size} stages"
-        if newton not in ("exact", "simplified"):
-            raise ValueError("IRK: newton must be 'exact' or 'simplified'")
+        self.newton, self.refresh = _check_newton(newton), _check_refresh(refresh)
+        self._frozen, self.factorizations, self._fresh_iters = None, 0, None
         self.M, self.V, self.dt = M, M.space, float(dt)
         self.s, self.n = self.b.size, self.V.dim
         from .linalg import _space_data
@@ -576,14 +601,32 @@ class IRK:
         # stage Jacobian lives in the product numbering, so the solver converts both ways
         to_P = lambda Ks: self._gather(np.split(np.asarray(Ks, dtype=np.float64), self.s))        # noqa: E731
         to_stacked = lambda Kp: np.concatenate(self._split(Kp))                                   # noqa: E731
+        run = lambda solve: _step_core(self._core, cn, self.t, self.dt, self._F, self.M._K, solve,   # noqa: E731
+                                       to_stacked(self.K))
         if self.newton == "exact":
             def solve(Ks, r):
+                self.factorizations += 1
                 S = self.jacobian(self.stages(cn, to_P(Ks))[1]).solver(self.backend)
                 return to_stacked(np.asarray(S.solve(to_P(r)), dtype=np.float64))
+            info = run(solve)
         else:
-            frozen = self.jacobian([cn] * self.s, [self.t] * self.s).solver(self.backend)
-            solve = lambda Ks, r: to_stacked(np.asarray(frozen.solve(to_P(r)), dtype=np.float64))   # noqa: E731
-        info = _step_core(self._core, cn, self.t, self.dt, self._F, self.M._K, solve, to_stacked(self.K))
+            def factor():                                   # the stage Jacobian at (t_n, u^n), factored
+                self.factorizations += 1
+                return (self.dt, self.jacobian([cn] * self.s, [self.t] * self.s).solver(self.backend))
+            on = lambda Ks, r: to_stacked(np.asarray(self._frozen[1].solve(to_P(r)), dtype=np.float64))  # noqa: E731
+            fresh = self.newton == "simplified" or self._frozen is None or self._frozen[0] != self.dt
+            if fresh:
+                self._frozen = factor()
+            info = run(on)
+            if self.newton == "frozen" and not fresh and not info.converged:
+                self._frozen = factor()                     # gone stale: refactor at (t_n, u^n), retry
+                info = run(on)
+                fresh = True
+            if self.newton == "frozen" and info.converged:
+                if fresh:
+                    self._fresh_iters = info.iterations     # what a new factorization achieves now
+                if self._stale(info.iterations, fresh):
+                    self._frozen = None                     # slow: refactor at the next step's start
         if not info.converged:
             raise RuntimeError(f"IRK: Newton did not converge at t = {self.t + self.dt:g}: ||F|| = {info.residual:.2e}"
                                f" after {info.iterations} iterations{' (' + info.message + ')' if info.message else ''}; "
@@ -595,6 +638,24 @@ class IRK:
             self.time.assign(self.t)
         self.history.append(info.iterations)
         return info
+
+    def _stale(self, iterations, fresh):
+        """newton="frozen": whether the next step should start with a new factorization, after a step
+        that took this many Newton iterations (fresh: the step began with a new one).
+
+        refresh="auto": when the step used more than half of maxiter (an older factorization would
+        likely fail, and a failed step costs maxiter iterations before the retry), or when a step on
+        an older factorization took more than the last fresh one plus half of it (at least 2 more).
+        A number k: when the step took more than k iterations."""
+        r = self.refresh
+        if r != "auto":
+            return iterations > r
+        if iterations > self.maxiter // 2:
+            return True
+        if fresh:
+            return False
+        base = self._fresh_iters if self._fresh_iters is not None else iterations
+        return iterations > base + max(2, base // 2)
 
     def __repr__(self):
         extra = ", boundary data" if self.lifted else ""
@@ -773,11 +834,8 @@ class _IRK2D(IRK):
         if not isinstance(M, SparseMatrix) or M.space is None or M.shape[0] != M.shape[1]:
             raise TypeError("IRK: on a 2D mesh M must be a square SparseMatrix of a space (from a form) or a rank-2 Form")
         self.A, self.b, self.c, self.method = _tableau(method, stages)
-        if newton not in ("exact", "simplified", "frozen"):
-            raise ValueError("IRK: newton must be 'exact', 'simplified' or 'frozen'")
-        if not (refresh == "auto" or (isinstance(refresh, (int, np.integer)) and not isinstance(refresh, bool)
-                                      and refresh >= 1)):
-            raise ValueError("IRK: refresh must be 'auto' or a positive number of Newton iterations")
+        _check_newton(newton)
+        _check_refresh(refresh)
         self.M, self.V, self.dt = M, M.space, float(dt)
         self.s, self.n = self.b.size, self.V.dim
         self._frozen, self.factorizations, self._fresh_iters = None, 0, None
@@ -947,24 +1005,6 @@ class _IRK2D(IRK):
             self.time.assign(self.t)
         self.history.append(info.iterations)
         return info
-
-    def _stale(self, iterations, fresh):
-        """newton="frozen": whether the next step should start with a new factorization, after a step
-        that took this many Newton iterations (fresh: the step began with a new one).
-
-        refresh="auto": when the step used more than half of maxiter (an older factorization would
-        likely fail, and a failed step costs maxiter iterations before the retry), or when a step on
-        an older factorization took more than the last fresh one plus half of it (at least 2 more).
-        A number k: when the step took more than k iterations."""
-        r = self.refresh
-        if r != "auto":
-            return iterations > r
-        if iterations > self.maxiter // 2:
-            return True
-        if fresh:
-            return False
-        base = self._fresh_iters if self._fresh_iters is not None else iterations
-        return iterations > base + max(2, base // 2)
 
     def __repr__(self):
         extra = ", boundary data" if self.lifted else ""

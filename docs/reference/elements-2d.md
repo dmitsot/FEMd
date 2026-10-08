@@ -293,7 +293,7 @@ per-point Jacobians.
 
 `fd.IRK(M, rhs, dt, method, stages, *, jacobian=None, unknown=None, time=None, t0=0.0, dirichlet=None, newton="simplified", tol=1e-12, rtol=0, xtol=1e-12, maxiter=20, line_search=False, backend="auto")`
 is chosen when `M` is a `SparseMatrix` or rank-2 `Form` on a 2D space or system ([manual, Section 12.6](../manual.md#126-implicit-time-stepping)).
-The inputs are those of [G.6](time-stepping.md#g6-irkm-rhs-dt-methodgauss-stages2--jacobiannone-unknownnone-timenone-t000-leftnone-rightnone-dirichletnone-newtonexact-tol1e-12-rtol0-xtol1e-12-maxiter20-line_searchfalse-backendauto), with these differences.
+The inputs are those of [G.6](time-stepping.md#g6-irkm-rhs-dt-methodgauss-stages2--jacobiannone-unknownnone-timenone-t000-leftnone-rightnone-dirichletnone-newtonexact-tol1e-12-rtol0-xtol1e-12-maxiter20-line_searchfalse-backendauto-refreshauto), with these differences.
 
 | argument | meaning |
 |---|---|
@@ -306,9 +306,9 @@ The inputs are those of [G.6](time-stepping.md#g6-irkm-rhs-dt-methodgauss-stages
 
 | member | meaning |
 |---|---|
-| `step(u, dt=None)` | As in [G.6](time-stepping.md#g6-irkm-rhs-dt-methodgauss-stages2--jacobiannone-unknownnone-timenone-t000-leftnone-rightnone-dirichletnone-newtonexact-tol1e-12-rtol0-xtol1e-12-maxiter20-line_searchfalse-backendauto). `u` a Function, `ProductFunction`, `VectorFunction` or array of $V$, or of `V.unconstrained` with `dirichlet=`. A new `dt` drops the frozen factorization. |
+| `step(u, dt=None)` | As in [G.6](time-stepping.md#g6-irkm-rhs-dt-methodgauss-stages2--jacobiannone-unknownnone-timenone-t000-leftnone-rightnone-dirichletnone-newtonexact-tol1e-12-rtol0-xtol1e-12-maxiter20-line_searchfalse-backendauto-refreshauto). `u` a Function, `ProductFunction`, `VectorFunction` or array of $V$, or of `V.unconstrained` with `dirichlet=`. A new `dt` drops the frozen factorization. |
 | `K` | The stages of the last step, stacked: $[K_1; \dots; K_s]$, length $sn$. |
-| `stages(cn, K)`, `residual(cn, K)` | As in [G.6](time-stepping.md#g6-irkm-rhs-dt-methodgauss-stages2--jacobiannone-unknownnone-timenone-t000-leftnone-rightnone-dirichletnone-newtonexact-tol1e-12-rtol0-xtol1e-12-maxiter20-line_searchfalse-backendauto), in the stacked numbering. |
+| `stages(cn, K)`, `residual(cn, K)` | As in [G.6](time-stepping.md#g6-irkm-rhs-dt-methodgauss-stages2--jacobiannone-unknownnone-timenone-t000-leftnone-rightnone-dirichletnone-newtonexact-tol1e-12-rtol0-xtol1e-12-maxiter20-line_searchfalse-backendauto-refreshauto), in the stacked numbering. |
 | `jacobian(Us, ts=None)` | The $sn \times sn$ stage Jacobian as a `SparseMatrix`. |
 | `stage_solver(cn)` | The simplified-Newton solver at $(t, c^n)$, with `.solve(r)` and `.kinds` (the backend of each factored system). |
 | `factorizations` | Sparse factorizations so far. |
