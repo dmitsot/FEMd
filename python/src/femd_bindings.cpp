@@ -13,6 +13,7 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <complex>
 
 #include "femd/femd.hpp"
 #include "femd/krylov/adapters.hpp"
@@ -624,6 +625,15 @@ NB_MODULE(_femd, m)
         .def_prop_rw("symmetric", [](const AssembledMatrix &K) { return K.symmetric; }, [](AssembledMatrix &K, bool s) { K.symmetric = s; })
         .def("clear", &AssembledMatrix::clear)
         .def("add_entry", [](AssembledMatrix &K, int i, int j, double v) { K.add(i, j, v); }, "i"_a, "j"_a, "v"_a)
+        .def("add_entries", [](AssembledMatrix &K, IArr i, IArr j, DArr v) {
+                 const std::size_t m = v.shape(0);
+                 if (i.shape(0) != m || j.shape(0) != m) throw std::invalid_argument("add_entries: i, j and v must have the same length");
+                 for (std::size_t t = 0; t < m; ++t)
+                 {
+                     if (i.data()[t] < 0 || i.data()[t] >= K.n || j.data()[t] < 0 || j.data()[t] >= K.n) throw std::out_of_range("add_entries: index out of range");
+                     K.add(i.data()[t], j.data()[t], v.data()[t]);
+                 }
+             }, "i"_a, "j"_a, "v"_a, "Add the triplets (i, j, v); entries outside the band become periodic corners.")
         .def("to_coo", &to_coo)
         .def("matvec",
              [](const AssembledMatrix &K, DArr x)
@@ -685,6 +695,33 @@ NB_MODULE(_femd, m)
              },
              "product"_a, "I"_a, "J"_a, "rows"_a, "cols"_a, "vals"_a,
              "Scatter block (I, J), given as field-local triplets, through the product numbering.")
+        .def("norm1", [](const AssembledMatrix &K) {
+                 if (K.n == 0) return 1.0;
+                 std::vector<double> col(static_cast<std::size_t>(K.n), 0.0);
+                 bool any = false;
+                 for (int i = 0; i < K.n; ++i)
+                     for (int off = -K.p; off <= K.p; ++off)
+                     {
+                         const int j = i + off;
+                         if (j < 0 || j >= K.n) continue;
+                         const double v = K.band[static_cast<std::size_t>(i) * K.w + (off + K.p)];
+                         if (v != 0.0) { col[static_cast<std::size_t>(j)] += std::abs(v); any = true; }
+                     }
+                 for (std::size_t q = 0; q < K.ov.size(); ++q) { col[static_cast<std::size_t>(K.oj[q])] += std::abs(K.ov[q]); any = true; }
+                 if (!any) return 1.0;
+                 return *std::max_element(col.begin(), col.end()); },
+             "max_j sum_i |a_ij|, the largest column sum (1 for a zero matrix).")
+        .def("add_csr_block", [](AssembledMatrix &K, const ProductSpace &P, int I, int J, const CSRMatrix &B, double alpha)
+             {
+                 GilRelease release;
+                 for (int i = 0; i < B.nrows(); ++i)
+                 {
+                     const int gi = P.global(I, i);
+                     for (int q = B.indptr()[i]; q < B.indptr()[i + 1]; ++q) K.add(gi, P.global(J, B.indices()[q]), alpha * B.data[q]);
+                 }
+             },
+             "product"_a, "I"_a, "J"_a, "B"_a, "alpha"_a = 1.0,
+             "Block (I, J) += alpha B for a CSRMatrix B (field-local rows and columns), through the product numbering.")
         .def("add_scaled_block", [](AssembledMatrix &K, const ProductSpace &P, int I, int J, const AssembledMatrix &B, double alpha)
              {
                  GilRelease release;
@@ -769,7 +806,7 @@ NB_MODULE(_femd, m)
         .def_prop_ro("stages", [](const ExplicitRK &rk) { return rk.tableau().s; })
         .def_prop_ro("order", [](const ExplicitRK &rk) { return rk.tableau().order; })
         .def_prop_ro("name", [](const ExplicitRK &rk) { return rk.tableau().name; })
-        .def_prop_ro("c", [](const ExplicitRK &rk) { return to_np(rk.tableau().c); })
+        .def_prop_ro("c", [](const ExplicitRK &rk) { return to_np(rk.tableau().c); }, nb::rv_policy::move)
         .def("step", [](ExplicitRK &rk, Vec u, double t, double dt, nb::callable f, nb::handle Minv) {
                  const std::size_t n = u.shape(0);
                  KOp Mop = as_precon(Minv, n);            // None: M = I; a LinearSolver in C++; or a callable
@@ -786,6 +823,215 @@ NB_MODULE(_femd, m)
              }, "u"_a, "t"_a, "dt"_a, "f"_a, "Minv"_a.none(),
              "One step in place: u <- u + dt sum b_i k_i, k_i = M^{-1} f(t + c_i dt, U_i).  Minv: None (M = I), a "
              "LinearSolver (the factored mass matrix, applied in C++) or a callable r -> M^{-1} r.");
+    // ---- compiled integrands ---------------------------------------------------------
+    nb::class_<Integrand>(m, "Integrand",
+            "The coefficient of a form as a short program over registers, evaluated at all quadrature points in C++ "
+            "(forms/integrand.hpp), in parallel, each point by one thread.")
+        .def("__init__", [](Integrand *self, IArr code, int nreg, int nconst, int ninput) {
+                 new (self) Integrand(std::vector<int>(code.data(), code.data() + code.shape(0)), nreg, nconst, ninput);
+             }, "code"_a, "nreg"_a, "nconst"_a, "ninput"_a,
+             "code: 4 ints per instruction (op, out, a, b).  Ops: 0 CONST a, 1 X, 2 Y, 3 NX (a = sign), 4 NY, 5 INPUT a, "
+             "6 ADD a b, 7 MUL a b, 8 POW a consts[b], 9 SIN, 10 COS, 11 EXP, 12 LOG, 13 TANH, 14 SQRT, 15 SINH, 16 COSH, "
+             "17 SECH, 18 ABS, 19 SIGN (a).  The last instruction's out register is the result.")
+        .def_prop_ro("instructions", &Integrand::instructions)
+        .def_prop_ro("registers", &Integrand::registers)
+        .def_prop_ro("needs_coordinates", &Integrand::needs_coordinates)
+        .def_prop_ro("needs_normal", &Integrand::needs_normal)
+        .def("evaluate", [](const Integrand &P, std::size_t npts, nb::handle xs, nb::handle ys, nb::handle nx, nb::handle ny,
+                            const std::vector<DArr> &inputs, DArr consts) {
+                 auto ptr = [npts](nb::handle h, const char *what) -> const double * {
+                     if (h.is_none()) return static_cast<const double *>(nullptr);
+                     DArr a = nb::cast<DArr>(h);
+                     if (a.shape(0) != npts) throw std::invalid_argument(std::string("Integrand.evaluate: ") + what + " has the wrong length");
+                     return a.data();
+                 };
+                 const double *px = ptr(xs, "xs"), *py = ptr(ys, "ys"), *pnx = ptr(nx, "nx"), *pny = ptr(ny, "ny");
+                 std::vector<const double *> in;
+                 in.reserve(inputs.size());
+                 for (const DArr &a : inputs)
+                 {
+                     if (a.shape(0) != npts) throw std::invalid_argument("Integrand.evaluate: an input has the wrong length");
+                     in.push_back(a.data());
+                 }
+                 std::vector<double> cv(consts.data(), consts.data() + consts.shape(0)), out(npts);
+                 {
+                     GilRelease g;
+                     P.evaluate(npts, px, py, pnx, pny, in, cv, out.data());
+                 }
+                 return to_np(std::move(out));
+             }, "npts"_a, "xs"_a.none(), "ys"_a.none(), "nx"_a.none(), "ny"_a.none(), "inputs"_a, "consts"_a,
+             "The coefficient at npts points: xs, ys, nx, ny arrays or None, inputs the field values, consts the constants.");
+    // ---- Arnoldi (solve/eigen.hpp) ----------------------------------------------------
+    m.def("arnoldi_largest", [](int n, nb::handle op, nb::handle B, int k, int ncv, double tol, int maxiter, bool symmetric, DArr v0) {
+              const std::size_t nn = static_cast<std::size_t>(n);
+              KOp opf = as_operator(op, nn);
+              std::function<void(const std::vector<double> &, std::vector<double> &)> bf;
+              if (!B.is_none()) bf = as_operator(B, nn);
+              ArnoldiOptions o; o.k = k; o.ncv = ncv; o.tol = tol; o.maxiter = maxiter; o.symmetric = symmetric;
+              if (v0.shape(0) != nn) throw std::invalid_argument("arnoldi_largest: v0 must have length n");
+              std::vector<double> start(v0.data(), v0.data() + nn);
+              ArnoldiResult R = arnoldi_largest(n, opf, bf, o, start);     // the operators may call back into Python
+              return nb::make_tuple(to_np(R.values), to_np(R.vectors), to_np(R.residuals), R.restarts, R.operator_applications,
+                                    R.converged, R.message);
+          }, "n"_a, "op"_a, "B"_a.none(), "k"_a, "ncv"_a = 0, "tol"_a = 0.0, "maxiter"_a = 0, "symmetric"_a = false, "v0"_a,
+          "The k eigenvalues of largest magnitude of the operator op (an AssembledMatrix, a CSRMatrix or a callable x -> op x) "
+          "by Arnoldi with restarts and locking, in the inner product of B (None: standard).  Returns (values, vectors as one "
+          "array of k columns of length n, residual estimates, restarts, operator applications, converged, message).");
+    // ---- Newton's method (solve/newton.hpp) --------------------------------------------
+    m.def("newton_solve", [](Vec x, nb::callable residual, nb::callable direction, double tol, double rtol, double xtol,
+                             int maxiter, bool line_search, nb::handle progress) {
+              const std::size_t n = x.shape(0);
+              std::vector<double> xv(x.data(), x.data() + n);
+              auto res = [&](const std::vector<double> &xc, std::vector<double> &r) {
+                  nb::object o = residual(to_np(xc));
+                  DArr a = nb::cast<DArr>(o);
+                  if (a.shape(0) != n) throw std::invalid_argument("newton_solve: the residual returned the wrong length");
+                  r.assign(a.data(), a.data() + n);
+              };
+              // direction(x, r) -> d, or raises ValueError / RuntimeError when the Jacobian cannot be
+              // factored, which ends the iteration with that message
+              auto dir = [&](const std::vector<double> &xc, const std::vector<double> &r, std::vector<double> &d, int &lin, std::string &msg) {
+                  try
+                  {
+                      nb::object o = direction(to_np(xc), to_np(r));
+                      if (nb::isinstance<nb::tuple>(o))
+                      {
+                          nb::tuple t = nb::cast<nb::tuple>(o);
+                          DArr a = nb::cast<DArr>(t[0]);
+                          d.assign(a.data(), a.data() + a.shape(0));
+                          lin = nb::cast<int>(t[1]);
+                      }
+                      else
+                      {
+                          DArr a = nb::cast<DArr>(o);
+                          d.assign(a.data(), a.data() + a.shape(0));
+                          lin = 0;
+                      }
+                      return true;
+                  }
+                  catch (nb::python_error &e)
+                  {
+                      if (e.matches(PyExc_ValueError) || e.matches(PyExc_RuntimeError) || e.matches(PyExc_ArithmeticError))
+                      {
+                          msg = std::string("the Jacobian could not be factored (") + nb::cast<std::string>(nb::str(e.value())) + ")";
+                          return false;
+                      }
+                      throw;
+                  }
+              };
+              NewtonOptions o; o.tol = tol; o.rtol = rtol; o.xtol = xtol; o.maxiter = maxiter; o.line_search = line_search;
+              std::function<void(int, double, double, int)> prog;
+              if (!progress.is_none())
+              {
+                  nb::callable pc = nb::cast<nb::callable>(progress);
+                  prog = [pc](int it, double nr, double s, int lin) { pc(it, nr, s, lin); };
+              }
+              NewtonReport rep = newton_solve(xv, res, dir, o, prog);
+              std::copy(xv.begin(), xv.end(), x.data());
+              return nb::make_tuple(rep.converged, rep.iterations, to_np(rep.residuals), to_np(rep.steps), to_np(rep.linear_iterations), rep.message);
+          }, "x"_a, "residual"_a, "direction"_a, "tol"_a = 1e-10, "rtol"_a = 0.0, "xtol"_a = 0.0, "maxiter"_a = 50,
+          "line_search"_a = true, "progress"_a.none() = nb::none(),
+          "Newton's method on F(x) = 0, x (a contiguous float64 array) updated in place to the last accepted iterate.  "
+          "residual(x) -> F(x); direction(x, r) -> d solving J(x) d = -r, or (d, linear_iterations); it may raise ValueError "
+          "or RuntimeError to say the Jacobian could not be factored.  progress(it, ||F||, step, linear_iterations) is called "
+          "after each iteration.  Returns (converged, iterations, residuals, steps, linear_iterations, message).");
+    // ---- SSP Runge-Kutta ---------------------------------------------------------------
+    nb::class_<SSPRK>(m, "SSPRK", "Explicit strong-stability-preserving Runge-Kutta stepper, Shu-Osher form with a limiter after every stage (timestep/ssp_rk.hpp).")
+        .def(nb::init<int, int>(), "stages"_a, "order"_a)
+        .def_prop_ro("stages", &SSPRK::stages)
+        .def_prop_ro("order", &SSPRK::order)
+        .def_prop_ro("cfl", &SSPRK::cfl)
+        .def_prop_ro("name", &SSPRK::name)
+        .def("step", [](SSPRK &rk, Vec u, double t, double dt, nb::callable rate, nb::handle limiter) {
+                 const std::size_t n = u.shape(0);
+                 std::vector<double> uv(u.data(), u.data() + n);
+                 auto r = [&](double tt, const std::vector<double> &U, std::vector<double> &k) {
+                     nb::object o = rate(tt, to_np(U));
+                     DArr a = nb::cast<DArr>(o);
+                     if (a.shape(0) != n) throw std::invalid_argument("SSPRK: rate(t, u) returned the wrong length");
+                     k.assign(a.data(), a.data() + n);
+                 };
+                 if (limiter.is_none())
+                     rk.step(uv, t, dt, r, [](std::vector<double> &) {});
+                 else
+                 {
+                     nb::callable lim = nb::cast<nb::callable>(limiter);
+                     rk.step(uv, t, dt, r, [&](std::vector<double> &v) {
+                         nb::object o = lim(to_np(v));
+                         DArr a = nb::cast<DArr>(o);
+                         if (a.shape(0) != n) throw std::invalid_argument("SSPRK: the limiter returned the wrong length");
+                         v.assign(a.data(), a.data() + n);
+                     });
+                 }
+                 std::copy(uv.begin(), uv.end(), u.data());
+             }, "u"_a, "t"_a, "dt"_a, "rate"_a, "limiter"_a.none() = nb::none(),
+             "One step in place.  rate(t, u) -> M^{-1} f(t, u); limiter(u) -> u, applied to every stage value, or None.");
+    // ---- implicit Runge-Kutta ------------------------------------------------------
+    m.def("implicit_tableau", [](const std::string &name, int stages) {
+              ImplicitTableau T = ImplicitTableau::named(name, stages);
+              return nb::make_tuple(to_np(T.A), to_np(T.b), to_np(T.c), T.order, T.name);
+          }, "name"_a, "stages"_a, "(A flattened row-major, b, c, order, canonical name) of gauss or radau with s stages.");
+    nb::class_<ImplicitRK>(m, "ImplicitRK",
+            "Implicit Runge-Kutta stepper for M u' = f(t, u): the stage iteration (simplified or classical Newton on "
+            "R_i = M K_i - f(t_i, U_i), stages stacked) in C++ (timestep/implicit_rk.hpp).")
+        .def("__init__", [](ImplicitRK *self, const std::string &method, int stages, double tol, double rtol, double xtol,
+                            int maxiter, bool line_search) {
+                 ImplicitRKOptions o; o.tol = tol; o.rtol = rtol; o.xtol = xtol; o.maxiter = maxiter; o.line_search = line_search;
+                 new (self) ImplicitRK(method, stages, o);
+             }, "method"_a, "stages"_a = 2, "tol"_a = 1e-12, "rtol"_a = 0.0, "xtol"_a = 1e-12, "maxiter"_a = 20, "line_search"_a = false)
+        .def("__init__", [](ImplicitRK *self, DArr A, DArr b, DArr c, double tol, double rtol, double xtol, int maxiter,
+                            bool line_search, int order, const std::string &name) {
+                 ImplicitTableau T;
+                 T.s = static_cast<int>(b.shape(0)); T.order = order; T.name = name;
+                 T.A = to_vec(A); T.b = to_vec(b); T.c = to_vec(c);
+                 ImplicitRKOptions o; o.tol = tol; o.rtol = rtol; o.xtol = xtol; o.maxiter = maxiter; o.line_search = line_search;
+                 new (self) ImplicitRK(T, o);
+             }, "A"_a, "b"_a, "c"_a, "tol"_a = 1e-12, "rtol"_a = 0.0, "xtol"_a = 1e-12, "maxiter"_a = 20, "line_search"_a = false,
+             "order"_a = 0, "name"_a = "custom")
+        .def_prop_ro("stages_count", [](const ImplicitRK &rk) { return rk.tableau().s; })
+        .def_prop_ro("order", [](const ImplicitRK &rk) { return rk.tableau().order; })
+        .def_prop_ro("name", [](const ImplicitRK &rk) { return rk.tableau().name; })
+        .def_prop_ro("A", [](const ImplicitRK &rk) { return to_np(rk.tableau().A); }, nb::rv_policy::move)
+        .def_prop_ro("b", [](const ImplicitRK &rk) { return to_np(rk.tableau().b); }, nb::rv_policy::move)
+        .def_prop_ro("c", [](const ImplicitRK &rk) { return to_np(rk.tableau().c); }, nb::rv_policy::move)
+        .def_prop_ro("stages", [](const ImplicitRK &rk) { return to_np(rk.stages()); }, nb::rv_policy::move,
+                     "The stages of the last converged step, stacked [K_1; ...; K_s] (empty before the first).")
+        .def("set_stages", [](ImplicitRK &rk, DArr K) { rk.set_stages(to_vec(K)); }, "K"_a)
+        .def("forget_stages", &ImplicitRK::forget_stages)
+        .def_prop_rw("tol", [](const ImplicitRK &rk) { return rk.options().tol; }, [](ImplicitRK &rk, double v) { rk.options().tol = v; })
+        .def_prop_rw("rtol", [](const ImplicitRK &rk) { return rk.options().rtol; }, [](ImplicitRK &rk, double v) { rk.options().rtol = v; })
+        .def_prop_rw("xtol", [](const ImplicitRK &rk) { return rk.options().xtol; }, [](ImplicitRK &rk, double v) { rk.options().xtol = v; })
+        .def_prop_rw("maxiter", [](const ImplicitRK &rk) { return rk.options().maxiter; }, [](ImplicitRK &rk, int v) { rk.options().maxiter = v; })
+        .def_prop_rw("line_search", [](const ImplicitRK &rk) { return rk.options().line_search; }, [](ImplicitRK &rk, bool v) { rk.options().line_search = v; })
+        .def("stage_values", [](const ImplicitRK &rk, DArr u, double dt, DArr K) {
+                 std::vector<double> U;
+                 rk.stage_values(to_vec(u), dt, to_vec(K), U);
+                 return to_np(std::move(U)); }, "u"_a, "dt"_a, "K"_a, "U_i = u + dt sum_j a_ij K_j, stacked.")
+        .def("step", [](ImplicitRK &rk, Vec u, double t, double dt, nb::callable f, nb::handle M, nb::callable solve, nb::handle k0) {
+                 const std::size_t n = u.shape(0);
+                 KOp Mop = as_operator(M, n);             // an AssembledMatrix, a CSRMatrix or a callable K -> M K
+                 std::vector<double> uv(u.data(), u.data() + n);
+                 auto residual = [&](double tt, const std::vector<double> &U, std::vector<double> &out) {
+                     nb::object r = f(tt, to_np(U));
+                     DArr a = nb::cast<DArr>(r);
+                     if (a.shape(0) != n) throw std::invalid_argument("ImplicitRK: f(t, U) returned the wrong length");
+                     out.assign(a.data(), a.data() + n);
+                 };
+                 auto stage_solve = [&](const std::vector<double> &K, const std::vector<double> &r, std::vector<double> &d) {
+                     nb::object x = solve(to_np(K), to_np(r));
+                     DArr a = nb::cast<DArr>(x);
+                     d.assign(a.data(), a.data() + a.shape(0));
+                 };
+                 std::vector<double> K0;
+                 if (!k0.is_none()) K0 = to_vec(nb::cast<DArr>(k0));
+                 NewtonReport rep = rk.step(uv, t, dt, residual, Mop, stage_solve, K0);
+                 if (rep.converged) std::copy(uv.begin(), uv.end(), u.data());
+                 return nb::make_tuple(rep.converged, rep.iterations, to_np(rep.residuals), to_np(rep.steps), rep.message);
+             }, "u"_a, "t"_a, "dt"_a, "f"_a, "M"_a, "solve"_a, "k0"_a.none() = nb::none(),
+             "One step in place when Newton converges (u is left alone otherwise).  f(t, U) -> array; M an AssembledMatrix, "
+             "a CSRMatrix or a callable K -> M K; solve(K, r) -> array, the approximate inverse of the stage Jacobian at the "
+             "stages K applied to r; k0 the first iterate for the stages (default: the last step's, or zero).  Returns "
+             "(converged, iterations, residuals, steps, message).");
     m.def("csnewton",
           [](nb::callable F, nb::handle M, DArr x0, int max_newton, double tol, double h, int restart,
              int gmres_max_iter, double gmres_tol, bool lgmres, int k_aug)
@@ -940,6 +1186,206 @@ NB_MODULE(_femd, m)
                      "True when Auto fell back to a banded LU with partial pivoting (an indefinite matrix, or a pivot-free LU that broke down or, with periodic corners, failed its accuracy check).")
         .def("solve", [](const LinearSolver &s, DArr b)
              { std::vector<double> bv = to_vec(b), x; { GilRelease release; x = s.solve(bv); } return to_np(std::move(x)); }, "b"_a);
+
+    // ---- the whole 1D form in C++ ------------------------------------------------------------
+    {
+        using VRef = FormAssembler1D::VectorRef;
+        auto refs = [](const std::vector<DArr> &v) {
+            std::vector<VRef> r;
+            r.reserve(v.size());
+            for (const DArr &a : v) r.push_back(VRef{a.data(), a.shape(0)});
+            return r;
+        };
+        auto cvec = [](const DArr &c) { return std::vector<double>(c.data(), c.data() + c.shape(0)); };
+        nb::class_<FormAssembler1D>(m, "FormAssembler1D",
+                "A 1D form compiled for C++ assembly (forms/assembler_1d.hpp): point sets (cells, interior facets, end "
+                "points), the fields read at them and the terms with their Integrand programs, in the order of the form.  "
+                "Built once by Form._compiled_1d; assemble_* runs without the GIL.")
+            .def(nb::init<int, int, int, int, int>(), "rank"_a, "nvectors"_a, "nconsts"_a, "n"_a, "ncols"_a = -1)
+            .def_prop_ro("rectangular", &FormAssembler1D::rectangular)
+            .def_prop_ro("ncols", &FormAssembler1D::columns)
+            .def_prop_ro("rank", &FormAssembler1D::rank)
+            .def_prop_ro("nvectors", &FormAssembler1D::vectors)
+            .def_prop_ro("nconsts", &FormAssembler1D::constants)
+            .def_prop_ro("nvalues", &FormAssembler1D::values)
+            .def_prop_ro("nterms", &FormAssembler1D::terms)
+            .def_prop_ro("n", &FormAssembler1D::size)
+            .def("add_cells", &FormAssembler1D::add_cells, "Q"_a, nb::keep_alive<1, 2>())
+            .def("add_facets", &FormAssembler1D::add_facets, "F"_a, nb::keep_alive<1, 2>())
+            .def("add_point", &FormAssembler1D::add_point, "x"_a)
+            .def("add_quad_field", &FormAssembler1D::add_quad_field, "ps"_a, "V"_a, "Q"_a, "vec"_a, "map"_a, "k"_a,
+                 nb::keep_alive<1, 3>(), nb::keep_alive<1, 4>())
+            .def("add_point_field", &FormAssembler1D::add_point_field, "ps"_a, "V"_a, "vec"_a, "map"_a, "k"_a, nb::keep_alive<1, 3>())
+            .def("add_facet_field", &FormAssembler1D::add_facet_field, "ps"_a, "V"_a, "F"_a, "vec"_a, "map"_a, "side"_a, "k"_a,
+                 nb::keep_alive<1, 3>(), nb::keep_alive<1, 4>())
+            .def("add_cell_term", &FormAssembler1D::add_cell_term, "ps"_a, "prog"_a, "inputs"_a, "consts"_a, "a"_a, "b"_a,
+                 "P"_a.none(), "I"_a, "J"_a, "QS"_a.none(), nb::keep_alive<1, 8>(), nb::keep_alive<1, 11>())
+            .def("add_facet_term", &FormAssembler1D::add_facet_term, "ps"_a, "prog"_a, "inputs"_a, "consts"_a, "st"_a, "ss"_a,
+                 "a"_a, "b"_a, "nt"_a, "map"_a, "FS"_a.none(), "P"_a.none(), "I"_a, "J"_a, "clear_symmetric"_a,
+                 nb::keep_alive<1, 12>(), nb::keep_alive<1, 13>())
+            .def("add_point_term", &FormAssembler1D::add_point_term, "ps"_a, "prog"_a, "inputs"_a, "consts"_a,
+                 "T"_a.none(), "a"_a, "mapT"_a, "S"_a.none(), "b"_a, "mapS"_a, nb::keep_alive<1, 6>(), nb::keep_alive<1, 9>())
+            .def("assemble_scalar", [refs, cvec](const FormAssembler1D &A, std::vector<DArr> vectors, DArr consts) {
+                     auto r = refs(vectors);
+                     auto cv = cvec(consts);
+                     GilRelease release;
+                     return A.assemble_scalar(r, cv);
+                 }, "vectors"_a, "consts"_a)
+            .def("assemble_vector", [refs, cvec](const FormAssembler1D &A, std::vector<DArr> vectors, DArr consts) {
+                     auto r = refs(vectors);
+                     auto cv = cvec(consts);
+                     std::vector<double> f(static_cast<std::size_t>(A.size()), 0.0);
+                     { GilRelease release; A.assemble_vector(r, cv, f.data(), f.size()); }
+                     return to_np(std::move(f));
+                 }, "vectors"_a, "consts"_a, "The rank-1 form as a vector of n entries.")
+            .def("assemble_matrix", [refs, cvec](const FormAssembler1D &A, std::vector<DArr> vectors, DArr consts, AssembledMatrix &K) {
+                     auto r = refs(vectors);
+                     auto cv = cvec(consts);
+                     GilRelease release;
+                     A.assemble_matrix(r, cv, K);
+                 }, "vectors"_a, "consts"_a, "K"_a, "K += the rank-2 form (an AssembledMatrix of order n).")
+            .def("assemble_complex", [refs, cvec](const FormAssembler1D &A, std::vector<DArr> vre, std::vector<nb::object> vim,
+                                                  DArr cre, DArr cim) {
+                     auto r = refs(vre);
+                     std::vector<VRef> i;
+                     for (const nb::object &o : vim)
+                     {
+                         if (o.is_none()) { i.push_back(VRef{nullptr, 0}); continue; }
+                         DArr a = nb::cast<DArr>(o);
+                         i.push_back(VRef{a.data(), a.shape(0)});
+                     }
+                     auto kr = cvec(cre), ki = cvec(cim);
+                     if (A.rank() == 0)
+                     {
+                         double sr, si;
+                         { GilRelease release; A.assemble_scalar_complex(r, i, kr, ki, sr, si); }
+                         return nb::object(nb::make_tuple(sr, si));
+                     }
+                     std::vector<double> fr(static_cast<std::size_t>(A.size())), fi(fr.size());
+                     { GilRelease release; A.assemble_vector_complex(r, i, kr, ki, fr.data(), fi.data(), fr.size()); }
+                     return nb::object(nb::make_tuple(to_np(std::move(fr)), to_np(std::move(fi))));
+                 }, "vectors_re"_a, "vectors_im"_a, "consts_re"_a, "consts_im"_a,
+                 "A rank-0 or rank-1 form with complex values (the complex-step derivative): (re, im), numbers or vectors.  "
+                 "An imaginary vector may be None (a real field).")
+            .def("assemble_rect", [refs, cvec](const FormAssembler1D &A, std::vector<DArr> vectors, DArr consts) {
+                     auto r = refs(vectors);
+                     auto cv = cvec(consts);
+                     GilRelease release;
+                     return A.assemble_rect(r, cv);
+                 }, "vectors"_a, "consts"_a, "The rectangular rank-2 form as a CSRMatrix (n x ncols).");
+    }
+
+    // ---- CSR from triplets, and between the banded and the CSR store ------------------------
+    m.def("csr_from_triplets", [](int nrows, int ncols, IArr I, IArr J, DArr V) {
+              std::vector<int> i(I.data(), I.data() + I.shape(0)), j(J.data(), J.data() + J.shape(0));
+              std::vector<double> v(V.data(), V.data() + V.shape(0));
+              GilRelease release;
+              return from_triplets(nrows, ncols, i, j, v);
+          }, "nrows"_a, "ncols"_a, "I"_a, "J"_a, "V"_a,
+          "The CSRMatrix of the triplets, duplicates summed in the order they come, explicit zeros kept.");
+    m.def("banded_to_csr", [](const AssembledMatrix &K) {
+              std::vector<int> I, J; std::vector<double> V;
+              for (int i = 0; i < K.n; ++i)
+                  for (int off = -K.p; off <= K.p; ++off)
+                  {
+                      const int j = i + off;
+                      if (j < 0 || j >= K.n) continue;
+                      const double v = K.band[static_cast<std::size_t>(i) * K.w + (off + K.p)];
+                      if (v != 0.0) { I.push_back(i); J.push_back(j); V.push_back(v); }
+                  }
+              for (std::size_t q = 0; q < K.ov.size(); ++q) { I.push_back(K.oi[q]); J.push_back(K.oj[q]); V.push_back(K.ov[q]); }
+              GilRelease release;
+              CSRMatrix C = from_triplets(K.n, K.n, I, J, V);
+              C.symmetric = K.symmetric;
+              return C;
+          }, "K"_a, "The banded matrix (its nonzero band entries and the periodic corners) as a CSRMatrix.");
+
+    // ---- small dense linear algebra, FFT and point searches for the setup code ------------------
+    {
+        using D2 = nb::ndarray<const double, nb::shape<-1, -1>, nb::c_contig>;
+        using M2 = nb::ndarray<double, nb::numpy, nb::shape<-1, -1>, nb::c_contig>;
+        auto np2 = [](std::vector<double> v, std::size_t r, std::size_t c) {
+            double *p = new double[v.size() ? v.size() : 1];
+            std::copy(v.begin(), v.end(), p);
+            nb::capsule owner(p, [](void *q) noexcept { delete[] static_cast<double *>(q); });
+            return M2(p, {r, c}, owner);
+        };
+        auto square = [](const D2 &A, const char *what) {
+            if (A.shape(0) != A.shape(1)) throw std::invalid_argument(std::string(what) + ": the matrix is not square");
+            return std::vector<double>(A.data(), A.data() + A.shape(0) * A.shape(1));
+        };
+        nb::class_<DenseLU>(m, "DenseLU", "P A = L U of a dense matrix with partial pivoting (util/dense.hpp).")
+            .def("__init__", [square](DenseLU *self, D2 A) { new (self) DenseLU(square(A, "DenseLU"), static_cast<int>(A.shape(0))); }, "A"_a)
+            .def_prop_ro("size", &DenseLU::size)
+            .def("solve", [](const DenseLU &L, DArr b) {
+                     if (static_cast<int>(b.shape(0)) != L.size()) throw std::invalid_argument("DenseLU.solve: length mismatch");
+                     std::vector<double> x(b.data(), b.data() + b.shape(0));
+                     L.solve(x.data());
+                     return to_np(std::move(x)); }, "b"_a)
+            .def("solve_many", [np2](const DenseLU &L, D2 B) {
+                     if (static_cast<int>(B.shape(0)) != L.size()) throw std::invalid_argument("DenseLU.solve_many: B needs n rows");
+                     std::vector<double> b(B.data(), B.data() + B.shape(0) * B.shape(1));
+                     return np2(L.solve_many(b, static_cast<int>(B.shape(1))), B.shape(0), B.shape(1)); }, "B"_a)
+            .def("inverse", [np2](const DenseLU &L) { return np2(L.inverse(), L.size(), L.size()); });
+        m.def("dense_inverse", [square, np2](D2 A) {
+                  DenseLU L(square(A, "dense_inverse"), static_cast<int>(A.shape(0)));
+                  return np2(L.inverse(), A.shape(0), A.shape(0)); }, "A"_a, "A^{-1} by LU with partial pivoting.");
+        m.def("legendre_vandermonde", [np2](DArr x, int p) {
+                  std::vector<double> xv(x.data(), x.data() + x.shape(0));
+                  return np2(legendre_vandermonde(xv, p), x.shape(0), static_cast<std::size_t>(p) + 1); }, "x"_a, "p"_a,
+              "V[i, k] = P_k(x_i), the Legendre Vandermonde matrix (numpy.polynomial.legendre.legvander).");
+        m.def("gauss_legendre", [](int n) {
+                  if (n < 1) throw std::invalid_argument("gauss_legendre: n >= 1");
+                  GaussLegendre g(n);
+                  std::vector<double> x(n), w(n);
+                  std::vector<int> o(n);
+                  for (int q = 0; q < n; ++q) o[q] = q;
+                  std::stable_sort(o.begin(), o.end(), [&g](int a, int b) { return g.node(a) < g.node(b); });
+                  for (int q = 0; q < n; ++q) { x[q] = g.node(o[q]); w[q] = g.weight(o[q]); }
+                  return nb::make_tuple(to_np(std::move(x)), to_np(std::move(w))); }, "n"_a,
+              "(nodes, weights) of the n-point Gauss-Legendre rule on [-1, 1], nodes increasing.");
+        m.def("norm2", [](DArr x, nb::object y) {
+                  const double *py = nullptr;
+                  if (!y.is_none())
+                  {
+                      DArr ya = nb::cast<DArr>(y);
+                      if (ya.shape(0) != x.shape(0)) throw std::invalid_argument("norm2: x and y differ in length");
+                      py = ya.data();
+                      GilRelease release;
+                      return norm2(x.data(), py, x.shape(0));
+                  }
+                  GilRelease release;
+                  return norm2(x.data(), nullptr, x.shape(0)); }, "x"_a, "y"_a = nb::none(),
+              "sqrt(x.x + y.y) (y the imaginary part, optional), ordered sums without BLAS.");
+        m.def("fft", [](DArr re, nb::object im) {
+                  std::vector<std::complex<double>> x(re.shape(0));
+                  for (std::size_t i = 0; i < x.size(); ++i) x[i] = re.data()[i];
+                  if (!im.is_none())
+                  {
+                      DArr ia = nb::cast<DArr>(im);
+                      if (ia.shape(0) != re.shape(0)) throw std::invalid_argument("fft: re and im differ in length");
+                      for (std::size_t i = 0; i < x.size(); ++i) x[i] = {re.data()[i], ia.data()[i]};
+                  }
+                  std::vector<std::complex<double>> X = fft(x);
+                  std::vector<double> xr(X.size()), xi(X.size());
+                  for (std::size_t i = 0; i < X.size(); ++i) { xr[i] = X[i].real(); xi[i] = X[i].imag(); }
+                  return nb::make_tuple(to_np(std::move(xr)), to_np(std::move(xi))); }, "re"_a, "im"_a = nb::none(),
+              "The DFT X_k = sum_j x_j exp(-2 pi i jk/n) as (re, im), numpy.fft.fft's convention (util/fft.hpp).");
+        m.def("nearest_points", [](D2 P, D2 Q) {
+                  if (P.shape(1) != 2 || Q.shape(1) != 2) throw std::invalid_argument("nearest_points: (n, 2) arrays");
+                  std::vector<double> p(P.data(), P.data() + P.shape(0) * 2), q(Q.data(), Q.data() + Q.shape(0) * 2), d;
+                  std::vector<int> j;
+                  { GilRelease release; nearest_points(p, q, j, d); }
+                  return nb::make_tuple(to_np(std::move(d)), to_np(std::move(j))); }, "P"_a, "Q"_a,
+              "(distance, index) of the nearest point of P to each point of Q (mesh/point_match.hpp).");
+        m.def("nearest_segments", [](D2 X, D2 ring) {
+                  if (X.shape(1) != 2 || ring.shape(1) != 2) throw std::invalid_argument("nearest_segments: (n, 2) arrays");
+                  std::vector<double> x(X.data(), X.data() + X.shape(0) * 2), r(ring.data(), ring.data() + ring.shape(0) * 2), d;
+                  std::vector<int> e;
+                  { GilRelease release; nearest_segments(x, r, e, d); }
+                  return nb::make_tuple(to_np(std::move(e)), to_np(std::move(d))); }, "X"_a, "ring"_a,
+              "(segment, distance) of the nearest segment of the closed polygon `ring` to each point.");
+    }
 
     bind_2d(m);
 }

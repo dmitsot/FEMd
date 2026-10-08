@@ -15,7 +15,6 @@ them is carried by a lift, V.lift(g), a Function of V.unconstrained.
 from __future__ import annotations
 
 import numpy as np
-import scipy.sparse as sp
 from . import _femd as _C
 from .forms import Function
 from .sparse import SparseMatrix
@@ -70,7 +69,16 @@ def _lumped_sparse(d, space):
         raise ValueError(f"mass_matrix(lumped=True): the lumped entry is {d[i]:.3g} at dof {i}, not positive, so the "
                          "lumped mass would be singular or indefinite; use Q_k elements with nodes='lobatto' "
                          "(or P_1 on triangles)")
-    return SparseMatrix.from_scipy(sp.diags(d).tocsr(), space=space, symmetric=True)
+    S = SparseMatrix(_diagonal_csr(d), space)
+    S.symmetric = True
+    return S
+
+
+def _diagonal_csr(d):
+    """The diagonal matrix of the entries d in the CSR store."""
+    d = np.ascontiguousarray(d, dtype=np.float64)
+    i = np.arange(d.size, dtype=np.int32)
+    return _C.csr_from_triplets(int(d.size), int(d.size), i, i, d)
 
 
 class _Lagrange2D:
@@ -494,7 +502,6 @@ def _periodic_pairs(periodic):
 def _periodic_classes(V, pairs):
     """The representative raw node of every raw node when the sides of each pair (a, b) are identified
     by the translation that takes side a to side b, and per pair a dict with the shift and the nodes."""
-    from scipy.spatial import cKDTree
     xy = np.asarray(V.raw_coordinates(), dtype=np.float64)
     n = xy.shape[0]
     P = np.asarray(V.mesh.points, dtype=np.float64)
@@ -513,7 +520,8 @@ def _periodic_classes(V, pairs):
             raise ValueError(f"periodic ({a}, {b}): side {a} has {A.size} nodes and side {b} has {B.size}; the mesh "
                              "must match node for node across the two sides")
         shift = xy[B].mean(axis=0) - xy[A].mean(axis=0)
-        dist, j = cKDTree(xy[A]).query(xy[B] - shift)
+        dist, j = _C.nearest_points(np.ascontiguousarray(xy[A]), np.ascontiguousarray(xy[B] - shift))
+        dist, j = np.asarray(dist), np.asarray(j, dtype=np.int64)
         bad = np.flatnonzero(dist > tol)
         if bad.size or np.unique(j).size != j.size:
             q = xy[B[bad[0]]] if bad.size else xy[B[0]]
@@ -652,8 +660,8 @@ class ProductSpace2D:
         if getattr(self, "_slip", None):
             from .slip import slip_matrix
             self._base = ProductSpace2D._make(fields, self.blocks)
-            self._Z, self.slip_info = slip_matrix(self._base, self._slip)
-            self._ZT = self._Z.T.tocsr()
+            self._Z, self.slip_info = slip_matrix(self._base, self._slip)       # CSRMatrix, in C++
+            self._ZT = self._Z.transposed()
         else:
             self._slip = []
 
@@ -661,15 +669,27 @@ class ProductSpace2D:
     @property
     def fields(self): return self._fields
     @property
-    def dim(self): return int(self.offsets[-1]) if self._Z is None else int(self._Z.shape[1])
+    def dim(self): return int(self.offsets[-1]) if self._Z is None else int(self._Z.ncols)
     @property
     def n_constraints(self):
         """Nodal values removed: Dirichlet nodes, plus one per slip node and two per slip corner."""
         return sum(f.n_constraints for f in self._fields) + int(self.offsets[-1]) - self.dim
     @property
     def slip_matrix(self):
-        """Z, with x_B = Z x the coefficients without the slip condition (None without one)."""
-        return self._Z
+        """Z as a RectMatrix from this space to the one without the slip condition: x_B = Z x
+        (None without one)."""
+        if self._Z is None:
+            return None
+        from .linalg import RectMatrix
+        return RectMatrix(self._Z.copy(), self._base, self)
+
+    def _z(self, x):
+        """Z x (the coefficients without the slip condition), in C++; a complex x by parts."""
+        return _real_linear(lambda v: self._Z.matvec(np.ascontiguousarray(v, dtype=np.float64)), x)
+
+    def _zt(self, x):
+        """Z^T x, in C++; a complex x by parts."""
+        return _real_linear(lambda v: self._ZT.matvec(np.ascontiguousarray(v, dtype=np.float64)), x)
     @property
     def degree(self): return max(f.degree for f in self._fields)
     @property
@@ -694,7 +714,7 @@ class ProductSpace2D:
         if x.size != self.dim:
             raise ValueError(f"split: {x.size} coefficients, the system has {self.dim}")
         if self._Z is not None:
-            x = self._Z @ x
+            x = self._z(x)
         return [x[self.offsets[i]:self.offsets[i + 1]] for i in range(len(self._fields))]
 
     def gather(self, parts):
@@ -703,7 +723,7 @@ class ProductSpace2D:
         if len(parts) != len(self._fields):
             raise ValueError(f"gather: {len(parts)} parts for {len(self._fields)} fields")
         x = np.concatenate(parts)
-        return x if self._Z is None else self._ZT @ x
+        return x if self._Z is None else self._zt(x)
 
     @property
     def unconstrained(self):
@@ -727,7 +747,7 @@ class ProductSpace2D:
         def real(r):
             U = self.unconstrained
             x = np.concatenate([f.restrict(p) for f, p in zip(self._fields, U.split(r))])
-            return x if self._Z is None else self._ZT @ x
+            return x if self._Z is None else self._zt(x)
         return _real_linear(real, raw)
 
     def pattern(self, trial=None):
@@ -807,7 +827,7 @@ class ProductSpace2D:
             for i, fi in zip(idx, comps):
                 parts[i] = np.zeros(self._fields[i].dim) if fi is None else self._fields[i].interpolate(fi)
         x = np.concatenate(parts)
-        return x if self._Z is None else self._ZT @ x        # the tangential part at slip nodes
+        return x if self._Z is None else self._zt(x)         # the tangential part at slip nodes
 
     def mass_matrix(self, lumped: bool = False):
         """The mass matrix of the system, sum over blocks of (u, v) (created once).  lumped=True
@@ -829,7 +849,8 @@ class ProductSpace2D:
                 meas = dx(scheme="lobatto") if lob else dx
                 A = form(sum(terms[1:], terms[0]) * meas).assemble()
                 d = np.asarray(A.diagonal() if lob else A.matvec(np.ones(self.dim)), dtype=np.float64)
-                if lob and np.abs(A.tocsr() - sp.diags(d)).max() > 1e-14 * np.abs(d).max():
+                if lob and np.abs(np.asarray(A._K.combine(_diagonal_csr(d), 1.0, -1.0).data)).max(initial=0.0) > \
+                        1e-14 * np.abs(d).max():
                     d = np.asarray(A.matvec(np.ones(self.dim)), dtype=np.float64)   # a slip rotation couples components
                 M = _lumped_sparse(d, self)
             self.__dict__[key] = M
@@ -890,7 +911,7 @@ class ProductSpace2D:
                     raise TypeError(f"project(): a callable, a number or an expression per component, got {fi!r}")
         b = np.concatenate(parts)
         if self._Z is not None:
-            b = self._ZT @ b
+            b = self._zt(b)
         S = self.__dict__.get("_mass_solver")
         if S is None:
             S = self.mass_matrix().solver()

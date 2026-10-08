@@ -12,8 +12,10 @@
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/tuple.h>
 
 #include "femd/femd.hpp"
+#include <complex>
 #include <memory>
 #include <vector>
 
@@ -26,6 +28,7 @@ namespace {
 using DArr  = nb::ndarray<const double, nb::shape<-1>, nb::c_contig>;
 using IArr  = nb::ndarray<const int, nb::shape<-1>, nb::c_contig>;
 using PArr  = nb::ndarray<const double, nb::shape<-1, 2>, nb::c_contig>;
+using Mat2  = nb::ndarray<const double, nb::shape<-1, -1>, nb::c_contig>;
 using Vec   = nb::ndarray<double, nb::numpy, nb::shape<-1>, nb::c_contig>;
 using IVec  = nb::ndarray<int, nb::numpy, nb::shape<-1>, nb::c_contig>;
 using Mat   = nb::ndarray<double, nb::numpy, nb::shape<-1, -1>, nb::c_contig>;
@@ -153,8 +156,17 @@ void bind_2d(nb::module_ &m)
              "B"_a, "alpha"_a, "beta"_a, "alpha A + beta B (A's pattern when the patterns are shared)")
         .def("scaled", [](const CSRMatrix &A, double a) { return scaled(A, a); }, "a"_a)
         .def("transposed", [](const CSRMatrix &A) { return transposed(A); })
-        .def("multiply", [](const CSRMatrix &A, const CSRMatrix &B) { return multiply(A, B); }, "B"_a)
+        .def("multiply", [](const CSRMatrix &A, const CSRMatrix &B) { return multiply(A, B); }, "B"_a, nb::call_guard<GilRelease>())
+        .def("triple_product", [](const CSRMatrix &A, const CSRMatrix &PT, const CSRMatrix &P) { return triple_product(PT, A, P); },
+             "PT"_a, "P"_a, nb::call_guard<GilRelease>(),
+             "PT @ self @ P in one pass, exact zeros dropped (the values of the two products, bit for bit).")
         .def("asymmetry", [](const CSRMatrix &A) { return asymmetry(A); })
+        .def("shifted", [](const CSRMatrix &A, double sigma) { return shifted(A, sigma); }, "sigma"_a,
+             "A - sigma I, exact zeros dropped.")
+        .def("norm1", [](const CSRMatrix &A) { return norm1(A); }, "max_j sum_i |a_ij| (1 for an empty matrix).")
+        .def("identity_defect", [](const CSRMatrix &A) { return identity_defect(A); }, "max |a_ij - delta_ij|.")
+        .def("permuted", [](const CSRMatrix &A, std::vector<int> p) { return permuted(A, p); }, "p"_a,
+             "P A P^T: row and column k are row and column p[k] of A.")
         .def("pruned", &CSRMatrix::pruned, "tol"_a = 0.0)
         .def("copy", [](const CSRMatrix &A) { return CSRMatrix(A); })
         .def("clear", &CSRMatrix::clear);
@@ -200,6 +212,10 @@ void bind_2d(nb::module_ &m)
         .def_prop_ro("max_pivot", &SparseCholesky::max_pivot)
         .def_prop_ro("ordering", &SparseCholesky::ordering_name)
         .def_prop_ro("positive_definite", &SparseCholesky::positive_definite)
+        .def_prop_ro("subtrees", &SparseCholesky::subtrees, "Independent subtrees of the elimination tree solved concurrently.")
+        .def_prop_ro("top_nodes", &SparseCholesky::top_nodes, "Nodes above the subtrees, solved supernode by supernode.")
+        .def_prop_ro("top_supernodes", &SparseCholesky::top_supernodes)
+        .def_prop_ro("top_fraction", &SparseCholesky::top_fraction, "Share of the entries of L in the top.")
         .def("permutation", [](const SparseCholesky &C) { return np1(C.permutation()); })
         .def("etree", [](const SparseCholesky &C) { return np1(C.etree()); })
         .def("factors", [](const SparseCholesky &C) {
@@ -232,6 +248,162 @@ void bind_2d(nb::module_ &m)
         .def_prop_ro("min_pivot", &SparseLDLT::min_pivot)
         .def_prop_ro("ordering", &SparseLDLT::ordering_name)
         .def("permutation", [](const SparseLDLT &F) { return np1(F.permutation()); });
+    // ---- sparse LU, real and complex (sparse/lu.hpp) ----------------------------------
+    auto lu_ordering = [](const std::string &ordering) {
+        if (ordering == "auto") return SparseLU<double>::Ordering::Auto;
+        if (ordering == "ata" || ordering == "colamd") return SparseLU<double>::Ordering::ATA;
+        if (ordering == "amd") return SparseLU<double>::Ordering::AMD;
+        if (ordering == "natural") return SparseLU<double>::Ordering::Natural;
+        throw std::invalid_argument("SparseLU: ordering is 'auto' (the default), 'ata' (AMD of A^T A), 'amd' (of A + A^T) or 'natural', got '" + ordering + "'");
+    };
+    auto lu_method = [](const std::string &method) {
+        if (method == "frontal" || method == "multifrontal") return SparseLU<double>::Method::Frontal;
+        if (method == "columns" || method == "left-looking") return SparseLU<double>::Method::Columns;
+        throw std::invalid_argument("SparseLU: method is 'frontal' (the default) or 'columns', got '" + method + "'");
+    };
+    using CLU = SparseLU<std::complex<double>>;
+    using CArr2 = nb::ndarray<const std::complex<double>, nb::shape<-1>, nb::c_contig>;
+    using CVec2 = nb::ndarray<std::complex<double>, nb::numpy, nb::shape<-1>, nb::c_contig>;
+    nb::class_<SparseLU<double>>(m, "SparseLU",
+            "LU with threshold pivoting of a square (nonsymmetric) matrix, multifrontal on the pattern of A + A^T in AMD order (sparse/lu.hpp, lu_frontal.hpp).")
+        .def("__init__", [lu_ordering, lu_method](SparseLU<double> *self, const CSRMatrix &K, const std::string &ordering, double pivot_tol, nb::handle q, const std::string &method) {
+                if (K.nrows() != K.ncols()) throw std::invalid_argument("SparseLU: the matrix must be square");
+                auto o = lu_ordering(ordering);
+                std::vector<int> qv;
+                if (!q.is_none()) { IArr qa = nb::cast<IArr>(q); qv.assign(qa.data(), qa.data() + qa.shape(0)); o = SparseLU<double>::Ordering::Given; }
+                const SparseLU<double>::Method mth = lu_method(method);
+                GilRelease g;
+                new (self) SparseLU<double>(K.nrows(), K.indptr(), K.indices(), K.data.data(), o, pivot_tol, qv, mth); },
+             "K"_a, "ordering"_a = "auto", "pivot_tol"_a = 0.1, "q"_a.none() = nb::none(), "method"_a = "frontal",
+             "method: 'frontal' (the multifrontal elimination on the pattern of A + A^T, the default) or 'columns' (left-looking).")
+        .def("refactor", [](SparseLU<double> &F, const CSRMatrix &K) {
+                if (K.nrows() != F.size() || K.ncols() != F.size()) throw std::invalid_argument("SparseLU.refactor: size mismatch");
+                GilRelease g; F.refactor(K.data.data()); }, "K"_a, "New values on the same pattern.")
+        .def("solve", [](const SparseLU<double> &F, DArr b) {
+                if (b.shape(0) != static_cast<std::size_t>(F.size())) throw std::invalid_argument("SparseLU.solve: length mismatch");
+                std::vector<double> x(static_cast<std::size_t>(F.size()));
+                { GilRelease g; if (F.size() > 0) F.solve(b.data(), x.data()); }
+                return np1(x); }, "b"_a)
+        .def_prop_ro("nnz_L", &SparseLU<double>::nnz_L)
+        .def_prop_ro("nnz_U", &SparseLU<double>::nnz_U)
+        .def_prop_ro("off_diagonal_pivots", &SparseLU<double>::off_diagonal_pivots)
+        .def_prop_ro("min_pivot", &SparseLU<double>::min_pivot)
+        .def_prop_ro("max_pivot", &SparseLU<double>::max_pivot)
+        .def_prop_ro("pivot_tol", &SparseLU<double>::pivot_tol)
+        .def_prop_ro("ordering", &SparseLU<double>::ordering_name)
+        .def_prop_ro("subtrees", &SparseLU<double>::subtrees, "Independent subtrees of the elimination tree of L + U that the solves run concurrently.")
+        .def_prop_ro("top_nodes", &SparseLU<double>::top_nodes, "Nodes above the subtrees, solved in order.")
+        .def_prop_ro("top_chains", &SparseLU<double>::top_chains, "Chains of the top, the units of its schedule.")
+        .def_prop_ro("top_levels", &SparseLU<double>::top_levels, "Heights of the tree of chains.")
+        .def_prop_ro("top_steps", &SparseLU<double>::top_steps, "Steps of the top schedule, each two parallel loops.")
+        .def_prop_ro("top_fraction", &SparseLU<double>::top_fraction, "Share of the entries of L and U in the top.")
+        .def_prop_ro("tree_contained", &SparseLU<double>::tree_contained, "Whether the factors lie in the tree (else the solves are serial).")
+        .def_prop_ro("method", &SparseLU<double>::method_name, "'frontal' or 'columns'.")
+        .def_prop_ro("delayed_pivots", &SparseLU<double>::delayed_pivots, "Frontal method: pivots delayed to a parent front.")
+        .def_prop_ro("max_front", &SparseLU<double>::max_front, "Frontal method: the order of the largest front.")
+        .def_prop_ro("fronts", &SparseLU<double>::fronts, "Frontal method: the number of fronts (supernodes).")
+        .def("column_order", [](const SparseLU<double> &F) { return np1(F.column_order()); })
+        .def("row_pivots", [](const SparseLU<double> &F) { return np1(F.row_pivots()); });
+    // ---- limiters (fe/limiters.hpp) --------------------------------------------------------
+    nb::class_<Limiter1D>(m, "Limiter1D", "The TVB and finite volume slope limiters of DG coefficient vectors in 1D (fe/limiters.hpp).")
+        .def("__init__", [](Limiter1D *self, int p, int ne, bool periodic, DArr h, DArr to_modal, DArr to_nodal, double M, int slope, bool uno2, bool all) {
+                new (self) Limiter1D(p, ne, periodic, vec(h), vec(to_modal), vec(to_nodal), M, slope, uno2, all); },
+             "p"_a, "ne"_a, "periodic"_a, "h"_a, "to_modal"_a, "to_nodal"_a, "M"_a, "slope"_a, "uno2"_a, "all"_a,
+             "slope: -1 for the TVB limiter, else 0 minmod, 1 mc, 2 van Leer, 3 van Albada; to_modal/to_nodal empty for a Legendre basis.")
+        .def("limit", [](const Limiter1D &L, DArr c) {
+                if (static_cast<int>(c.shape(0)) != L.dim()) throw std::invalid_argument("Limiter1D.limit: need " + std::to_string(L.dim()) + " coefficients");
+                double *out = new double[static_cast<std::size_t>(std::max(L.dim(), 1))];
+                nb::capsule owner(out, [](void *q) noexcept { delete[] static_cast<double *>(q); });
+                int troubled;
+                { GilRelease g; troubled = L.limit(c.data(), out); }
+                return nb::make_tuple(Vec(out, {static_cast<std::size_t>(L.dim())}, owner), troubled); }, "c"_a,
+             "The limited copy of c and the number of troubled elements.");
+    nb::class_<VertexLimiter2D>(m, "VertexLimiter2D", "The vertex-based limiter of DG coefficient vectors on triangles (fe/limiters.hpp).")
+        .def("__init__", [](VertexLimiter2D *self, int k, int nc, int n, DArr mean, DArr Pi, DArr E, IArr rv, int nv) {
+                new (self) VertexLimiter2D(k, nc, n, vec(mean), vec(Pi), vec(E), ivec(rv), nv); },
+             "k"_a, "nc"_a, "n"_a, "mean"_a, "Pi"_a, "E"_a, "rv"_a, "nv"_a)
+        .def("limit", [](const VertexLimiter2D &L, DArr c) {
+                if (static_cast<int>(c.shape(0)) != L.dim()) throw std::invalid_argument("VertexLimiter2D.limit: need " + std::to_string(L.dim()) + " coefficients");
+                double *out = new double[static_cast<std::size_t>(std::max(L.dim(), 1))];
+                nb::capsule owner(out, [](void *q) noexcept { delete[] static_cast<double *>(q); });
+                int troubled;
+                { GilRelease g; troubled = L.limit(c.data(), out); }
+                return nb::make_tuple(Vec(out, {static_cast<std::size_t>(L.dim())}, owner), troubled); }, "c"_a,
+             "The limited copy of c and the number of troubled cells.")
+        .def_prop_ro("alpha", [](const VertexLimiter2D &L) { return np1(L.alpha()); }, nb::rv_policy::move, "The scaling of each cell in the last call.");
+
+    nb::class_<CLU>(m, "SparseLUComplex",
+            "LU with threshold pivoting of a complex matrix given as a CSR pattern with real and imaginary values.")
+        .def("__init__", [lu_ordering, lu_method](CLU *self, const CSRMatrix &K, DArr re, DArr im, const std::string &ordering, double pivot_tol, nb::handle q, const std::string &method) {
+                if (K.nrows() != K.ncols()) throw std::invalid_argument("SparseLUComplex: the matrix must be square");
+                const std::size_t nnz = static_cast<std::size_t>(K.nnz());
+                if (re.shape(0) != nnz || im.shape(0) != nnz) throw std::invalid_argument("SparseLUComplex: re and im must have one value per stored entry");
+                std::vector<std::complex<double>> z(nnz);
+                for (std::size_t p = 0; p < nnz; ++p) z[p] = std::complex<double>(re.data()[p], im.data()[p]);
+                std::vector<int> qv;
+                CLU::Ordering o = static_cast<CLU::Ordering>(static_cast<int>(lu_ordering(ordering)));
+                if (!q.is_none()) { IArr qa = nb::cast<IArr>(q); qv.assign(qa.data(), qa.data() + qa.shape(0)); o = CLU::Ordering::Given; }
+                const CLU::Method mth = static_cast<CLU::Method>(static_cast<int>(lu_method(method)));
+                GilRelease g;
+                new (self) CLU(K.nrows(), K.indptr(), K.indices(), z.data(), o, pivot_tol, qv, mth); },
+             "K"_a, "re"_a, "im"_a, "ordering"_a = "auto", "pivot_tol"_a = 0.1, "q"_a.none() = nb::none(), "method"_a = "frontal",
+             "K gives the pattern (its values are ignored), re and im the values entry by entry; q a column order to use instead.")
+        .def("refactor", [](CLU &F, DArr re, DArr im) {
+                if (re.shape(0) != im.shape(0)) throw std::invalid_argument("SparseLUComplex.refactor: re and im differ in length");
+                std::vector<std::complex<double>> z(re.shape(0));
+                for (std::size_t p = 0; p < z.size(); ++p) z[p] = std::complex<double>(re.data()[p], im.data()[p]);
+                GilRelease g; F.refactor(z.data()); }, "re"_a, "im"_a)
+        .def("solve", [](const CLU &F, CArr2 b) {
+                if (b.shape(0) != static_cast<std::size_t>(F.size())) throw std::invalid_argument("SparseLUComplex.solve: length mismatch");
+                auto *x = new std::complex<double>[static_cast<std::size_t>(F.size())];
+                { GilRelease g; if (F.size() > 0) F.solve(b.data(), x); }
+                nb::capsule owner(x, [](void *q) noexcept { delete[] static_cast<std::complex<double> *>(q); });
+                return CVec2(x, {static_cast<std::size_t>(F.size())}, owner); }, "b"_a)
+        .def_prop_ro("nnz_L", &CLU::nnz_L)
+        .def_prop_ro("nnz_U", &CLU::nnz_U)
+        .def_prop_ro("off_diagonal_pivots", &CLU::off_diagonal_pivots)
+        .def_prop_ro("min_pivot", &CLU::min_pivot)
+        .def_prop_ro("max_pivot", &CLU::max_pivot)
+        .def_prop_ro("ordering", &CLU::ordering_name)
+        .def_prop_ro("subtrees", &CLU::subtrees)
+        .def_prop_ro("top_nodes", &CLU::top_nodes)
+        .def_prop_ro("top_chains", &CLU::top_chains)
+        .def_prop_ro("top_levels", &CLU::top_levels)
+        .def_prop_ro("top_steps", &CLU::top_steps)
+        .def_prop_ro("top_fraction", &CLU::top_fraction)
+        .def_prop_ro("tree_contained", &CLU::tree_contained)
+        .def_prop_ro("method", &CLU::method_name)
+        .def_prop_ro("delayed_pivots", &CLU::delayed_pivots)
+        .def_prop_ro("max_front", &CLU::max_front)
+        .def_prop_ro("fronts", &CLU::fronts);
+    // ---- the stage systems of an implicit Runge-Kutta step (timestep/stage_solver.hpp) --------
+    nb::class_<StageSystemSolver>(m, "StageSystemSolver",
+            "I (x) M - dt A (x) J solved through the eigenvalues of the Butcher matrix A: one real or complex sparse "
+            "factorization per distinct eigenvalue (Cholesky, LDL^T, LU or complex LU by the matrix).")
+        .def("__init__", [](StageSystemSolver *self, const CSRMatrix &M, nb::handle J, DArr A, int s, double dt, const std::string &backend) {
+                if (A.shape(0) != static_cast<std::size_t>(s) * s) throw std::invalid_argument("StageSystemSolver: A must have s*s entries");
+                const CSRMatrix *Jp = J.is_none() ? nullptr : nb::cast<const CSRMatrix *>(J);
+                std::vector<double> Av(A.data(), A.data() + A.shape(0));
+                GilRelease g;
+                new (self) StageSystemSolver(M, Jp, Av, s, dt, backend); },
+             "M"_a, "J"_a.none(), "A"_a, "s"_a, "dt"_a, "backend"_a = "auto")
+        .def("solve", [](const StageSystemSolver &S, DArr r) {
+                if (r.shape(0) != static_cast<std::size_t>(S.size())) throw std::invalid_argument("StageSystemSolver.solve: length mismatch");
+                std::vector<double> d(static_cast<std::size_t>(S.size()));
+                { GilRelease g; S.solve(r.data(), d.data()); }
+                return np1(d); }, "r"_a, "d = (I (x) M - dt A (x) J)^{-1} r, the stages stacked.")
+        .def_prop_ro("factorizations", &StageSystemSolver::factorizations)
+        .def_prop_ro("kinds", &StageSystemSolver::kinds)
+        .def_prop_ro("stages", &StageSystemSolver::stages)
+        .def_prop_ro("size", &StageSystemSolver::size);
+    m.def("block_csr", [](const std::vector<int> &roff, const std::vector<int> &coff,
+                           const std::vector<std::tuple<int, int, const CSRMatrix *, double>> &entries) {
+            std::vector<BlockEntry> e;
+            e.reserve(entries.size());
+            for (const auto &t : entries) e.push_back({std::get<0>(t), std::get<1>(t), std::get<2>(t), std::get<3>(t)});
+            GilRelease g;
+            return block_csr(roff, coff, e); }, "row_offsets"_a, "col_offsets"_a, "entries"_a,
+          "A CSR matrix from blocks: entries (i, j, K, alpha) place alpha * K at block (i, j); several on one position are summed.");
     m.def("amd_order", [](const CSRMatrix &K) {
             if (K.nrows() != K.ncols()) throw std::invalid_argument("amd_order: the matrix must be square");
             std::vector<int> p;
@@ -567,6 +739,44 @@ void bind_2d(nb::module_ &m)
           "FT"_a, "FS"_a, "sa"_a, "sb"_a, "a"_a, "b"_a, "coeffs"_a, "K"_a, "row_offset"_a = 0, "col_offset"_a = 0);
     m.def("cell_pattern", &cell_pattern, "test"_a, "trial"_a, nb::call_guard<GilRelease>(),
           "CSR pattern of all test-trial couplings through a common cell.");
+    m.def("csr_from_dense", [](Mat2 A) {
+              std::vector<double> d(A.data(), A.data() + A.shape(0) * A.shape(1));
+              return csr_from_dense(d, static_cast<int>(A.shape(0)), static_cast<int>(A.shape(1)));
+          }, "A"_a, "The nonzero entries of a dense array as a CSRMatrix.");
+    m.def("dg_vertex_tables", [](const Space2D &V) {
+              DGVertexTables T = dg_vertex_tables(V);
+              return nb::make_tuple(np1(T.mean), np2(T.Pi, 3, T.nloc), np2(T.E, T.nloc, 3));
+          }, "V"_a, "(mean, Pi (3, nloc), E (nloc, 3)) of a broken P_k space on triangles (fe/dg_tables.hpp).");
+    m.def("slip_matrix", [](nb::list F, std::vector<int> offsets, nb::list specs) {
+              std::vector<const Space2D *> f;
+              for (nb::handle h : F) f.push_back(nb::cast<const Space2D *>(h));
+              std::vector<SlipSpec> sp;
+              for (nb::handle h : specs)
+              {
+                  nb::tuple t = nb::cast<nb::tuple>(h);
+                  if (t.size() != 5) throw std::invalid_argument("slip_matrix: a spec is (f0, f1, markers, corner_angle, normal)");
+                  SlipSpec s;
+                  s.f0 = nb::cast<int>(t[0]); s.f1 = nb::cast<int>(t[1]);
+                  s.markers = nb::cast<std::vector<int>>(t[2]);
+                  s.corner_angle = nb::cast<double>(t[3]); s.normal = nb::cast<std::string>(t[4]);
+                  sp.push_back(std::move(s));
+              }
+              SlipSystem S;
+              { GilRelease g; S = slip_matrix(f, offsets, sp); }
+              nb::list info;
+              for (const SlipNodes &n : S.info)
+                  info.append(nb::make_tuple(np1(n.nodes), np2(n.normals, n.nodes.size(), 2), np1(n.corners)));
+              return nb::make_tuple(std::move(S.Z), info);
+          }, "fields"_a, "offsets"_a, "specs"_a,
+          "Z (CSRMatrix, base dim x reduced dim) of the slip conditions (fe/slip.hpp), and per spec (nodes, normals (n, 2), "
+          "corners), raw numbers of the first field.  specs: (f0, f1, markers, corner_angle, normal) tuples.");
+    m.def("slip_nodes", [](const Space2D &f, std::vector<int> markers, double corner_angle, std::string normal) {
+              std::sort(markers.begin(), markers.end());
+              markers.erase(std::unique(markers.begin(), markers.end()), markers.end());
+              SlipNodes n = slip_nodes(f, markers, corner_angle, normal);
+              return nb::make_tuple(np1(n.nodes), np2(n.normals, n.nodes.size(), 2), np1(n.corners));
+          }, "f"_a, "markers"_a, "corner_angle"_a = 45.0, "normal"_a = "conservative",
+          "The raw nodes of f on the sides `markers` with their unit normals, and the corner vertices.");
     m.def("product_pattern", [](nb::list T, std::vector<int> toff, int nrows, nb::list S, std::vector<int> soff, int ncols) {
               std::vector<const Space2D *> t, s;
               for (nb::handle h : T) t.push_back(nb::cast<const Space2D *>(h));
@@ -589,4 +799,83 @@ void bind_2d(nb::module_ &m)
               return np1(f);
           }, "Q"_a, "a"_a, "coeffs"_a);
     m.def("assemble_scalar_2d", [](const Cache2D &Q, DArr c) { return assemble_scalar_2d(Q, vec(c)); }, "Q"_a, "coeff"_a);
+
+    // ---- the whole form in C++ --------------------------------------------------------------
+    using VRef = FormAssembler2D::VectorRef;
+    auto refs = [](const std::vector<DArr> &v) {
+        std::vector<VRef> r;
+        r.reserve(v.size());
+        for (const DArr &a : v) r.push_back(VRef{a.data(), a.shape(0)});
+        return r;
+    };
+    nb::class_<FormAssembler2D>(m, "FormAssembler2D",
+            "A 2D form compiled for C++ assembly (forms/assembler_2d.hpp): point sets, the fields read at them, and "
+            "the terms with their Integrand programs.  Built once by Form._compile_2d; assemble_* runs without the GIL.")
+        .def(nb::init<int, int, int>(), "rank"_a, "nvectors"_a, "nconsts"_a)
+        .def_prop_ro("rank", &FormAssembler2D::rank)
+        .def_prop_ro("nvectors", &FormAssembler2D::vectors)
+        .def_prop_ro("nconsts", &FormAssembler2D::constants)
+        .def_prop_ro("nvalues", &FormAssembler2D::values)
+        .def_prop_ro("ngroups", &FormAssembler2D::groups)
+        .def("add_field", [](FormAssembler2D &A, const Cache2D &Q, int vec, int offset, int dim, std::vector<int> codes) {
+                 return A.add_field(Q, vec, offset, dim, codes); },
+             "Q"_a, "vec"_a, "offset"_a, "dim"_a, "codes"_a, nb::keep_alive<1, 2>(),
+             "A field at the points of Q: vectors[vec][offset:offset + dim], derivative codes; returns the first value index.")
+        .def("add_facet_field", [](FormAssembler2D &A, const InteriorFacetCache2D &F, int vec, int offset, int dim, int side,
+                                   std::vector<int> codes) { return A.add_field(F, vec, offset, dim, side, codes); },
+             "F"_a, "vec"_a, "offset"_a, "dim"_a, "side"_a, "codes"_a, nb::keep_alive<1, 2>(),
+             "A field on side 0 ('-') or 1 ('+') of the interior facets F.")
+        .def("add_group", [](FormAssembler2D &A, const Cache2D &QT, const Cache2D *QS, int toff, int roff) {
+                 return A.add_group(QT, QS, toff, roff); },
+             "QT"_a, "QS"_a.none(), "toff"_a, "roff"_a, nb::keep_alive<1, 2>(), nb::keep_alive<1, 3>(),
+             "A group of terms on the entries of QT (test block) and QS (trial block, None below rank 2); returns its index.")
+        .def("add_facet_group", [](FormAssembler2D &A, const InteriorFacetCache2D &FT, const InteriorFacetCache2D *FS, int toff, int roff) {
+                 return A.add_group(FT, FS, toff, roff); },
+             "FT"_a, "FS"_a.none(), "toff"_a, "roff"_a, nb::keep_alive<1, 2>(), nb::keep_alive<1, 3>(),
+             "A group of dS terms on the interior facets FT (test) and FS (trial, None below rank 2).")
+        .def("add_term", &FormAssembler2D::add_term, "group"_a, "prog"_a, "inputs"_a, "consts"_a, "a"_a, "b"_a, "sa"_a, "sb"_a,
+             "A term: Integrand prog over the value arrays `inputs` and the constants `consts`, test code a (side sa), "
+             "trial code b (side sb).  The program is copied.")
+        .def("assemble_scalar", [refs](const FormAssembler2D &A, std::vector<DArr> vectors, DArr consts) {
+                 auto r = refs(vectors);
+                 std::vector<double> cv(consts.data(), consts.data() + consts.shape(0));
+                 GilRelease g;
+                 return A.assemble_scalar(r, cv);
+             }, "vectors"_a, "consts"_a)
+        .def("assemble_vector", [refs](const FormAssembler2D &A, std::vector<DArr> vectors, DArr consts, std::size_t n) {
+                 auto r = refs(vectors);
+                 std::vector<double> cv(consts.data(), consts.data() + consts.shape(0));
+                 std::vector<double> f(n, 0.0);
+                 { GilRelease g; A.assemble_vector(r, cv, f.data(), n); }
+                 return np1(f);
+             }, "vectors"_a, "consts"_a, "n"_a, "The rank-1 form as a vector of n entries.")
+        .def("assemble_complex", [refs](const FormAssembler2D &A, std::vector<DArr> vre, std::vector<nb::object> vim,
+                                        DArr cre, DArr cim, std::size_t n) {
+                 auto r = refs(vre);
+                 std::vector<VRef> i;
+                 for (const nb::object &o : vim)
+                 {
+                     if (o.is_none()) { i.push_back(VRef{nullptr, 0}); continue; }
+                     DArr a = nb::cast<DArr>(o);
+                     i.push_back(VRef{a.data(), a.shape(0)});
+                 }
+                 std::vector<double> kr(cre.data(), cre.data() + cre.shape(0)), ki(cim.data(), cim.data() + cim.shape(0));
+                 if (A.rank() == 0)
+                 {
+                     double sr, si;
+                     { GilRelease g; A.assemble_scalar_complex(r, i, kr, ki, sr, si); }
+                     return nb::object(nb::make_tuple(sr, si));
+                 }
+                 std::vector<double> fr(n), fi(n);
+                 { GilRelease g; A.assemble_vector_complex(r, i, kr, ki, fr.data(), fi.data(), n); }
+                 return nb::object(nb::make_tuple(np1(fr), np1(fi)));
+             }, "vectors_re"_a, "vectors_im"_a, "consts_re"_a, "consts_im"_a, "n"_a = 0,
+             "A rank-0 or rank-1 form with complex values (the complex-step derivative): (re, im), numbers or vectors of n "
+             "entries.  An imaginary vector may be None (a real field).")
+        .def("assemble_matrix", [refs](const FormAssembler2D &A, std::vector<DArr> vectors, DArr consts, CSRMatrix &K) {
+                 auto r = refs(vectors);
+                 std::vector<double> cv(consts.data(), consts.data() + consts.shape(0));
+                 GilRelease g;
+                 A.assemble_matrix(r, cv, K);
+             }, "vectors"_a, "consts"_a, "K"_a, "K += the rank-2 form (K on the form's pattern, zeroed by the caller).");
 }

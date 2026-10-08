@@ -88,7 +88,7 @@ def _operator(A, n):
     if isinstance(A, RectMatrix):
         if A.shape != (n, n):
             raise ValueError(f"gmres: A is {A.shape[0]} x {A.shape[1]}, b has length {n}")
-        return _callable(A.matvec, n, "A"), A.row_space
+        return A._K, A.row_space                              # the CSR store: the matvec in C++
     if hasattr(A, "matvec"):
         return _callable(A.matvec, n, "A.matvec"), getattr(A, "space", None)
     if hasattr(A, "__matmul__") and not callable(A):

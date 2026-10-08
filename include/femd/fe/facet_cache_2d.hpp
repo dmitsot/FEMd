@@ -136,9 +136,16 @@ public:
     {
         if (static_cast<int>(c.size()) != (raw ? V_->raw_dim() : V_->dim()))
             throw std::invalid_argument("InteriorFacetCache2D::at_points: coefficient length does not match the space");
+        std::vector<double> out(static_cast<std::size_t>(nf_) * nq_, 0.0);
+        eval_into(c.data(), s, m, out.data(), raw);
+        return out;
+    }
+
+    /// @brief at_points into out[f * nq + q] for the dim (raw_dim with raw) coefficients at c.
+    void eval_into(const double *c, int s, int m, double *out, bool raw = false) const
+    {
         if (s < 0 || s > 1) throw std::invalid_argument("InteriorFacetCache2D::at_points: side is 0 ('-') or 1 ('+')");
         if (m < 0 || m >= V_->ncodes()) throw std::invalid_argument("InteriorFacetCache2D::at_points: derivative code out of range");
-        std::vector<double> out(static_cast<std::size_t>(nf_) * nq_, 0.0);
         FEMD_OMP_PARALLEL_IF(detail::parallel_elements(nf_, nq_))
         {
         std::vector<double> r(static_cast<std::size_t>(nloc_)), loc(r.size());
@@ -156,7 +163,6 @@ public:
             }
         }
         }
-        return out;
     }
 
 private:

@@ -17,7 +17,8 @@ import warnings
 
 import numpy as np
 import scipy.sparse as sp
-import scipy.sparse.linalg as spla
+
+from ._util import _norm2
 
 from .newton import NewtonInfo
 
@@ -30,13 +31,18 @@ def _linear_solve(Jx, r, backend):
     if isinstance(Jx, Matrix):
         return np.asarray(Jx.solver(backend).solve(r), dtype=np.float64)
     if isinstance(Jx, RectMatrix):
-        Jx = Jx.tocsr()
+        if Jx.shape[0] != Jx.shape[1]:
+            raise ValueError(f"newton_system: J(x) is {Jx.shape[0]} x {Jx.shape[1]}, not square")
+        from .sparse import SparseMatrix
+        S = SparseMatrix(Jx._K.copy(), Jx.col_space, Jx.row_space)
+        return np.asarray(S.solver("lu").solve(r), dtype=np.float64)
     if isinstance(Jx, LinearSolver) or (hasattr(Jx, "solve") and not sp.issparse(Jx) and not isinstance(Jx, np.ndarray)):
         return np.asarray(Jx.solve(r), dtype=np.float64)
-    if sp.issparse(Jx):
-        return np.asarray(spla.spsolve(sp.csc_matrix(Jx), r), dtype=np.float64)
-    if isinstance(Jx, np.ndarray):
-        return np.linalg.solve(Jx, r)
+    if sp.issparse(Jx):                                       # a SciPy matrix: FEMd's sparse LU
+        return np.asarray(_as_sparse(Jx).solver("lu").solve(r), dtype=np.float64)
+    if isinstance(Jx, np.ndarray):                            # a dense array: FEMd's dense LU
+        from . import _femd as _C
+        return np.asarray(_C.DenseLU(np.ascontiguousarray(Jx, dtype=np.float64)).solve(np.ascontiguousarray(r, dtype=np.float64)))
     raise TypeError(f"newton_system: J(x) must return a Matrix, a LinearSolver, a SciPy sparse matrix or an ndarray, "
                     f"got {type(Jx).__name__}")
 
@@ -60,77 +66,52 @@ def newton_system(F, J, x0, *, tol=1e-10, rtol=0.0, xtol=0.0, maxiter=50, line_s
     floor and the steps are round-off noise.  This ends the iteration once the step is at
     round-off, when ||F|| sits at its floor, which grows with the size of the problem and can
     lie above an absolute tol."""
+    from . import _femd as _C
     x = np.array(x0, dtype=np.float64).reshape(-1)
-    r = np.asarray(F(x), dtype=np.float64)
-    nr = float(np.linalg.norm(r))
-    info = NewtonInfo(False, 0, residuals=[nr])
-    target = max(tol, rtol * nr)
-    nd_prev = 0.0
-    if verbose:
-        print(f"newton  0: ||F|| = {nr:.3e}")
-    for it in range(1, maxiter + 1):
-        if nr <= target:
-            break
-        try:
-            d = _linear_solve(J(x), -r, backend)
-        except (ValueError, RuntimeError, np.linalg.LinAlgError) as e:
-            info.message = f"the Jacobian could not be factored ({e})"
-            break
-        if not np.all(np.isfinite(d)):
-            info.message = "the Newton direction is not finite; the Jacobian is singular or nearly so"
-            break
-        nd = float(np.linalg.norm(d))
-        theta = nd / nd_prev if nd_prev > 0.0 else None
-        nd_prev = nd
-        bound = xtol * np.linalg.norm(x)
-        if theta is not None and theta < 1.0:
-            done = theta / (1.0 - theta) * nd <= bound          # contracting: estimated error left
-        else:
-            done = nd <= bound       # first step, or steps of pure round-off that no longer contract
-        if xtol > 0.0 and done:
-            x = x + d
-            r = np.asarray(F(x), dtype=np.float64)
-            info.iterations = it
-            info.steps.append(1.0)
-            info.linear_iterations.append(0)
-            info.residuals.append(float(np.linalg.norm(r)))
-            info.converged = True
-            info.message = "converged on the step: the error left is below xtol, ||F|| is at its round-off floor"
-            if verbose:
-                print(f"newton {it:2d}: ||F|| = {info.residuals[-1]:.3e}, step {nd:.1e}, stopped on the step")
-            return x, info
-        s = 1.0
-        while True:
-            x_new = x + s * d
-            r_new = np.asarray(F(x_new), dtype=np.float64)
-            n_new = float(np.linalg.norm(r_new))
-            ok = np.isfinite(n_new) and n_new <= (1.0 - 1e-4 * s) * nr
-            if ok or (not line_search and np.isfinite(n_new)) or s < 2.0**-30:
-                break
-            s *= 0.5
-        if not np.isfinite(n_new) or (line_search and not ok):
-            info.message = ("the residual is not finite along the Newton direction" if not np.isfinite(n_new) else
-                            "the line search could not reduce ||F||")
-            break
-        stalled = xtol > 0.0 and n_new >= 0.9 * nr and nd <= np.sqrt(xtol) * np.linalg.norm(x)
-        if stalled and n_new > nr:
-            x_new, r_new, n_new = x, r, nr            # keep the better of the two
-        x, r, nr = x_new, r_new, n_new
-        info.iterations = it
-        info.steps.append(s)
-        info.linear_iterations.append(0)
-        info.residuals.append(nr)
+
+    def residual(xc):
+        return np.asarray(F(xc), dtype=np.float64)
+
+    def direction(xc, r):
+        return _linear_solve(J(xc), -r, backend), 0           # a factorization error is reported by the core
+
+    def progress(it, nr, s, lin):
         if verbose:
             print(f"newton {it:2d}: ||F|| = {nr:.3e}, step {s:g}")
-        if stalled:
-            info.converged = True
-            info.message = "converged: ||F|| stalls at its round-off floor while the step is tiny"
-            return x, info
-    info.converged = nr <= target
+
+    if verbose:
+        print(f"newton  0: ||F|| = {_norm2(residual(x)):.3e}")
+    converged, iterations, residuals, steps, linear_its, message = _C.newton_solve(
+        x, residual, direction, tol=tol, rtol=rtol, xtol=xtol, maxiter=maxiter, line_search=bool(line_search),
+        progress=progress if verbose else None)
+    info = NewtonInfo(bool(converged), int(iterations), residuals=list(residuals), steps=list(steps),
+                      linear_iterations=[int(k) for k in linear_its], message=str(message))
     if warn and not info.converged:
-        warnings.warn(f"newton_system did not converge: ||F|| = {nr:.2e} after {info.iterations} iterations"
+        warnings.warn(f"newton_system did not converge: ||F|| = {info.residual:.2e} after {info.iterations} iterations"
                       + (f" ({info.message})" if info.message else ""), RuntimeWarning, stacklevel=2)
     return x, info
+
+
+def _core(A, b, c, name, tol, rtol, xtol, maxiter, line_search):
+    """The C++ stage iteration (timestep/implicit_rk.hpp) for a tableau."""
+    from . import _femd as _C
+    return _C.ImplicitRK(np.ascontiguousarray(A, dtype=np.float64).ravel(), np.ascontiguousarray(b, dtype=np.float64),
+                         np.ascontiguousarray(c, dtype=np.float64), tol=tol, rtol=rtol, xtol=xtol, maxiter=maxiter,
+                         line_search=line_search, name=str(name))
+
+
+def _step_core(core, c, t, dt, F, M, solve, k0):
+    """One step of the C++ stage iteration on the coefficients c (a float64 array, advanced in place
+    when Newton converges).  F(t, c) is the semi-discrete right-hand side, M the C++ mass matrix (or a
+    callable), solve(K, r) the stage solver, k0 the first iterate for the stages.  Returns a NewtonInfo."""
+    from .newton import NewtonInfo
+    if not (isinstance(c, np.ndarray) and c.dtype == np.float64 and c.flags.c_contiguous and c.flags.writeable):
+        raise TypeError("IRK: the coefficients must be a contiguous writable float64 array")
+    f = lambda tt, U: np.ascontiguousarray(F(tt, U), dtype=np.float64)                   # noqa: E731
+    sv = lambda K, r: np.ascontiguousarray(solve(K, r), dtype=np.float64)                 # noqa: E731
+    converged, iterations, residuals, steps, message = core.step(c, t, dt, f, M, sv, np.ascontiguousarray(k0, dtype=np.float64))
+    return NewtonInfo(bool(converged), int(iterations), residuals=list(residuals), steps=list(steps),
+                      linear_iterations=[0] * int(iterations), message=str(message))
 
 
 # --------------------------------------------------------------------------- Butcher tableaus
@@ -394,8 +375,10 @@ class IRK:
         then a Function of V.unconstrained.  Time-dependent data need M as a rank-2 Form.
       newton: "simplified" (the default in 2D): f' frozen at (t_n, u^n), the stage matrix split by
         the eigenvalues of A into s systems of size n (complex for a conjugate pair, one per pair),
-        factored once per step; "frozen": that factorization kept from step to step and renewed
-        when Newton takes more than irk.refresh (6) iterations or fails; "exact": the s n x s n
+        factored once per step; "frozen": that factorization kept from step to step, renewed at once
+        when Newton fails and at the next step when it slows down (refresh="auto": the step took more
+        than maxiter/2 iterations, or more than 1.5 times those of the last new factorization;
+        refresh=k: more than k); "exact": the s n x s n
         stage Jacobian in the CSR store, factored at every iteration (fewest iterations, costliest).
       M may be singular, as for Stokes and Navier-Stokes (no pressure block): use Radau IIA.
       irk.factorizations counts the sparse factorizations.
@@ -462,6 +445,7 @@ class IRK:
         self.xtol = xtol
         self.line_search, self.backend = line_search, backend
         self.K = None                       # the stages of the last step, in the product numbering
+        self._core = _core(self.A, self.b, self.c, self.method, tol, rtol, xtol, maxiter, line_search)
         self.t, self.history = float(t0), []
         if self.lifted:
             periodic = self.V.periodic if self.product else self.V.bc.is_periodic
@@ -520,8 +504,9 @@ class IRK:
     def stages(self, cn, Kp):
         """The stage values U_i = c^n + dt sum_j a_ij K_j, from K in the product numbering."""
         Ks = self._split(Kp)
-        dt, A = self.dt, self.A
-        return Ks, [cn + dt * sum(A[i, j] * Ks[j] for j in range(self.s)) for i in range(self.s)]
+        U = np.asarray(self._core.stage_values(np.ascontiguousarray(cn, dtype=np.float64), float(self.dt),
+                                               np.ascontiguousarray(np.concatenate(Ks), dtype=np.float64)))
+        return Ks, list(U.reshape(self.s, -1))                 # U_i = c^n + dt sum_j a_ij K_j, in C++
 
     def residual(self, cn, Kp):
         Ks, Us = self.stages(cn, Kp)
@@ -574,34 +559,38 @@ class IRK:
         from .forms import Function, ProductFunction
         if dt is not None and float(dt) != self.dt:
             self.dt, self.K = float(dt), None
+            self._core.forget_stages()
         vec = u.vector if hasattr(u, "vector") else u
         if self.lifted:
             if (isinstance(u, Function) and u.space is not self.U) or (isinstance(u, ProductFunction) and u.product is not self.U):
                 raise ValueError("IRK: with boundary data, u must be a Function (ProductFunction) of V.unconstrained")
             if np.size(vec) != self.U.dim:
                 raise ValueError(f"IRK: with boundary data, u needs {self.U.dim} raw coefficients, got {np.size(vec)}")
-            cn = np.asarray(self._to_V(np.asarray(vec, dtype=np.float64) - self.data.lift(self.t)), dtype=np.float64)
+            cn = np.array(self._to_V(np.asarray(vec, dtype=np.float64) - self.data.lift(self.t)), dtype=np.float64)
         else:
             cn = np.array(vec, dtype=np.float64)
         if self.K is None:
             k0 = np.asarray(self.M.solver().solve(self._F(self.t, cn)), dtype=np.float64)
             self.K = self._gather([k0] * self.s)
+        # the stage iteration runs in C++ (ImplicitRK) on the stages stacked [K_1; ...; K_s]; the
+        # stage Jacobian lives in the product numbering, so the solver converts both ways
+        to_P = lambda Ks: self._gather(np.split(np.asarray(Ks, dtype=np.float64), self.s))        # noqa: E731
+        to_stacked = lambda Kp: np.concatenate(self._split(Kp))                                   # noqa: E731
         if self.newton == "exact":
-            J = lambda Kp: self.jacobian(self.stages(cn, Kp)[1])          # noqa: E731
+            def solve(Ks, r):
+                S = self.jacobian(self.stages(cn, to_P(Ks))[1]).solver(self.backend)
+                return to_stacked(np.asarray(S.solve(to_P(r)), dtype=np.float64))
         else:
             frozen = self.jacobian([cn] * self.s, [self.t] * self.s).solver(self.backend)
-            J = lambda Kp: frozen                                          # noqa: E731
-        K, info = newton_system(lambda Kp: self.residual(cn, Kp), J, self.K, tol=self.tol, rtol=self.rtol, xtol=self.xtol,
-                                maxiter=self.maxiter, line_search=self.line_search, backend=self.backend, warn=False)
+            solve = lambda Ks, r: to_stacked(np.asarray(frozen.solve(to_P(r)), dtype=np.float64))   # noqa: E731
+        info = _step_core(self._core, cn, self.t, self.dt, self._F, self.M._K, solve, to_stacked(self.K))
         if not info.converged:
             raise RuntimeError(f"IRK: Newton did not converge at t = {self.t + self.dt:g}: ||F|| = {info.residual:.2e}"
                                f" after {info.iterations} iterations{' (' + info.message + ')' if info.message else ''}; "
                                "reduce dt, raise maxiter, or loosen tol")
-        self.K = K
-        Ks = self._split(K)
-        c_new = cn + self.dt * sum(self.b[i] * Ks[i] for i in range(self.s))
+        self.K = to_P(self._core.stages)
         self.t += self.dt
-        vec[:] = self._full(self.t, c_new)
+        vec[:] = self._full(self.t, cn)                                   # cn now holds c^{n+1}
         if self.time is not None:
             self.time.assign(self.t)
         self.history.append(info.iterations)
@@ -710,17 +699,22 @@ class _Data2D:
         return np.asarray(self.V.lift(self._at(self.g, t, True)).vector, dtype=np.float64)
 
 
-def _csr(J):
-    """A Jacobian from _Rhs (SparseMatrix, SciPy sparse, dense array or None) as a SciPy CSR matrix."""
+def _as_sparse(J):
+    """A Jacobian (SparseMatrix, Matrix, RectMatrix, SciPy sparse, dense array or None) as a SparseMatrix
+    on FEMd's CSR store: the conversion of an input format, the arithmetic then runs in C++."""
     from .sparse import SparseMatrix
-    if J is None:
-        return None
-    if isinstance(J, SparseMatrix):
-        return J.tocsr()
+    from . import Matrix, RectMatrix
+    from . import _femd as _C
+    if J is None or isinstance(J, SparseMatrix):
+        return J
+    if isinstance(J, Matrix):
+        return SparseMatrix(_C.banded_to_csr(J._K), J.space, J.space)
+    if isinstance(J, RectMatrix):
+        return SparseMatrix(J._K.copy(), J.col_space, J.row_space)
     if sp.issparse(J):
-        return sp.csr_matrix(J)
+        return SparseMatrix.from_scipy(J, symmetric=False)
     if isinstance(J, np.ndarray):
-        return sp.csr_matrix(J)
+        return SparseMatrix(_C.csr_from_dense(np.ascontiguousarray(np.atleast_2d(J), dtype=np.float64)))
     raise TypeError(f"IRK: on a 2D mesh the Jacobian must be a SparseMatrix, a SciPy sparse matrix or an ndarray, "
                     f"got {type(J).__name__}")
 
@@ -729,55 +723,26 @@ class _StageSolver:
     """The simplified-Newton matrix  I (x) M - dt A (x) J  solved through A = T diag(lam) T^{-1}:
     one system M - dt lam_k J of size n per real eigenvalue and one complex system per conjugate
     pair, instead of one real system of size s n (Butcher's transformation, as in Hairer and
-    Wanner's RADAU5).  A 2D factorization of the s n system costs about s^3 times one of size n."""
+    Wanner's RADAU5).  A 2D factorization of the s n system costs about s^3 times one of size n.
+    The eigen decomposition, the factorizations and the solves are C++ (timestep/stage_solver.hpp);
+    a Jacobian given as a SciPy matrix or an array is first copied into the CSR store."""
 
     def __init__(self, M, J, A, dt, backend="auto"):
         from .sparse import SparseMatrix
+        from . import _femd as _C
         s = A.shape[0]
-        lam, T = np.linalg.eig(A)
-        T = T.astype(np.complex128)
-        partner = [None] * s
-        for k in range(s):
-            if partner[k] is not None or abs(lam[k].imag) <= 1e-12 * abs(lam[k]):
-                continue
-            j = next((j for j in range(k + 1, s) if partner[j] is None and abs(lam[j] - np.conj(lam[k])) <= 1e-10 * abs(lam[k])),
-                     None)
-            if j is None:
-                raise ValueError("the eigenvalues of A do not come in conjugate pairs")
-            partner[j] = k
-            T[:, j] = np.conj(T[:, k])
-        if np.linalg.cond(T) > 1e10:
-            raise ValueError("A is not (well) diagonalizable")
-        self.s, self.n, self.T, self.Ti, self.partner = s, M.shape[0], T, np.linalg.inv(T), partner
-        Mc, Jc = M.tocsr(), _csr(J)
-        self.solves = [None] * s
-        self.kinds = []
-        for k in range(s):
-            if partner[k] is not None:
-                continue
-            l = lam[k]
-            if abs(l.imag) <= 1e-12 * abs(l):
-                B = SparseMatrix.from_scipy(Mc if Jc is None else Mc - (dt * l.real) * Jc)
-                S = B.solver(backend)
-                self.solves[k] = lambda z, S=S: (S._solve_array(np.ascontiguousarray(z.real))
-                                                 + 1j * S._solve_array(np.ascontiguousarray(z.imag)))
-                self.kinds.append(S.backend)
-            else:
-                C = Mc.astype(np.complex128) if Jc is None else Mc - (dt * l) * Jc
-                lu = spla.splu(sp.csc_matrix(C, dtype=np.complex128))
-                self.solves[k] = lu.solve
-                self.kinds.append("superlu (complex)")
+        self.s, self.n = s, M.shape[0]
+        b = getattr(backend, "name", backend)
+        b = "auto" if b is None or str(b).lower() == "auto" else str(b).lower()
+        if b in ("superlu", "splu"):
+            b = "lu"
+        M, J = _as_sparse(M), _as_sparse(J)
+        self._core = _C.StageSystemSolver(M._K, None if J is None else J._K,
+                                          np.ascontiguousarray(A, dtype=np.float64).ravel(), int(s), float(dt), b)
+        self.kinds = list(self._core.kinds)
 
     def solve(self, r):
-        Z = self.Ti @ np.asarray(r, dtype=np.float64).reshape(self.s, self.n)
-        W = np.empty_like(Z)
-        for k in range(self.s):
-            if self.partner[k] is None:
-                W[k] = self.solves[k](np.ascontiguousarray(Z[k]))
-        for k in range(self.s):
-            if self.partner[k] is not None:
-                W[k] = np.conj(W[self.partner[k]])
-        return np.ascontiguousarray((self.T @ W).real.ravel())
+        return self._core.solve(np.ascontiguousarray(r, dtype=np.float64).reshape(-1))
 
 
 class _IRK2D(IRK):
@@ -786,7 +751,8 @@ class _IRK2D(IRK):
     The stages are stacked one after the other, K = [K_1; ...; K_s].  newton="simplified" (the
     default here) freezes f' at (t_n, u^n) and splits I (x) M - dt A (x) f' by the eigenvalues of A
     into systems of size n (_StageSolver); "frozen" keeps that factorization from step to step and
-    refactors when Newton slows down (one factorization for a whole run of a linear problem);
+    refactors when Newton slows down (one factorization for a whole run of a linear problem; see
+    _stale for when);
     "exact" assembles delta_ij M - dt a_ij f'(U_i) as one s n x s n matrix in the CSR store at every
     iteration.  Boundary data: dirichlet= as in V.lift, with callables g(x, y, t) or g(t) for data
     that change in time, and u a Function of V.unconstrained.  M may be singular (a
@@ -795,7 +761,7 @@ class _IRK2D(IRK):
 
     def __init__(self, M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0,
                  dirichlet=None, left=None, right=None, newton="simplified", tol=1e-12, rtol=0.0, xtol=1e-12, maxiter=20,
-                 line_search=False, backend="Auto"):
+                 line_search=False, backend="Auto", refresh="auto"):
         from . import Form
         from .sparse import SparseMatrix
         from .forms import Function
@@ -809,9 +775,13 @@ class _IRK2D(IRK):
         self.A, self.b, self.c, self.method = _tableau(method, stages)
         if newton not in ("exact", "simplified", "frozen"):
             raise ValueError("IRK: newton must be 'exact', 'simplified' or 'frozen'")
+        if not (refresh == "auto" or (isinstance(refresh, (int, np.integer)) and not isinstance(refresh, bool)
+                                      and refresh >= 1)):
+            raise ValueError("IRK: refresh must be 'auto' or a positive number of Newton iterations")
         self.M, self.V, self.dt = M, M.space, float(dt)
         self.s, self.n = self.b.size, self.V.dim
-        self._frozen, self.refresh, self.factorizations = None, 6, 0
+        self._frozen, self.factorizations, self._fresh_iters = None, 0, None
+        self.refresh = refresh                    # newton="frozen": when to factor anew, see _stale
         if M.shape[0] != self.n:
             raise ValueError(f"IRK: M is {M.shape[0]} x {M.shape[1]}, its space has dim {self.n}")
         from .linalg import _space_data
@@ -825,6 +795,7 @@ class _IRK2D(IRK):
         self.newton, self.tol, self.rtol, self.maxiter = newton, tol, rtol, maxiter
         self.xtol = xtol
         self.line_search = line_search
+        self._core = _core(self.A, self.b, self.c, self.method, tol, rtol, xtol, maxiter, line_search)
         b = getattr(backend, "name", backend)
         self.backend = "auto" if b is None or str(b).lower() == "auto" else str(b).lower()
         self.K = None
@@ -863,10 +834,10 @@ class _IRK2D(IRK):
         return np.concatenate([np.asarray(v, dtype=np.float64) for v in vecs])
 
     def stages(self, cn, K):
-        """The stage values U_i = c^n + dt sum_j a_ij K_j, with K = [K_1; ...; K_s]."""
-        Ks = np.asarray(K, dtype=np.float64).reshape(self.s, self.n)
-        Us = cn[None, :] + self.dt * (self.A @ Ks)
-        return list(Ks), list(Us)
+        """The stage values U_i = c^n + dt sum_j a_ij K_j, with K = [K_1; ...; K_s] (in C++)."""
+        K = np.ascontiguousarray(K, dtype=np.float64).reshape(-1)
+        U = np.asarray(self._core.stage_values(np.ascontiguousarray(cn, dtype=np.float64), float(self.dt), K))
+        return list(K.reshape(self.s, self.n)), list(U.reshape(self.s, self.n))
 
     def residual(self, cn, K):
         Ks, Us = self.stages(cn, K)
@@ -877,20 +848,18 @@ class _IRK2D(IRK):
         """The stage Jacobian delta_ij M - dt a_ij f'(t_i, U_i), one SparseMatrix of size s n."""
         from .sparse import SparseMatrix
         ts = self.times() if ts is None else ts
-        Mc = self.M.tocsr()
-        rows = []
-        for i in range(self.s):
-            Ji = _csr(self.rhs.J(ts[i], self._full(ts[i], Us[i])))
-            row = []
+        Js = [_as_sparse(self.rhs.J(ts[i], self._full(ts[i], Us[i]))) for i in range(self.s)]
+        from . import _femd as _C
+        offs = [i * self.n for i in range(self.s + 1)]
+        Mk = _as_sparse(self.M)._K
+        entries = [(i, i, Mk, 1.0) for i in range(self.s)]
+        for i, Ji in enumerate(Js):
+            if Ji is None:
+                continue
             for j in range(self.s):
-                blk = Mc if i == j else None
-                if self.A[i, j] != 0.0 and Ji is not None:
-                    term = (-self.dt * self.A[i, j]) * Ji
-                    blk = term if blk is None else blk + term
-                row.append(blk)
-            rows.append(row)
-        B = sp.bmat(rows, format="csr")
-        return SparseMatrix.from_scipy(B, symmetric=False)
+                if self.A[i, j] != 0.0:
+                    entries.append((i, j, Ji._K, float(-self.dt * self.A[i, j])))
+        return SparseMatrix(_C.block_csr(offs, offs, entries))                  # the s n x s n matrix in C++
 
     def _factor(self, B):
         return B.solver(self.backend)
@@ -911,10 +880,13 @@ class _IRK2D(IRK):
         """The first Newton guess for the stages: K_i = M^{-1} f(t_n, u^n), or zero when M is singular."""
         F = self._F(self.t, cn)
         if self._Msolver is None:
-            try:
-                self._Msolver = self.M.solver()
-            except (RuntimeError, ValueError):
-                self._Msolver = False                    # singular: a differential-algebraic system
+            if np.any(np.asarray(self.M.diagonal(), dtype=np.float64) == 0.0):
+                self._Msolver = False                    # a zero on the diagonal of a mass matrix: a differential-
+            else:                                        # algebraic system (Stokes, Navier-Stokes), not factored,
+                try:                                     # which took 1.6 s for 17 546 unknowns to find it singular
+                    self._Msolver = self.M.solver()
+                except (RuntimeError, ValueError):
+                    self._Msolver = False                # singular: a differential-algebraic system
         if self._Msolver is False:
             return np.zeros(self.n)
         k = np.asarray(self._Msolver._solve_array(np.ascontiguousarray(F)), dtype=np.float64)
@@ -927,6 +899,7 @@ class _IRK2D(IRK):
         when dirichlet= is given."""
         if dt is not None and float(dt) != self.dt:
             self.dt, self.K = float(dt), None
+            self._core.forget_stages()
         vec = u.vector if hasattr(u, "vector") else u
         if not isinstance(vec, np.ndarray):
             raise TypeError("IRK.step: u must be a Function, a ProductFunction or a float64 array")
@@ -934,44 +907,64 @@ class _IRK2D(IRK):
             if vec.size != self.U.dim:
                 raise ValueError(f"IRK: with dirichlet=, u must be a Function of V.unconstrained ({self.U.dim} "
                                  f"coefficients), got {vec.size}")
-            cn = np.asarray(self.V.restrict(np.asarray(vec, dtype=np.float64) - self.data.lift(self.t)),
-                            dtype=np.float64)
+            cn = np.array(self.V.restrict(np.asarray(vec, dtype=np.float64) - self.data.lift(self.t)), dtype=np.float64)
         else:
             if vec.size != self.n:
                 raise ValueError(f"IRK: u has {vec.size} coefficients, M's space has {self.n}")
             cn = np.array(vec, dtype=np.float64)
         if self.K is None:
             self.K = np.tile(self._k0(cn), self.s)
-        solve = lambda J: newton_system(lambda K: self.residual(cn, K), J, self.K, tol=self.tol, rtol=self.rtol,  # noqa: E731
-                                        xtol=self.xtol, maxiter=self.maxiter, line_search=self.line_search, warn=False)
+        # the stage iteration runs in C++ (ImplicitRK); Python supplies f, M and the stage solver
+        solve_with = lambda S: _step_core(self._core, cn, self.t, self.dt, self._F, self.M._K,     # noqa: E731
+                                          lambda K, r: np.asarray(S(K).solve(r), dtype=np.float64), self.K)
         if self.newton == "exact":
             def J(K):
                 self.factorizations += 1
                 return self._factor(self.jacobian(self.stages(cn, K)[1]))
-            K, info = solve(J)
+            info = solve_with(J)
         else:
             fresh = self.newton == "simplified" or self._frozen is None or self._frozen[0] != self.dt
             if fresh:
                 self._frozen = (self.dt, self.stage_solver(cn))
-            K, info = solve(lambda K: self._frozen[1])
+            info = solve_with(lambda K: self._frozen[1])
             if self.newton == "frozen" and not fresh and not info.converged:
                 self._frozen = (self.dt, self.stage_solver(cn))        # gone stale: refactor at (t_n, u^n), retry
-                K, info = solve(lambda K: self._frozen[1])
-            elif self.newton == "frozen" and info.iterations > self.refresh:
-                self._frozen = None                                    # slow: refactor at the next step's start
+                info = solve_with(lambda K: self._frozen[1])
+                fresh = True
+            if self.newton == "frozen" and info.converged:
+                if fresh:
+                    self._fresh_iters = info.iterations                # what a new factorization achieves now
+                if self._stale(info.iterations, fresh):
+                    self._frozen = None                                # slow: refactor at the next step's start
         if not info.converged:
             raise RuntimeError(f"IRK: Newton did not converge at t = {self.t + self.dt:g}: ||F|| = {info.residual:.2e}"
                                f" after {info.iterations} iterations{' (' + info.message + ')' if info.message else ''}; "
                                "reduce dt, raise maxiter, or loosen tol")
-        self.K = K
-        Ks = np.asarray(K).reshape(self.s, self.n)
-        c_new = cn + self.dt * (self.b @ Ks)
+        self.K = self._core.stages
         self.t += self.dt
-        vec[:] = self._full(self.t, c_new)
+        vec[:] = self._full(self.t, cn)                                   # cn now holds c^{n+1}
         if self.time is not None:
             self.time.assign(self.t)
         self.history.append(info.iterations)
         return info
+
+    def _stale(self, iterations, fresh):
+        """newton="frozen": whether the next step should start with a new factorization, after a step
+        that took this many Newton iterations (fresh: the step began with a new one).
+
+        refresh="auto": when the step used more than half of maxiter (an older factorization would
+        likely fail, and a failed step costs maxiter iterations before the retry), or when a step on
+        an older factorization took more than the last fresh one plus half of it (at least 2 more).
+        A number k: when the step took more than k iterations."""
+        r = self.refresh
+        if r != "auto":
+            return iterations > r
+        if iterations > self.maxiter // 2:
+            return True
+        if fresh:
+            return False
+        base = self._fresh_iters if self._fresh_iters is not None else iterations
+        return iterations > base + max(2, base // 2)
 
     def __repr__(self):
         extra = ", boundary data" if self.lifted else ""
@@ -1035,6 +1028,8 @@ class SSPRK:
         self.time, self.t = time, float(t0)
         if time is not None:
             time.assign(t0)
+        from . import _femd as _C
+        self._core = _C.SSPRK(stages, order)                 # the stage loop in C++ (timestep/ssp_rk.hpp)
 
     @property
     def solver(self):
@@ -1044,42 +1039,16 @@ class SSPRK:
 
     def rate(self, t, u):
         """u' = M^{-1} f(t, u), the forward Euler direction."""
-        return np.asarray(self._solver.solve(self.rhs.f(t, u)), dtype=np.float64)
+        return np.ascontiguousarray(self._solver.solve(self.rhs.f(t, u)), dtype=np.float64)
 
     def _lim(self, u):
-        return u if self.limiter is None else np.asarray(self.limiter(u), dtype=np.float64)
+        return u if self.limiter is None else np.ascontiguousarray(self.limiter(u), dtype=np.float64)
 
     def _advance(self, u0):
-        dt, t, L, lim = self.dt, self.t, self.rate, self._lim
-        s = (self.stages, self.order)
-        if s == (1, 1):
-            return lim(u0 + dt * L(t, u0))
-        if s == (2, 2):
-            u1 = lim(u0 + dt * L(t, u0))
-            return lim(0.5 * u0 + 0.5 * (u1 + dt * L(t + dt, u1)))
-        if s == (3, 3):
-            u1 = lim(u0 + dt * L(t, u0))
-            u2 = lim(0.75 * u0 + 0.25 * (u1 + dt * L(t + dt, u1)))
-            return lim(u0 / 3.0 + 2.0 / 3.0 * (u2 + dt * L(t + 0.5 * dt, u2)))
-        if s == (4, 3):
-            h = 0.5 * dt
-            u1 = lim(u0 + h * L(t, u0))
-            u2 = lim(u1 + h * L(t + h, u1))
-            u3 = lim(2.0 / 3.0 * u0 + (u2 + h * L(t + dt, u2)) / 3.0)
-            return lim(u3 + h * L(t + h, u3))
-        # Ketcheson (2008), SSPRK(10,4), low storage
-        h = dt / 6.0
-        q1, q2, tq = u0.copy(), u0.copy(), t
-        for _ in range(5):
-            q1 = lim(q1 + h * L(tq, q1))
-            tq += h
-        q2 = q2 / 25.0 + 9.0 / 25.0 * q1
-        q1 = lim(15.0 * q2 - 5.0 * q1)               # = 3/5 u0 + 2/5 u5, a convex combination
-        tq = t + dt / 3.0
-        for _ in range(4):
-            q1 = lim(q1 + h * L(tq, q1))
-            tq += h
-        return lim(q2 + 0.6 * q1 + 0.1 * dt * L(t + dt, q1))
+        """One step from u0 (a fresh contiguous float64 array, advanced in place): the convex
+        combinations of forward Euler steps and the limiter calls run in C++."""
+        self._core.step(u0, self.t, self.dt, self.rate, self._lim if self.limiter is not None else None)
+        return u0
 
     def step(self, u, dt=None):
         """Advance u by one step, in place, and rk.t by dt.  u is a Function, a ProductFunction or
@@ -1115,10 +1084,12 @@ class _KrylovMass:
                  warm_start=True):
         from .sparse import SparseMatrix
         from . import Matrix
+        from . import _femd as _C
         if isinstance(M, SparseMatrix):
             A = M
         elif isinstance(M, Matrix):
-            A = SparseMatrix.from_scipy(M.tocsr(), symmetric=None)
+            A = SparseMatrix(_C.banded_to_csr(M._K))
+            A.symmetric = A.is_symmetric()
         else:
             raise TypeError(f"ERK: a Krylov backend needs M as a Matrix or SparseMatrix, got {type(M).__name__}")
         if A.shape[0] != A.shape[1]:

@@ -8,6 +8,8 @@
 |---|---|---|
 | `newton(R, u, ...)` | function | Newton's method for a residual form, with exact Jacobian and boundary data |
 | `NewtonInfo` | class | the convergence report of `newton`, `newton_system` and `IRK.step` |
+| `_femd.newton_solve(x, residual, direction, tol, rtol, xtol, maxiter, line_search, progress)` | C++ function | the Newton iteration of `newton`, `newton_system` and `IRK` (`solve/newton.hpp`): `x` updated in place, `residual(x)`, `direction(x, r)` giving $d$ or $(d, \text{linear iterations})$ and raising `ValueError`/`RuntimeError` when the Jacobian cannot be factored; returns (converged, iterations, residuals, steps, linear_iterations, message) |
+| `_femd.ImplicitRK` | C++ class | the stage iteration of `IRK` (`timestep/implicit_rk.hpp`): tableau (`gauss`, `radau` or $(A, b, c)$), `step(u, t, dt, f, M, solve, k0)`, `stages`, `set_stages`, `forget_stages`, `stage_values`, the options `tol`, `rtol`, `xtol`, `maxiter`, `line_search` |
 | `newton_system(F, J, x0, ...)` | function | Newton's method for any algebraic system $F(x) = 0$ |
 | `residual_function(R, u, ...)` | function | a residual form as a function of the free coefficients, for `csnewton` and other array solvers |
 | `csnewton(F, x0, ...)` | function | complex-step Newton-Krylov on a NumPy function |

@@ -4,9 +4,10 @@ femd.eigen -- sparse eigenproblems  A x = lambda M x  on any space.
     lam, modes = fd.eigs(a, m, k=6, sigma=0.0)          # forms or assembled matrices
     r = fd.eigs(A, M, k=12, sigma=5.5)                   # an EigenResult: r.values, r.vectors, r.functions
 
-Shift-invert Lanczos (symmetric problems, SciPy's eigsh) or Arnoldi (eigs), with the inner solve
-(A - sigma M)^{-1} done by FEMd's own factorization of the shifted matrix: banded or cyclic in
-1D, sparse Cholesky / pivoting LDL^T / SuperLU in 2D, so the k eigenvalues nearest sigma come
+Shift-invert Arnoldi in C++ (solve/eigen.hpp, with restarts and locking; Lanczos in the M inner
+product for symmetric problems), with the inner solve (A - sigma M)^{-1} done by FEMd's own
+factorization of the shifted matrix: banded or cyclic in 1D, sparse Cholesky / pivoting LDL^T /
+sparse LU in 2D, so the k eigenvalues nearest sigma come
 out after one factorization.  sigma must not be an eigenvalue (A - sigma M must be invertible):
 for a curl-curl operator, whose kernel is every gradient, put sigma inside the spectrum of
 interest, away from 0.
@@ -14,7 +15,8 @@ interest, away from 0.
 from __future__ import annotations
 
 import numpy as np
-import scipy.sparse.linalg as spla
+
+from ._util import _norm2
 
 __all__ = ["eigs", "EigenResult"]
 
@@ -91,13 +93,14 @@ def eigs(a, m=None, k: int = 6, sigma: float = 0.0, symmetric=None, which: str =
                the standard problem A x = lambda x.  For a Galerkin problem m is the mass form u*v*dx.
     k:         how many eigenpairs.
     sigma:     the shift; the result is the k eigenvalues nearest it.  It must not be an eigenvalue.
-    symmetric: None measures A and M; True uses Lanczos (eigsh, M must then be positive definite),
-               False Arnoldi (eigs, complex results possible).
-    which:     "nearest" (default, shift-invert about sigma), or "largest" / "smallest" magnitude
-               without a shift (no factorization; slow for the smallest).
-    tol, maxiter, ncv: passed to ARPACK.  vectors=False skips the eigenvectors.
-    v0:        ARPACK's starting vector.  The default is a fixed pseudo-random one, so a call gives
-               the same result every time (ARPACK's own default is random).
+    symmetric: None measures A and M; True uses the M inner product (Lanczos; M must then be positive
+               definite), False plain Arnoldi (complex results possible).
+    which:     "nearest" (default, shift-invert about sigma), "largest" magnitude (M^{-1} A, no shifted
+               factorization) or "smallest" (the shift 0).
+    tol, maxiter, ncv: the relative residual tolerance of a Ritz pair (1e-10), the restarts (300) and the
+               Arnoldi vectors per restart (max(2k + 1, 20)).  vectors=False skips the eigenvectors.
+    v0:        the starting vector.  The default is a fixed pseudo-random one, so a call gives the same
+               result every time.
     backend:   the solver of the shifted matrix (A - sigma M).solver(backend).
 
     Returns an EigenResult; lam, X = fd.eigs(...) unpacks it, and .functions gives Functions."""
@@ -112,51 +115,51 @@ def eigs(a, m=None, k: int = 6, sigma: float = 0.0, symmetric=None, which: str =
     if symmetric is None:
         symmetric = _measured_symmetric(A) and (M is None or _measured_symmetric(M))
     space = getattr(A, "space", None)
-    Aop = spla.LinearOperator((n, n), matvec=lambda x: np.asarray(A.matvec(np.ascontiguousarray(np.real(x), dtype=np.float64)))
-                              + (1j * np.asarray(A.matvec(np.ascontiguousarray(np.imag(x), dtype=np.float64)))
-                                 if np.iscomplexobj(x) else 0.0), dtype=np.float64)
-    Mop = None
-    if M is not None:
-        Mop = spla.LinearOperator((n, n), matvec=lambda x: np.asarray(M.matvec(np.ascontiguousarray(np.real(x), dtype=np.float64)))
-                                  + (1j * np.asarray(M.matvec(np.ascontiguousarray(np.imag(x), dtype=np.float64)))
-                                     if np.iscomplexobj(x) else 0.0), dtype=np.float64)
+    from . import _femd as _C
+
+    def matvec_of(K):
+        return lambda x: np.ascontiguousarray(K.matvec(np.ascontiguousarray(x, dtype=np.float64)), dtype=np.float64)
+
     if v0 is None:
         v0 = np.random.default_rng(12345).standard_normal(n)
-    opts = dict(k=k, tol=tol, maxiter=maxiter, ncv=ncv, return_eigenvectors=bool(vectors),
-                v0=np.asarray(getattr(v0, "vector", v0), dtype=np.float64))
+    v0 = np.ascontiguousarray(getattr(v0, "vector", v0), dtype=np.float64)
     w = str(which).lower()
-    if w == "nearest":
+    if w not in ("nearest", "largest", "smallest"):
+        raise ValueError(f"eigs(): which is 'nearest', 'largest' or 'smallest', got {which!r}")
+    Amv = matvec_of(A)
+    Mmv = matvec_of(M) if M is not None else None
+    if w in ("nearest", "smallest"):
+        # shift-invert: OP = (A - sigma M)^{-1} M, theta = 1 / (lambda - sigma); "smallest" is the shift 0
+        shift = float(sigma) if w == "nearest" else 0.0
         if M is not None:
-            C = A - float(sigma) * M if sigma != 0 else A.copy()
+            C = A - shift * M if shift != 0 else A.copy()
         else:
-            import scipy.sparse as sp
-            Cs = A.tocsr() - float(sigma) * sp.identity(n, format="csr")
-            C = _like(A, Cs)
+            C = _shifted(A, shift)
         try:
             S = C.solver(backend) if backend != "auto" else C.solver()
         except Exception as e:
-            raise ValueError(f"eigs(): the shifted matrix A - {sigma:g} M could not be factored ({e}); sigma may be "
+            raise ValueError(f"eigs(): the shifted matrix A - {shift:g} M could not be factored ({e}); sigma may be "
                              "an eigenvalue (a curl-curl or pure Neumann operator has 0 in its spectrum): move it") from None
-
-        def inv(x):
-            x = np.asarray(x)
-            if np.iscomplexobj(x):
-                return _solve(S, x.real) + 1j * _solve(S, x.imag)
-            return _solve(S, x)
-        OPinv = spla.LinearOperator((n, n), matvec=inv, dtype=np.float64)
-        if symmetric:
-            res = spla.eigsh(Aop, M=Mop, sigma=float(sigma), OPinv=OPinv, which="LM", **opts)
-        else:
-            res = spla.eigs(Aop, M=Mop, sigma=float(sigma), OPinv=OPinv, which="LM", **opts)
-    elif w in ("largest", "smallest"):
-        if M is not None:
-            Ms = M.solver()
-            Minv = spla.LinearOperator((n, n), matvec=lambda x: _solve(Ms, np.real(x)), dtype=np.float64)
-            opts["Minv"] = Minv
-        which_ = "LM" if w == "largest" else "SM"
-        res = (spla.eigsh if symmetric else spla.eigs)(Aop, M=Mop, which=which_, **opts)
+        op = (lambda x: _solve(S, Mmv(x))) if M is not None else (lambda x: _solve(S, x))
+        back = lambda theta: shift + 1.0 / theta                                               # noqa: E731
     else:
-        raise ValueError(f"eigs(): which is 'nearest', 'largest' or 'smallest', got {which!r}")
+        # the largest in magnitude of OP = M^{-1} A directly, theta = lambda
+        Ms = M.solver() if M is not None else None
+        op = (lambda x: _solve(Ms, Amv(x))) if M is not None else Amv
+        back = lambda theta: theta                                                             # noqa: E731
+    B = Mmv if (symmetric and M is not None) else None
+    theta, Xs, _, restarts, _, converged, message = _C.arnoldi_largest(
+        n, op, B, int(k), int(ncv or 0), float(tol), int(maxiter or 0), bool(symmetric), v0)
+    if not converged:
+        raise ValueError(f"eigs(): Arnoldi did not converge after {restarts} restarts ({message}); raise maxiter or ncv, "
+                         "or move sigma")
+    lam = back(np.asarray(theta))
+    X = np.ascontiguousarray(np.asarray(Xs).reshape(len(lam), n).T)
+    if symmetric:                                              # Lanczos in the M inner product: everything real
+        lam, X = lam.real, np.ascontiguousarray(X.real)
+    res = (lam, X) if vectors else lam
+    Aop = Amv
+    Mop = Mmv
     lam, X = (res if vectors else (res, None))
     lam = np.asarray(lam)
     if not symmetric and np.allclose(np.imag(lam), 0.0, atol=1e-12 * max(1.0, np.abs(lam).max())):
@@ -170,18 +173,26 @@ def eigs(a, m=None, k: int = 6, sigma: float = 0.0, symmetric=None, which: str =
     resid = np.zeros(len(lam))
     if X is not None:
         nA, nM = _norm1(A), (_norm1(M) if M is not None else 1.0)
+        def apply(f, x):
+            if np.iscomplexobj(x):
+                return f(np.ascontiguousarray(x.real)) + 1j * f(np.ascontiguousarray(x.imag))
+            return f(np.ascontiguousarray(x))
+
         for i in range(len(lam)):
-            ax = Aop @ X[:, i]
-            mx = Mop @ X[:, i] if Mop is not None else X[:, i]
-            scale = (nA + abs(lam[i]) * nM) * np.linalg.norm(X[:, i])
-            resid[i] = np.linalg.norm(ax - lam[i] * mx) / max(scale, 1e-300)
+            ax = apply(Aop, X[:, i])
+            mx = apply(Mop, X[:, i]) if Mop is not None else X[:, i]
+            scale = (nA + abs(lam[i]) * nM) * _norm2(X[:, i])
+            resid[i] = _norm2(ax - lam[i] * mx) / max(scale, 1e-300)
     return EigenResult(lam, X, space, float(sigma), resid, bool(symmetric))
 
 
 def _norm1(A):
-    """The 1-norm of a matrix (largest column sum of |a_ij|), the scale of the residuals."""
-    C = abs(A.tocsr())
-    return float(np.asarray(C.sum(axis=0)).max()) if C.nnz else 1.0
+    """The 1-norm of a matrix (largest column sum of |a_ij|), the scale of the residuals, in C++."""
+    K = getattr(A, "_K", None)
+    if K is not None and hasattr(K, "norm1"):
+        return float(K.norm1())
+    from .timestep import _as_sparse
+    return float(_as_sparse(A)._K.norm1())
 
 
 def _solve(S, b):
@@ -189,10 +200,12 @@ def _solve(S, b):
     return np.asarray(getattr(out, "vector", out), dtype=np.float64)
 
 
-def _like(A, Cs):
-    """A matrix of A's kind holding the scipy matrix Cs (the standard problem's shift)."""
+def _shifted(A, shift):
+    """A - shift I for a SparseMatrix (the standard problem), in C++, exact zeros dropped."""
     from .sparse import SparseMatrix
     if isinstance(A, SparseMatrix):
-        return SparseMatrix.from_scipy(Cs.tocsr(), space=A.space, symmetric=None)
+        C = SparseMatrix(A._K.shifted(float(shift)), space=A.space)
+        C.symmetric = C.is_symmetric()
+        return C
     raise TypeError("eigs(): the standard problem (m=None) needs a 2D SparseMatrix; in 1D pass a mass matrix "
                     "(or the identity) as m")

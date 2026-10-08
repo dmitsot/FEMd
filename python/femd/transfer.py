@@ -31,7 +31,8 @@ import warnings
 
 import numpy as np
 import scipy.sparse as sp
-import scipy.sparse.linalg as spla
+
+from . import _femd as _C
 
 __all__ = ["Transfer", "mixed_mass"]
 
@@ -55,17 +56,30 @@ def _breakpoints(V, W):
 
 
 def _gauss(brk, n):
-    xg, wg = np.polynomial.legendre.leggauss(n)
+    xg, wg = (np.asarray(a) for a in _C.gauss_legendre(int(n)))
     h, m = np.diff(brk), 0.5 * (brk[:-1] + brk[1:])
     return (m[:, None] + 0.5 * h[:, None] * xg).ravel(), (0.5 * h[:, None] * wg).ravel()
 
 
-def mixed_mass(W, V) -> sp.csr_matrix:
-    """B_ij = int_{W.a}^{W.b} N^W_i N^V_j, (W.dim x V.dim), exact for any pair of grids."""
+def _mixed_mass_csr(W, V):
+    """B = N_W^T diag(w) N_V in the CSR store (one pass in C++, exact zeros dropped)."""
     _check_domains(V, W)
     x, w = _gauss(_breakpoints(V, W), (W.degree + V.degree) // 2 + 1)
-    NW, NV = W.basis_matrix(x), V.basis_matrix(np.clip(x, V.a, V.b))
-    return (NW.T @ sp.diags(w) @ NV).tocsr()
+    NW, NV = W._basis_csr(x), V._basis_csr(np.clip(x, V.a, V.b))
+    i = np.arange(w.size, dtype=np.int32)
+    Dw = _C.csr_from_triplets(int(w.size), int(w.size), i, i, np.ascontiguousarray(w, dtype=np.float64))
+    return Dw.triple_product(NW.transposed(), NV)
+
+
+def _scipy(K):
+    """A SciPy copy of a _femd.CSRMatrix, for the functions that return one."""
+    return sp.csr_matrix((np.array(K.data), np.array(K.indices), np.array(K.indptr)), shape=(K.nrows, K.ncols))
+
+
+def mixed_mass(W, V) -> sp.csr_matrix:
+    """B_ij = int_{W.a}^{W.b} N^W_i N^V_j, (W.dim x V.dim), exact for any pair of grids (computed in
+    C++; returned as a scipy.sparse matrix)."""
+    return _scipy(_mixed_mass_csr(W, V))
 
 
 # --------------------------------------------------------------------------- boundary checks
@@ -141,20 +155,23 @@ class Transfer:
         _check_domains(source, target)
         self.source, self.target, self.kind = source, target, kind
         if kind == "project":
-            self.rhs = mixed_mass(target, source)
+            self._rhsK = _mixed_mass_csr(target, source)
+            self.rhs = _scipy(self._rhsK)
             self.lhs = target.mass_matrix()
             solver = self.lhs.solver()
             self._solve = lambda b: np.asarray(solver.solve(b), dtype=np.float64)
         else:
             xi = target.dof_coordinates()
-            self.rhs = source.basis_matrix(np.clip(xi, source.a, source.b))
-            C = target.basis_matrix(xi)
-            if abs(C - sp.identity(target.dim)).max() < 1e-13:
+            self._rhsK = source._basis_csr(np.clip(xi, source.a, source.b))
+            self.rhs = _scipy(self._rhsK)
+            CK = target._basis_csr(xi)
+            if CK.identity_defect() < 1e-13:
                 self.lhs, self._solve = None, lambda b: b
             else:
-                self.lhs = C
-                lu = spla.splu(C.tocsc())
-                self._solve = lu.solve
+                from .linalg import Matrix
+                self.lhs = _scipy(CK)
+                solver = Matrix.from_csr(CK, periodic=target.bc.is_periodic).solver()
+                self._solve = lambda b: np.asarray(solver.solve(b), dtype=np.float64)
 
     @property
     def shape(self):
@@ -164,7 +181,7 @@ class Transfer:
         c = np.asarray(c, dtype=np.float64)
         if c.shape != (self.source.dim,):
             raise ValueError(f"Transfer @ c: need a vector of length {self.source.dim}, got shape {c.shape}")
-        return self._solve(self.rhs @ c)
+        return self._solve(self._rhsK.matvec(np.ascontiguousarray(c)))
 
     def __call__(self, u, check: bool = True, name=None, _stacklevel=3):
         from .forms import Function

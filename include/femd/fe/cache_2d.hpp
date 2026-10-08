@@ -288,6 +288,32 @@ public:
     }
     bool is_vector() const { return vector_; }
 
+    /// @brief Values of derivative code m at every point (out[e * nq + q]) for the dim coefficients c,
+    ///        scalar or vector space, summed as at_points does (the two agree bit for bit).
+    void eval_into(const double *c, int m, double *out) const
+    {
+        if (m < 0 || m >= V_->ncodes())
+            throw std::invalid_argument(vector_ ? "derivative code is 3 c + d: component c, d = 0 (value), 1 (d/dx), 2 (d/dy)"
+                                                : "derivative code is 0 (value), 1 (d/dx) or 2 (d/dy)");
+        FEMD_OMP_PARALLEL_IF(detail::parallel_elements(nent_, nq_))
+        {
+        std::vector<double> rowbuf(static_cast<std::size_t>(nloc_)), loc(static_cast<std::size_t>(nloc_));
+        FEMD_OMP_FOR
+        for (int e = 0; e < nent_; ++e)
+        {
+            const int *d = dofs(e);
+            for (int l = 0; l < nloc_; ++l) loc[l] = d[l] >= 0 ? c[d[l]] : 0.0;
+            for (int q = 0; q < nq_; ++q)
+            {
+                row(e, q, m, rowbuf.data());
+                double s = 0.0;
+                for (int l = 0; l < nloc_; ++l) s += rowbuf[l] * loc[l];
+                out[static_cast<std::size_t>(e) * nq_ + q] = s;
+            }
+        }
+        }
+    }
+
 private:
     std::vector<double> eval(const std::vector<double> &c, int m, bool raw) const
     {
@@ -295,13 +321,14 @@ private:
             throw std::invalid_argument(vector_ ? "derivative code is 3 c + d: component c, d = 0 (value), 1 (d/dx), 2 (d/dy)"
                                                 : "derivative code is 0 (value), 1 (d/dx) or 2 (d/dy)");
         std::vector<double> out(static_cast<std::size_t>(nent_) * nq_, 0.0);
+        if (!raw) { eval_into(c.data(), m, out.data()); return out; }
         FEMD_OMP_PARALLEL_IF(detail::parallel_elements(nent_, nq_))
         {
         std::vector<double> rowbuf(static_cast<std::size_t>(nloc_)), loc(static_cast<std::size_t>(nloc_));
         FEMD_OMP_FOR
         for (int e = 0; e < nent_; ++e)
         {
-            const int *d = raw ? raw_dofs(e) : dofs(e);
+            const int *d = raw_dofs(e);
             for (int l = 0; l < nloc_; ++l) loc[l] = d[l] >= 0 ? c[d[l]] : 0.0;
             for (int q = 0; q < nq_; ++q)
             {

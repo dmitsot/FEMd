@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import _femd as _C
+
 __all__ = ["TVBLimiter", "SlopeLimiter", "limited_slope", "VertexLimiter", "minmod"]
 
 
@@ -44,53 +46,31 @@ def minmod(*args):
 
 
 class _FieldLimiter:
-    """The limiter on one DGSpace: nodal <-> modal maps and element widths."""
+    """The limiter on one DGSpace: the nodal <-> modal maps and element widths are set up here,
+    the limiting of a coefficient vector runs in C++ (fe/limiters.hpp, Limiter1D)."""
 
-    def __init__(self, V, M):
+    def __init__(self, V, M, slope=-1, uno2=False, all_elements=False):
         self.V, self.M = V, float(M)
         self.p, self.ne = V.degree, V.nelem
         self.periodic = V.bc.is_periodic
         grid = np.asarray(V.grid, dtype=np.float64)
-        self.h2 = np.diff(grid) ** 2
+        self.h = np.diff(grid)
+        self.h2 = self.h ** 2
         if V.basis_name == "legendre":
             self.to_modal = self.to_nodal = None
+            tm = tn = np.zeros(0)
         else:
             xi = np.asarray(V.reference_points(), dtype=np.float64)
-            Vand = np.polynomial.legendre.legvander(xi, self.p)     # nodal = Vand @ modal
-            self.to_nodal, self.to_modal = Vand, np.linalg.inv(Vand)
+            Vand = np.asarray(_C.legendre_vandermonde(np.ascontiguousarray(xi), self.p))   # nodal = Vand @ modal
+            self.to_nodal, self.to_modal = Vand, np.asarray(_C.dense_inverse(Vand))
+            tm, tn = np.ascontiguousarray(self.to_modal).ravel(), np.ascontiguousarray(self.to_nodal).ravel()
+        self._core = _C.Limiter1D(self.p, self.ne, bool(self.periodic), np.ascontiguousarray(self.h), tm, tn,
+                                  self.M, int(slope), bool(uno2), bool(all_elements))
 
     def limit(self, c):
         """Limited copy of the coefficients c (length dim), and the number of troubled elements."""
-        p, ne = self.p, self.ne
-        C = np.asarray(c, dtype=np.float64).reshape(ne, p + 1)
-        if self.to_modal is not None:
-            C = C @ self.to_modal.T
-        else:
-            C = C.copy()
-        if p == 0 or ne < 2:
-            return (C @ self.to_nodal.T if self.to_nodal is not None else C).ravel(), 0
-        mean = C[:, 0]
-        if self.periodic:
-            dp, dm = np.roll(mean, -1) - mean, mean - np.roll(mean, 1)
-        else:
-            dp, dm = np.empty(ne), np.empty(ne)
-            dp[:-1] = mean[1:] - mean[:-1]
-            dm[1:] = mean[1:] - mean[:-1]
-            dp[-1], dm[0] = dm[-1], dp[0]            # one-sided at the ends: the missing difference drops out
-        right = C.sum(axis=1) - mean                 # P_l(1) = 1
-        left = mean - C @ (-1.0) ** np.arange(p + 1)  # P_l(-1) = (-1)^l
-        thr = self.M * self.h2
-
-        def tvb(a):
-            return np.where(np.abs(a) <= thr, a, minmod(a, dp, dm))
-
-        bad = (tvb(right) != right) | (tvb(left) != left)
-        if bad.any():
-            C[bad, 1] = minmod(C[bad, 1], dp[bad], dm[bad])
-            C[bad, 2:] = 0.0
-        if self.to_nodal is not None:
-            C = C @ self.to_nodal.T
-        return C.ravel(), int(bad.sum())
+        out, troubled = self._core.limit(np.ascontiguousarray(c, dtype=np.float64).reshape(-1))
+        return out, int(troubled)
 
 
 class TVBLimiter:
@@ -195,13 +175,13 @@ def limited_slope(limiter, sm, sp, reconstruction="tvd2", Dm=None, D0=None, Dp=N
 
 
 class _SlopeFieldLimiter(_FieldLimiter):
-    """A finite volume slope limiter on one DGSpace."""
+    """A finite volume slope limiter on one DGSpace (the loops in C++, fe/limiters.hpp)."""
+
+    _IDS = {"minmod": 0, "mc": 1, "vanleer": 2, "vanalbada": 3}
 
     def __init__(self, V, limiter, reconstruction, M, troubled):
-        super().__init__(V, M)
         self.limiter, self.reconstruction, self.troubled_rule = limiter, reconstruction, troubled
-        grid = np.asarray(V.grid, dtype=np.float64)
-        self.h = np.diff(grid)
+        super().__init__(V, M, slope=self._IDS[limiter], uno2=(reconstruction == "uno2"), all_elements=(troubled == "all"))
         h = self.h
         if self.periodic:
             self.dp = 0.5 * (h + np.roll(h, -1))     # center of cell j to center of cell j+1
@@ -210,45 +190,6 @@ class _SlopeFieldLimiter(_FieldLimiter):
             self.dp, self.dm = np.empty_like(h), np.empty_like(h)
             self.dp[:-1] = self.dm[1:] = 0.5 * (h[:-1] + h[1:])
             self.dp[-1], self.dm[0] = self.dm[-1], self.dp[0]
-
-    def limit(self, c):
-        p, ne = self.p, self.ne
-        C = np.asarray(c, dtype=np.float64).reshape(ne, p + 1)
-        C = C @ self.to_modal.T if self.to_modal is not None else C.copy()
-        if p == 0 or ne < 2:
-            return (C @ self.to_nodal.T if self.to_nodal is not None else C).ravel(), 0
-        mean = C[:, 0]
-        if self.periodic:
-            Dp_, Dm_ = np.roll(mean, -1) - mean, mean - np.roll(mean, 1)
-        else:
-            Dp_, Dm_ = np.empty(ne), np.empty(ne)
-            Dp_[:-1] = Dm_[1:] = mean[1:] - mean[:-1]
-            Dp_[-1], Dm_[0] = Dm_[-1], Dp_[0]        # one-sided at the ends, as in TVBLimiter
-        if self.troubled_rule == "all":
-            bad = np.ones(ne, dtype=bool)
-        else:                                        # the Cockburn-Shu test with the TVB constant M
-            right = C.sum(axis=1) - mean
-            left = mean - C @ (-1.0) ** np.arange(p + 1)
-            thr = self.M * self.h2
-            tvb = lambda a: np.where(np.abs(a) <= thr, a, minmod(a, Dp_, Dm_))
-            bad = (tvb(right) != right) | (tvb(left) != left)
-        if bad.any():
-            sp, sm = Dp_ / self.dp, Dm_ / self.dm    # right and left slopes
-            s = limited_slope(self.limiter, sm, sp)
-            if self.reconstruction == "uno2":
-                D = 2.0 * (sp - sm) / (self.dm + self.dp)          # second divided differences
-                if self.periodic:
-                    s = limited_slope(self.limiter, sm, sp, "uno2", np.roll(D, 1), D, np.roll(D, -1),
-                                      self.dm, self.dp)
-                elif ne >= 5:                                      # TVD2 in the two cells next to each end
-                    j = slice(2, ne - 2)
-                    s[j] = limited_slope(self.limiter, sm[j], sp[j], "uno2", D[1:ne - 3], D[j], D[3:ne - 1],
-                                         self.dm[j], self.dp[j])
-            C[bad, 1] = 0.5 * self.h[bad] * s[bad]                 # the Legendre slope, P_1(1) = 1
-            C[bad, 2:] = 0.0
-        if self.to_nodal is not None:
-            C = C @ self.to_nodal.T
-        return C.ravel(), int(bad.sum())
 
 
 class SlopeLimiter(TVBLimiter):
@@ -319,7 +260,7 @@ class SlopeLimiter(TVBLimiter):
 
 # ============================================================================ 2D: the vertex-based limiter
 class _VertexFieldLimiter:
-    """The vertex-based limiter on one DGSpace2D."""
+    """The vertex-based limiter on one DGSpace2D (the tables here, the loops in C++, fe/limiters.hpp)."""
 
     def __init__(self, V):
         from .elements2d import _dg_tables
@@ -330,33 +271,15 @@ class _VertexFieldLimiter:
         rep = np.asarray(getattr(V, "vertex_representatives", np.arange(V.mesh.npoints)))
         self.rv = rep[np.asarray(V.cell_vertices())]                 # (nc, 3) vertex classes (periodic sides joined)
         self.nv = int(self.rv.max()) + 1
+        self._core = _C.VertexLimiter2D(self.k, self.nc, self.n, np.ascontiguousarray(self.mean, dtype=np.float64).ravel(),
+                                        np.ascontiguousarray(self.Pi, dtype=np.float64).ravel(),
+                                        np.ascontiguousarray(self.E, dtype=np.float64).ravel(),
+                                        np.ascontiguousarray(self.rv, dtype=np.int32).ravel(), self.nv)
 
     def limit(self, c):
-        C = np.asarray(c, dtype=np.float64).reshape(self.nc, self.n)
-        if self.k == 0:
-            return C.ravel().copy(), 0
-        ubar = C @ self.mean                                         # cell means
-        Uv = C @ self.Pi.T                                           # vertex values of the P1 part
-        umax = np.full(self.nv, -np.inf)
-        umin = np.full(self.nv, np.inf)
-        for j in range(3):
-            np.maximum.at(umax, self.rv[:, j], ubar)
-            np.minimum.at(umin, self.rv[:, j], ubar)
-        d = Uv - ubar[:, None]
-        scale = max(np.abs(ubar).max(), np.abs(d).max(), 1e-300)
-        tol = 1e-13 * scale
-        up = (umax[self.rv] - ubar[:, None])
-        lo = (umin[self.rv] - ubar[:, None])
-        with np.errstate(divide="ignore", invalid="ignore"):
-            a = np.where(d > tol, np.minimum(1.0, up / d), np.where(d < -tol, np.minimum(1.0, lo / d), 1.0))
-        alpha = np.clip(a.min(axis=1), 0.0, 1.0)
-        bad = alpha < 1.0 - 1e-12
-        out = C.copy()
-        if bad.any():
-            ub = ubar[bad][:, None]
-            out[bad] = ub + alpha[bad][:, None] * ((Uv[bad] - ub) @ self.E.T)
-        self.alpha = alpha
-        return out.ravel(), int(bad.sum())
+        out, troubled = self._core.limit(np.ascontiguousarray(c, dtype=np.float64).reshape(-1))
+        self.alpha = self._core.alpha
+        return out, int(troubled)
 
 
 class VertexLimiter:

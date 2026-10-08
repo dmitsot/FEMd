@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import numpy as np
 import scipy.sparse as sp
-import scipy.sparse.linalg as spla
 
 from . import _femd as _C
 from ._femd import QuadratureCache, Solver, has_fftw
-from ._util import _vec, _coeff
+from ._util import _vec, _coeff, _by_columns
 from .spaces import ProductSpace, LagrangeSpace, SplineSpace, _space_of
 from .forms import Function, ProductFunction, Form, form
 
@@ -143,6 +142,42 @@ class Matrix:
     def symmetric(self, v: bool):
         self._K.symmetric = bool(v)
 
+    @staticmethod
+    def from_scipy(S, periodic: bool = False, space=None, symmetric: bool = False) -> "Matrix":
+        """A Matrix from a square SciPy sparse matrix: the band that holds its entries, with entries
+        farther than n/2 from the diagonal taken as periodic corners when periodic=True.  The
+        result factors with FEMd's banded or cyclic solvers (`.solver()`)."""
+        S = sp.coo_matrix(S)
+        n = S.shape[0]
+        if S.shape[1] != n:
+            raise ValueError(f"Matrix.from_scipy: the matrix is {S.shape[0]} x {S.shape[1]}, not square")
+        r, c, v = np.asarray(S.row, dtype=np.int64), np.asarray(S.col, dtype=np.int64), np.asarray(S.data, dtype=np.float64)
+        off = np.abs(c - r)
+        inband = off <= n // 2 if periodic else np.ones(off.shape, dtype=bool)
+        p = int(off[inband].max()) if inband.any() else 0
+        K = _C.AssembledMatrix(n, p)
+        K.add_entries(np.ascontiguousarray(r, dtype=np.int32), np.ascontiguousarray(c, dtype=np.int32), np.ascontiguousarray(v))
+        K.symmetric = bool(symmetric)
+        return Matrix(K, bool(periodic), space)
+
+    @staticmethod
+    def from_csr(K, periodic: bool = False, space=None, symmetric: bool = False) -> "Matrix":
+        """A Matrix from a square _femd.CSRMatrix, as from_scipy does it (no SciPy involved)."""
+        n = int(K.nrows)
+        if int(K.ncols) != n:
+            raise ValueError(f"Matrix.from_csr: the matrix is {K.nrows} x {K.ncols}, not square")
+        ip = np.asarray(K.indptr, dtype=np.int64)
+        r = np.repeat(np.arange(n, dtype=np.int64), np.diff(ip))
+        c = np.asarray(K.indices, dtype=np.int64)
+        v = np.ascontiguousarray(K.data, dtype=np.float64)
+        off = np.abs(c - r)
+        inband = off <= n // 2 if periodic else np.ones(off.shape, dtype=bool)
+        p = int(off[inband].max()) if inband.any() else 0
+        A = _C.AssembledMatrix(n, p)
+        A.add_entries(np.ascontiguousarray(r, dtype=np.int32), np.ascontiguousarray(c, dtype=np.int32), v)
+        A.symmetric = bool(symmetric)
+        return Matrix(A, bool(periodic), space)
+
     def tocoo(self) -> sp.coo_matrix:
         r, c, v = self._K.to_coo()
         return sp.coo_matrix((v, (r, c)), shape=self.shape)
@@ -225,20 +260,15 @@ class Matrix:
         if isinstance(x, RectMatrix):
             if self.space is not x.row_space:
                 raise ValueError("A @ B: the columns of A and the rows of B index different spaces")
-            return RectMatrix(self.tocsr() @ x._A, self.space, x.col_space)
+            return RectMatrix(_C.banded_to_csr(self._K).multiply(x._K), self.space, x.col_space)
         if isinstance(x, Matrix):
             o = self._pair(x, "A @ B")
             return self._wrap(self._K.multiply(o._K), o)
         v = np.asarray(x)
-        if np.iscomplexobj(v):       # the matrix is real: apply it to the two parts, give a complex array
-            return self.matvec(v.real) + 1j * self.matvec(v.imag) if v.ndim == 1 else self.tocsr() @ v
-        v = np.asarray(v, dtype=np.float64)
-        if v.ndim == 1 and self._kernel is not None:
-            if not v.flags.c_contiguous:
-                v = np.ascontiguousarray(v)
-            y = self._kernel(v)
-        else:
-            y = self.tocsr() @ v
+        if np.iscomplexobj(v) or v.ndim != 1:   # complex (by parts) or several columns: the C++ kernel on each
+            return _by_columns(self._kernel, v, self.shape[0])
+        v = np.ascontiguousarray(v, dtype=np.float64)
+        y = self._kernel(v)
         if y.ndim == 1 and self.space is not None and not isinstance(self.space, ProductSpace):
             return Function._adopt(self.space, "product", y)
         return y
@@ -253,8 +283,6 @@ class Matrix:
         else:
             yv = y.vector if isinstance(y, Function) else y
             yv = np.ascontiguousarray(np.asarray(yv), dtype=np.float64)
-        if self._K is None or not hasattr(self._K, "inner"):
-            return float(yv @ (self.tocsr() @ xv))
         return self._K.inner(xv, yv)
 
     def matvec(self, x, out=None) -> np.ndarray:
@@ -288,7 +316,8 @@ class Matrix:
         Raises if the matrix is not circulant.  Needs no FFTW."""
         if not self.is_circulant():
             raise ValueError("symbol(): matrix is not circulant (needs periodic, uniform grid, constant coefficients)")
-        return np.fft.fft(_C.first_column(self._K))
+        re, im = _C.fft(np.ascontiguousarray(_C.first_column(self._K), dtype=np.float64))   # util/fft.hpp
+        return np.asarray(re) + 1j * np.asarray(im)
 
     def classify(self, tol: float = 1e-12) -> "MatrixInfo":
         """Measure what kind of matrix this is: bandwidth, symmetry, skew, circulant
@@ -454,8 +483,9 @@ class RectMatrix:
         B = fd.form(D(u) * q * dx).assemble()        # W.dim x V.dim
 
     and is the off-diagonal block of a coupled system, assembled into one banded
-    Matrix with fd.block([[A, B], [C, M]]).  It is stored as a SciPy CSR matrix,
-    since a rectangular block has no diagonal to band around and is never factored.
+    Matrix with fd.block([[A, B], [C, M]]).  It is stored in FEMd's compressed sparse
+    row store (_femd.CSRMatrix), since a rectangular block has no diagonal to band
+    around and is never factored; the products, the transpose and the algebra run in C++.
 
         B @ v        Function of W for a vector (or Function of V), RectMatrix for a Matrix
         B.T          the transposed operator, from W to V
@@ -463,15 +493,19 @@ class RectMatrix:
         B.tocsr()    a SciPy copy
     """
     def __init__(self, A, row_space, col_space):
-        A = sp.csr_matrix(A)
-        A.sum_duplicates()
-        if A.shape != (row_space.dim, col_space.dim):
-            raise ValueError(f"RectMatrix: shape {A.shape} does not match ({row_space.dim}, {col_space.dim})")
-        self._A, self.row_space, self.col_space = A, row_space, col_space
+        if not isinstance(A, _C.CSRMatrix):
+            A = _csr_from(A)
+        if (A.nrows, A.ncols) != (row_space.dim, col_space.dim):
+            raise ValueError(f"RectMatrix: shape {(A.nrows, A.ncols)} does not match ({row_space.dim}, {col_space.dim})")
+        self._K, self.row_space, self.col_space = A, row_space, col_space
 
     @property
     def shape(self):
-        return self._A.shape
+        return (self._K.nrows, self._K.ncols)
+
+    @property
+    def nnz(self):
+        return self._K.nnz
 
     @property
     def space(self):
@@ -479,54 +513,61 @@ class RectMatrix:
         return self.row_space
 
     def tocsr(self) -> sp.csr_matrix:
-        return self._A.copy()
+        """A SciPy copy."""
+        K = self._K
+        return sp.csr_matrix((np.array(K.data), np.array(K.indices), np.array(K.indptr)), shape=self.shape)
 
     def tocoo(self) -> sp.coo_matrix:
-        return self._A.tocoo()
+        return self.tocsr().tocoo()
 
     def toarray(self) -> np.ndarray:
-        return self._A.toarray()
+        return np.asarray(self._K.dense())
 
     def copy(self) -> "RectMatrix":
-        return RectMatrix(self._A.copy(), self.row_space, self.col_space)
+        return RectMatrix(self._K.copy(), self.row_space, self.col_space)
 
     @property
     def T(self) -> "RectMatrix":
-        return RectMatrix(self._A.T.tocsr(), self.col_space, self.row_space)
+        return RectMatrix(self._K.transposed(), self.col_space, self.row_space)
 
     def solver(self, *args, **kw):
         raise TypeError(f"a rectangular {self.shape[0]} x {self.shape[1]} block has no solver; assemble the "
                         "coupled system with fd.block([[A, B], [C, D]]) and solve that")
 
     def matvec(self, x, out=None) -> np.ndarray:
-        """B x as a plain array; out= copies the result into an existing array."""
+        """B x as a plain array; out= writes the result into an existing array."""
         v = x.vector if isinstance(x, Function) else np.asarray(x, dtype=np.float64)
         if v.shape != (self.shape[1],):
             raise ValueError(f"RectMatrix.matvec: need a vector of length {self.shape[1]}, got shape {v.shape}")
-        y = self._A @ v
+        v = np.ascontiguousarray(v, dtype=np.float64)
         if out is None:
-            return y
-        out[:] = y
+            return self._K.matvec(v)
+        if isinstance(out, np.ndarray) and out.dtype == np.float64 and out.flags.c_contiguous and out.shape == (self.shape[0],):
+            self._K.matvec_into(v, out)
+        else:
+            out[:] = self._K.matvec(v)
         return out
 
     def __matmul__(self, x):
         if isinstance(x, RectMatrix):
             if self.col_space is not x.row_space:
                 raise ValueError("B @ C: the columns of B and the rows of C index different spaces")
-            return RectMatrix(self._A @ x._A, self.row_space, x.col_space)
+            return RectMatrix(self._K.multiply(x._K), self.row_space, x.col_space)
         if isinstance(x, Matrix):
             if self.col_space is not x.space:
                 raise ValueError("B @ A: the columns of B and the rows of A index different spaces")
-            return RectMatrix(self._A @ x.tocsr(), self.row_space, x.space)
+            return RectMatrix(self._K.multiply(_C.banded_to_csr(x._K)), self.row_space, x.space)
         if isinstance(x, Function):
             if x.space is not self.col_space:
                 raise ValueError("B @ u: u does not live in the trial space of B")
             x = x.vector
         v = np.asarray(x, dtype=np.float64)
-        y = self._A @ v
-        if y.ndim == 1:
-            return Function._adopt(self.row_space, "product", np.ascontiguousarray(y))
-        return y
+        if v.ndim == 1:
+            return Function._adopt(self.row_space, "product", self.matvec(v))
+        if v.ndim == 2 and v.shape[0] == self.shape[1]:
+            return np.column_stack([self._K.matvec(np.ascontiguousarray(v[:, k])) for k in range(v.shape[1])]) \
+                if v.shape[1] else np.zeros((self.shape[0], 0))
+        raise ValueError(f"B @ x: x has shape {v.shape}, B is {self.shape[0]} x {self.shape[1]}")
 
     def _same(self, o, what):
         if not isinstance(o, RectMatrix):
@@ -537,30 +578,39 @@ class RectMatrix:
 
     def __add__(self, o):
         o = self._same(o, "B + C")
-        return o if o is NotImplemented else RectMatrix(self._A + o._A, self.row_space, self.col_space)
+        return o if o is NotImplemented else RectMatrix(self._K.combine(o._K, 1.0, 1.0), self.row_space, self.col_space)
 
     def __sub__(self, o):
         o = self._same(o, "B - C")
-        return o if o is NotImplemented else RectMatrix(self._A - o._A, self.row_space, self.col_space)
+        return o if o is NotImplemented else RectMatrix(self._K.combine(o._K, 1.0, -1.0), self.row_space, self.col_space)
 
     def __neg__(self):
-        return RectMatrix(-self._A, self.row_space, self.col_space)
+        return RectMatrix(self._K.scaled(-1.0), self.row_space, self.col_space)
 
     def __mul__(self, a):
         if not np.isscalar(a):
             return NotImplemented
-        return RectMatrix(float(a) * self._A, self.row_space, self.col_space)
+        return RectMatrix(self._K.scaled(float(a)), self.row_space, self.col_space)
 
     __rmul__ = __mul__
 
     def __truediv__(self, a):
         if not np.isscalar(a):
             return NotImplemented
-        return RectMatrix(self._A / float(a), self.row_space, self.col_space)
+        return RectMatrix(self._K.scaled(1.0 / float(a)), self.row_space, self.col_space)
 
     def __repr__(self):
-        return (f"RectMatrix({self.shape[0]} x {self.shape[1]}, {self._A.nnz} nonzeros, "
+        return (f"RectMatrix({self.shape[0]} x {self.shape[1]}, {self.nnz} nonzeros, "
                 f"{self.row_space!r} <- {self.col_space!r})")
+
+
+def _csr_from(A):
+    """A SciPy sparse matrix or a dense array as a _femd.CSRMatrix (an input format only)."""
+    if not sp.issparse(A):
+        A = sp.csr_matrix(np.atleast_2d(np.asarray(A, dtype=np.float64)))
+    C = sp.csr_matrix(A, dtype=np.float64, copy=True).tocoo()
+    return _C.csr_from_triplets(int(C.shape[0]), int(C.shape[1]), np.ascontiguousarray(C.row, dtype=np.int32),
+                                np.ascontiguousarray(C.col, dtype=np.int32), np.ascontiguousarray(C.data, dtype=np.float64))
 
 
 def _block_spaces(B):
@@ -626,11 +676,10 @@ def block(blocks, space=None, symmetric=None) -> Matrix:
             if isinstance(B, Matrix) and hasattr(B._K, "add_scaled_block"):
                 K.add_scaled_block(space, I, J, B._K, 1.0)          # straight off the band, in C++
                 continue
-            if isinstance(B, Matrix):
-                rr, cc, vv = B._K.to_coo()
-            else:
-                C = B._A.tocoo()
-                rr, cc, vv = C.row, C.col, C.data
+            if isinstance(B, RectMatrix):
+                K.add_csr_block(space, I, J, B._K, 1.0)             # straight off the CSR store, in C++
+                continue
+            rr, cc, vv = B._K.to_coo()
             K.add_coo(space, I, J, np.ascontiguousarray(rr, dtype=np.int32),
                       np.ascontiguousarray(cc, dtype=np.int32), np.ascontiguousarray(vv, dtype=np.float64))
     if symmetric is None:
@@ -670,7 +719,7 @@ def solve(a, L, left=None, right=None, backend=Solver.Auto, dirichlet=None):
     Without data it is a Function of V.  backend is passed to Matrix.solver().
 
     On a 2D mesh the data is dirichlet= (a number, a callable g(x, y), or a dict
-    {marker: number or callable}, as in V.lift()), and backend is "auto" / "superlu",
+    {marker: number or callable}, as in V.lift()), and backend is "auto" / "lu" / "superlu",
     "cg", "gmres" or "dense" (SparseMatrix.solver()).
 
     When the call gives no data, the data given with the space are used:

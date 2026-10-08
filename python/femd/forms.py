@@ -810,8 +810,9 @@ class Function(Argument):
     """
 
     def __new__(cls, V=None, name=None, vector=None, _infer=True):
-        # a system (or vector) space on a 2D mesh: the known field is a ProductFunction / VectorFunction
-        if cls is Function and (_is_system_2d(V) or _is_vector_element(V)):
+        # a system (ProductSpace in 1D or 2D, VectorFunctionSpace) or a vector element: the known
+        # field is a ProductFunction / VectorFunction / VectorElementFunction
+        if cls is Function and (hasattr(V, "fields") or _is_vector_element(V)):
             if isinstance(name, (np.ndarray, list, tuple, ListTensor, Expr)) and vector is None:
                 name, vector = None, name
             if name is None and _infer:
@@ -1495,6 +1496,21 @@ def _is_zero(e): return isinstance(e, Const) and e.value == 0.0
 
 
 # ============================================================================ evaluation
+def _source_vector(a, values, owner_values=None):
+    """The coefficient vector a known field reads: an internal override by id(owner), a keyword value
+    by name, or the owner's vector."""
+    if owner_values and a.owner is not None and id(a.owner) in owner_values:
+        vals = owner_values[id(a.owner)]
+    elif a.name in values:
+        vals = values[a.name]
+        vals = vals.vector if isinstance(vals, (Function, ProductFunction)) else vals
+    elif a.owner is not None:
+        vals = a.owner.vector
+    else:
+        raise KeyError(f"no value supplied for Function '{a.name}'")
+    return np.asarray(vals)
+
+
 class _Context:
     """Where pointwise expressions get their numbers: quadrature nodes of the caches, or one endpoint."""
     def __init__(self, xs, values, caches=None, point=None, node_space=None, owner_values=None):
@@ -1515,17 +1531,7 @@ class _Context:
 
     def _source(self, a: Argument):
         """The coefficient vector of the known field a reads: an override, a value, or the owner's."""
-        ov = self.owner_values
-        if ov and a.owner is not None and id(a.owner) in ov:
-            vals = ov[id(a.owner)]
-        elif a.name in self.values:
-            vals = self.values[a.name]
-            vals = vals.vector if isinstance(vals, (Function, ProductFunction)) else vals
-        elif a.owner is not None:
-            vals = a.owner.vector
-        else:
-            raise KeyError(f"no value supplied for Function '{a.name}'")
-        return np.asarray(vals)
+        return _source_vector(a, self.values, self.owner_values)
 
     def _func_values(self, a: Argument):
         vals = self._source(a)
@@ -1685,20 +1691,20 @@ class _RectAccum:
         self.extra.append((i, j, v))
 
     def finish(self):
-        import scipy.sparse as sp
         from . import RectMatrix
-        rows = [p[0] for p in self.parts]
-        cols = [p[1] for p in self.parts]
-        vals = [p[2] for p in self.parts]
+        rows = [np.asarray(p[0], dtype=np.int32) for p in self.parts]
+        cols = [np.asarray(p[1], dtype=np.int32) for p in self.parts]
+        vals = [np.asarray(p[2], dtype=np.float64) for p in self.parts]
         if self.extra:
             e = np.array(self.extra, dtype=np.float64)
-            rows.append(e[:, 0].astype(np.int64)); cols.append(e[:, 1].astype(np.int64)); vals.append(e[:, 2])
+            rows.append(e[:, 0].astype(np.int32)); cols.append(e[:, 1].astype(np.int32)); vals.append(e[:, 2])
         if rows:
             r, c, v = np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
         else:
-            r = c = np.zeros(0, dtype=np.int64); v = np.zeros(0)
-        A = sp.coo_matrix((v, (r, c)), shape=(self.T.dim, self.R.dim)).tocsr()
-        return RectMatrix(A, self.T, self.R)
+            r = c = np.zeros(0, dtype=np.int32); v = np.zeros(0)
+        K = _C.csr_from_triplets(int(self.T.dim), int(self.R.dim), np.ascontiguousarray(r), np.ascontiguousarray(c),
+                                 np.ascontiguousarray(v))
+        return RectMatrix(K, self.T, self.R)
 
 
 def _same_mesh(A, B):
@@ -1758,6 +1764,537 @@ def evaluate(e, ctx: _Context):
         memo[id(e)] = (e, r)
         return r
     raise TypeError(f"cannot evaluate {e!r}")
+
+
+# ============================================================================ compiled integrands
+_COMPILED = True
+
+
+def set_compiled_integrands(on=True):
+    """Assemble forms in C++ (default): the coefficients by the Integrand programs (in complex arithmetic
+    for complex values, the complex-step derivative) and the whole loop by FormAssembler1D /
+    FormAssembler2D.  False: the Python driver with the NumPy evaluation of the coefficients."""
+    global _COMPILED
+    _COMPILED = bool(on)
+
+
+def compiled_integrands():
+    return _COMPILED
+
+
+class _Program:
+    """A coefficient expression compiled for _C.Integrand (forms/integrand.hpp): a register program
+    whose inputs are the values of the known fields at the points (one per slot, from
+    ctx.func_values) and whose constants are the Const values and the current values of the
+    Constants.  compile() returns None for an expression the evaluator does not cover, and
+    evaluate() returns None when the values are complex (the complex-step derivative) or the
+    context lacks what the program reads; the NumPy evaluate() then takes over."""
+
+    _FUNCS = {"sin": 9, "cos": 10, "exp": 11, "log": 12, "tanh": 13, "sqrt": 14, "sinh": 15, "cosh": 16, "sech": 17,
+              "abs": 18, "sign": 19}                               # the Op numbers of forms/integrand.hpp
+    CONST, X, Y, NX, NY, INPUT, ADD, MUL, POW = range(9)
+
+    def __init__(self):
+        self.code, self.consts, self.inputs, self.input_keys, self.nreg, self.memo = [], [], [], {}, 0, {}
+        self.normal_sides = set()               # the restrictions the normal carries; checked against the context
+
+    @classmethod
+    def compile(cls, expr):
+        P = cls()
+        try:
+            P._emit(expr)
+        except NotImplementedError:
+            return None
+        P.prog = _C.Integrand(np.asarray(P.code, dtype=np.int32).ravel(), max(P.nreg, 1), len(P.consts), len(P.inputs))
+        return P
+
+    def _reg(self):
+        self.nreg += 1
+        return self.nreg - 1
+
+    def _const(self, c):
+        self.consts.append(c)
+        return len(self.consts) - 1
+
+    def _emit(self, e):
+        key = id(e)
+        got = self.memo.get(key)
+        if got is not None and got[0] is e:
+            return got[1]
+        r = self._emit_node(e)
+        self.memo[key] = (e, r)
+        return r
+
+    def _emit_node(self, e):
+        if isinstance(e, Const):
+            r = self._reg(); self.code.append((self.CONST, r, self._const(float(e.value)), 0)); return r
+        if isinstance(e, Constant):
+            r = self._reg(); self.code.append((self.CONST, r, self._const(e), 0)); return r
+        if isinstance(e, Spatial):
+            r = self._reg(); self.code.append((self.X if e.index == 0 else self.Y, r, 0, 0)); return r
+        if isinstance(e, Normal):
+            self.normal_sides.add(e.side)
+            r = self._reg(); self.code.append((self.NX if e.index == 0 else self.NY, r, -1 if e.side == "+" else 1, 0)); return r
+        if isinstance(e, Argument):
+            if e.kind != "func":
+                raise NotImplementedError
+            k = e.slot()
+            if k not in self.input_keys:
+                self.input_keys[k] = len(self.inputs)
+                self.inputs.append(e)
+            r = self._reg(); self.code.append((self.INPUT, r, self.input_keys[k], 0)); return r
+        if isinstance(e, Sum):
+            if not e.terms:
+                r = self._reg(); self.code.append((self.CONST, r, self._const(0.0), 0)); return r
+            acc = self._emit(e.terms[0])
+            for t in e.terms[1:]:
+                b = self._emit(t); r = self._reg(); self.code.append((self.ADD, r, acc, b)); acc = r
+            return acc
+        if isinstance(e, Prod):
+            if not e.factors:
+                r = self._reg(); self.code.append((self.CONST, r, self._const(1.0), 0)); return r
+            acc = self._emit(e.factors[0])
+            for f in e.factors[1:]:
+                b = self._emit(f); r = self._reg(); self.code.append((self.MUL, r, acc, b)); acc = r
+            return acc
+        if isinstance(e, Pow):
+            n = e.n
+            if isinstance(n, Expr) or np.iscomplexobj(n):
+                raise NotImplementedError
+            a = self._emit(e.base); r = self._reg(); self.code.append((self.POW, r, a, self._const(float(n)))); return r
+        if isinstance(e, Func):
+            op = self._FUNCS.get(e.name)
+            if op is None:
+                raise NotImplementedError
+            a = self._emit(e.arg); r = self._reg(); self.code.append((op, r, a, 0)); return r
+        raise NotImplementedError
+
+    def evaluate(self, ctx):
+        npts = int(np.size(ctx.xs))
+        if self.prog.needs_normal:
+            # the NumPy evaluation raises for a normal that does not fit the measure: leave those to it
+            if getattr(ctx, "normals", None) is None:
+                return None
+            if getattr(ctx, "facet", False) and None in self.normal_sides:
+                return None
+            if not getattr(ctx, "facet", False) and any(sd is not None for sd in self.normal_sides):
+                return None
+        consts = []
+        for c in self.consts:
+            v = _scalar(ctx.values.get(c.name, c.value)) if isinstance(c, Constant) else c
+            if isinstance(v, complex):
+                return None
+            consts.append(v)
+        inputs = []
+        for a in self.inputs:
+            v = np.asarray(ctx.func_values(a))
+            if np.iscomplexobj(v) or v.shape != (npts,):
+                return None
+            inputs.append(np.ascontiguousarray(v, dtype=np.float64))
+        xs = ys = nx = ny = None
+        if self.prog.needs_coordinates:
+            xs = np.ascontiguousarray(ctx.xs, dtype=np.float64).reshape(-1)
+            ys = np.ascontiguousarray(ctx.ys, dtype=np.float64).reshape(-1)
+        if self.prog.needs_normal:
+            nx = np.ascontiguousarray(ctx.normals[0], dtype=np.float64).reshape(-1)
+            ny = np.ascontiguousarray(ctx.normals[1], dtype=np.float64).reshape(-1)
+        return self.prog.evaluate(npts, xs, ys, nx, ny, inputs, np.asarray(consts, dtype=np.float64))
+
+
+class _Fallback(Exception):
+    """Raised while compiling a 2D form when a term needs the NumPy evaluation."""
+
+
+class _Compiled2D:
+    """A 2D form (one list of terms) compiled for _C.FormAssembler2D (forms/assembler_2d.hpp): the
+    point sets, the known fields read at each of them and the terms with their Integrand programs
+    are described once; assemble() then hands the current coefficient vectors and constants to
+    C++, which evaluates the fields, the coefficients and the kernels with no Python in the loop
+    (and without the GIL).  compile() returns None when a term needs the NumPy path: an expression
+    the Integrand does not cover, a field on another mesh, a normal that does not fit the measure
+    (the NumPy path raises the proper error)."""
+
+    def __init__(self, form_, terms):
+        self.form, self.terms, self.rank = form_, terms, terms[0].rank
+        rank = self.rank
+        T = form_.test_space if rank else next(iter(form_.spaces.values()))
+        R = form_.trial_space if rank == 2 else None
+        self.T0, self.R0 = T, R
+        self.ZT = getattr(T, "_Z", None) if rank else None            # slip: assemble without it, then reduce
+        self.ZR = getattr(R, "_Z", None) if rank == 2 else None
+        if self.ZT is not None:
+            T = T._base
+        if self.ZR is not None:
+            R = R._base
+        self.T, self.R = T, R
+        self.facets = any(t.measure.kind == "dS" for t in terms)
+        groups = _group_terms_2d(terms, T)
+        progs = {}
+        for t in terms:
+            P = form_._program(t)
+            if P is None:
+                raise _Fallback
+            progs[id(t)] = P
+        self.sources, self.consts = [], []                              # Arguments naming the vectors; floats or Constants
+        src_index, fields, field_order, plan = {}, {}, [], []
+        side = lambda a: 1 if a.side == "+" else 0                       # noqa: E731
+
+        def source(a):
+            k = (a.slot()[0], id(a.product) if a.product is not None else None)
+            if k not in src_index:
+                src_index[k] = len(self.sources)
+                self.sources.append(a)
+            if a.product is not None:
+                return src_index[k], int(a.product.offsets[a.field]), int(a.product.fields[a.field].dim)
+            return src_index[k], 0, int(a.space.dim)
+
+        for key, (Ts, toff), (Rs, roff), ts in groups.values():
+            Q = form_._cache2d(Ts, key)
+            if (Q.nf if key[0] == "dS" else Q.nent) == 0:
+                continue
+            QS = form_._cache2d(Rs, key) if rank == 2 else None
+            gterms = []
+            for t in ts:
+                P = progs[id(t)]
+                if P.prog.needs_normal:
+                    if key[0] == "dS" and None in P.normal_sides:
+                        raise _Fallback
+                    if key[0] != "dS" and any(sd is not None for sd in P.normal_sides):
+                        raise _Fallback
+                inputs = []
+                for a in P.inputs:
+                    if getattr(a.space, "tdim", 1) != 2:
+                        raise _Fallback
+                    vec, off, dim = source(a)
+                    if key[0] == "dS":
+                        if a.space.mesh is not form_._facet_mesh:
+                            raise _Fallback
+                        fk = ("dS", id(a.space), vec, off, side(a))
+                        Qa = form_._cache2d(a.space, ("dS",))
+                    else:
+                        if a.space.mesh is not Ts.mesh:
+                            raise _Fallback
+                        fk = (key, id(a.space), vec, off)
+                        Qa = form_._cache2d(a.space, key)
+                    if fk not in fields:
+                        fields[fk] = (Qa, vec, off, dim, side(a), [])
+                        field_order.append(fk)
+                    codes = fields[fk][5]
+                    if a.code() not in codes:
+                        codes.append(a.code())
+                    inputs.append((fk, a.code()))
+                cidx = list(range(len(self.consts), len(self.consts) + len(P.consts)))
+                self.consts.extend(P.consts)
+                a_, b_ = (t.test.code(), side(t.test)) if t.test is not None else (0, 0)
+                c_, d_ = (t.trial.code(), side(t.trial)) if t.trial is not None else (0, 0)
+                gterms.append((P.prog, inputs, cidx, a_, c_, b_, d_))
+            plan.append((key, Q, QS, int(toff), int(roff), gterms))
+
+        A = _C.FormAssembler2D(rank, len(self.sources), len(self.consts))
+        first = {}
+        for fk in field_order:
+            Qa, vec, off, dim, sd, codes = fields[fk]
+            if fk[0] == "dS":
+                first[fk] = A.add_facet_field(Qa, vec, off, dim, sd, codes)
+            else:
+                first[fk] = A.add_field(Qa, vec, off, dim, codes)
+        for key, Q, QS, toff, roff, gterms in plan:
+            g = A.add_facet_group(Q, QS, toff, roff) if key[0] == "dS" else A.add_group(Q, QS, toff, roff)
+            for prog, inputs, cidx, a_, c_, b_, d_ in gterms:
+                A.add_term(g, prog, [first[fk] + fields[fk][5].index(code) for fk, code in inputs], cidx, a_, c_, b_, d_)
+        self.A = A
+        self._fields = fields                                   # keeps the caches referenced
+
+    @classmethod
+    def compile(cls, form_, terms):
+        try:
+            return cls(form_, terms)
+        except _Fallback:
+            return None
+
+    def vectors(self, values, owner_values=None, cplx=False):
+        out = []
+        for a in self.sources:
+            v = np.asarray(_source_vector(a, values, owner_values)).reshape(-1)
+            if not cplx:
+                v = v.astype(np.float64, copy=False)
+            if a.product is not None and getattr(a.product, "_Z", None) is not None:
+                v = a.product._z(v)                                  # slip: the fields before Z
+            out.append(v if cplx else np.ascontiguousarray(v, dtype=np.float64))
+        return out
+
+    def constants(self, values, cplx=False):
+        return np.asarray([_scalar(values.get(c.name, c.value)) if isinstance(c, Constant) else c for c in self.consts],
+                          dtype=np.complex128 if cplx else np.float64)
+
+    def assemble_complex(self, values, owner_values=None):
+        """Rank 0 or 1 with complex values (the complex-step derivative), in C++."""
+        vre, vim = _complex_parts(self.vectors(values, owner_values, cplx=True))
+        k = self.constants(values, cplx=True)
+        got = self.A.assemble_complex(vre, vim, np.ascontiguousarray(k.real), np.ascontiguousarray(k.imag),
+                                      int(self.T.dim) if self.rank == 1 else 0)
+        if self.rank == 0:
+            return complex(got[0], got[1])
+        out = np.asarray(got[0]) + 1j * np.asarray(got[1])
+        return self.T0._zt(out) if self.ZT is not None else out
+
+    def assemble(self, values, owner_values=None):
+        from .sparse import SparseMatrix
+        vecs, consts = self.vectors(values, owner_values), self.constants(values)
+        T, R, T0, R0 = self.T, self.R, self.T0, self.R0
+        if self.rank == 0:
+            return float(self.A.assemble_scalar(vecs, consts))
+        if self.rank == 1:
+            out = self.A.assemble_vector(vecs, consts, int(T.dim))
+            return T0._zt(out) if self.ZT is not None else out
+        K = _C.CSRMatrix(_pattern_2d(T, R, facets=self.facets), False)
+        self.A.assemble_matrix(vecs, consts, K)
+        if self.ZT is not None or self.ZR is not None:
+            return _slip_reduce(K, T0, R0, self.ZT is not None, self.ZR)
+        if T is R:
+            K.symmetric = bool(K.asymmetry() <= 1e-13)
+        return SparseMatrix(K, R, T)
+
+
+class _Compiled1D:
+    """A 1D form (one list of terms) compiled for _C.FormAssembler1D (forms/assembler_1d.hpp): the
+    point sets (quadrature nodes of dx, Gauss or Lobatto; the interior facets of dS; the end points
+    of ds), the known fields read at each of them and the terms in the order of the form, each with
+    its Integrand program and its kernel, are described once; assemble() hands the current
+    coefficient vectors and constants to C++, which evaluates the fields and coefficients and
+    calls the kernels term after term as the Python driver did.  compile() returns None when the
+    Python driver is needed: an expression the Integrand does not cover, a normal or y (the NumPy
+    path raises the error), ds on a periodic space or dS across grids (errors again).  A rectangular
+    form (test and trial in two spaces on one grid) gives a RectMatrix on the CSR store."""
+
+    _Y = 2                                                       # the Y instruction of forms/integrand.hpp
+
+    def __init__(self, form_, terms):
+        f = form_
+        self.form, self.terms = f, terms
+        rank = self.rank = terms[0].rank
+        T = f.test_space if rank else None
+        is_prod = bool(rank) and hasattr(T, "fields") and not hasattr(T, "degree")
+        R = f.trial_space if rank == 2 else None
+        rect = rank == 2 and R is not T
+        if rect and (is_prod or (hasattr(R, "fields") and not hasattr(R, "degree")) or not _same_mesh(T, R)):
+            raise _Fallback                                      # a mismatch the Python driver reports
+        self.T, self.R, self.is_prod, self.rect = T, R, is_prod, rect
+        progs = []
+        for t in terms:
+            P = f._program(t)
+            if P is None or P.prog.needs_normal or any(int(op) == self._Y for op, *_ in P.code):
+                raise _Fallback
+            progs.append(P)
+            if t.measure.kind == "ds":
+                ns = t.test.space if t.test is not None else next(iter(f.spaces.values()))
+                if ns.bc.is_periodic:
+                    raise _Fallback
+            elif t.measure.kind == "dS":
+                ns = t.test.space if t.test is not None else next(iter(f.spaces.values()))
+                if any(not _same_mesh(sp_, ns) for sp_ in f.spaces.values()):
+                    raise _Fallback
+
+        self.sources, src_index = [], {}
+        self.consts = []
+        gidx = (lambda P_, k: np.ascontiguousarray(f._global_indices(P_)[k], dtype=np.int32))      # noqa: E731
+        empty = np.zeros(0, dtype=np.int32)
+
+        def source(a):
+            k = (a.slot()[0], id(a.product) if a.product is not None else None)
+            if k not in src_index:
+                src_index[k] = len(self.sources)
+                self.sources.append(a)
+            return src_index[k], (gidx(a.product, a.field) if a.product is not None else empty)
+
+        # the plan: point sets, fields and terms, in the order of the form
+        sets, set_order, fields, field_order, plan = {}, [], {}, [], []
+        side = lambda a: 0 if a.side == "-" else 1               # noqa: E731  (_add_facet's rule for test/trial)
+        fside = lambda a: 0 if (a.side or "-") == "-" else 1     # noqa: E731  (_FacetContext's rule for fields)
+
+        def point_set(key, make):
+            if key not in sets:
+                sets[key] = make
+                set_order.append(key)
+            return key
+
+        for t, P in zip(terms, progs):
+            kind = t.measure.kind
+            ns = t.test.space if t.test is not None else next(iter(f.spaces.values()))
+            if kind == "dx":
+                rule = ("lobatto", f._lobatto_points(t)) if t.measure.scheme == "lobatto" else None
+                cache = (lambda sp_, rule=rule: f._cache(sp_, rule))                              # noqa: E731
+                keys = [point_set(("dx", rule, id(ns)), ("cells", cache(ns)))]
+            elif kind == "dS":
+                keys = [point_set(("dS", id(ns)), ("facets", f._facet_cache(ns)))]
+            else:
+                mesh = ns.mesh
+                pts = {"left": [mesh.a], "right": [mesh.b], "both": [mesh.a, mesh.b]}[t.measure.where]
+                keys = [point_set(("pt", float(xp)), ("point", float(xp))) for xp in pts]
+            for key in keys:
+                inputs = []
+                for a in P.inputs:
+                    vec, mp = source(a)
+                    fk = (key, vec, a.field, a.deriv, a.side, id(a.space))
+                    if fk not in fields:
+                        if kind == "dx":
+                            if _same_mesh(a.space, ns):
+                                fields[fk] = ("quad", a.space, cache(a.space), vec, mp, int(a.deriv))
+                            else:
+                                fields[fk] = ("point", a.space, vec, mp, int(a.deriv))
+                        elif kind == "dS":
+                            fields[fk] = ("facet", a.space, f._facet_cache(a.space), vec, mp, fside(a), int(a.deriv))
+                        else:
+                            fields[fk] = ("point", a.space, vec, mp, int(a.deriv))
+                        field_order.append(fk)
+                    inputs.append(fk)
+                cidx = list(range(len(self.consts), len(self.consts) + len(P.consts)))
+                self.consts.extend(P.consts)
+                plan.append((key, kind, t, P, inputs, cidx, rule if kind == "dx" else None))
+
+        n = int(T.dim) if rank else 0
+        A = _C.FormAssembler1D(rank, len(self.sources), len(self.consts), n, int(R.dim) if rect else -1)
+        set_index = {}
+        for key in set_order:
+            what, obj = sets[key]
+            set_index[key] = A.add_cells(obj) if what == "cells" else (A.add_facets(obj) if what == "facets" else A.add_point(obj))
+        field_index = {}
+        for fk in field_order:
+            d = fields[fk]
+            ps = set_index[fk[0]]
+            if d[0] == "quad":
+                field_index[fk] = A.add_quad_field(ps, d[1], d[2], d[3], d[4], d[5])
+            elif d[0] == "facet":
+                field_index[fk] = A.add_facet_field(ps, d[1], d[2], d[3], d[4], d[5], d[6])
+            else:
+                field_index[fk] = A.add_point_field(ps, d[1], d[2], d[3], d[4])
+        for key, kind, t, P, inputs, cidx, rule in plan:
+            ps, ins, prog = set_index[key], [field_index[fk] for fk in inputs], P.prog
+            a_ = int(t.test.deriv) if t.test is not None else 0
+            b_ = int(t.trial.deriv) if t.trial is not None else 0
+            if kind == "dx":
+                if rank == 2 and is_prod:
+                    A.add_cell_term(ps, prog, ins, cidx, a_, b_, T, int(t.test.field), int(t.trial.field), f._cache(t.trial.space, rule))
+                elif rank == 1 and is_prod:
+                    A.add_cell_term(ps, prog, ins, cidx, a_, 0, T, int(t.test.field), 0, None)
+                elif rect:
+                    A.add_cell_term(ps, prog, ins, cidx, a_, b_, None, 0, 0, f._cache(t.trial.space, rule))
+                else:
+                    A.add_cell_term(ps, prog, ins, cidx, a_, b_, None, 0, 0, None)
+            elif kind == "dS":
+                st = side(t.test) if t.test is not None else 0
+                ss = side(t.trial) if t.trial is not None else 0
+                if rank == 1:
+                    nt = int(t.test.space.dim) if is_prod else n
+                    mp = gidx(T, t.test.field) if is_prod else empty
+                    A.add_facet_term(ps, prog, ins, cidx, st, 0, a_, 0, nt, mp, None, None, 0, 0, False)
+                elif rank == 2:
+                    FS = f._facet_cache(t.trial.space)
+                    if is_prod:
+                        clear = t.test.field != t.trial.field or t.test.deriv != t.trial.deriv or t.test.side != t.trial.side
+                        A.add_facet_term(ps, prog, ins, cidx, st, ss, a_, b_, 0, empty, FS, T, int(t.test.field),
+                                         int(t.trial.field), bool(clear))
+                    else:
+                        A.add_facet_term(ps, prog, ins, cidx, st, ss, a_, b_, 0, empty, FS, None, 0, 0, False)
+                else:
+                    A.add_facet_term(ps, prog, ins, cidx, 0, 0, 0, 0, 0, empty, None, None, 0, 0, False)
+            else:
+                Ts = t.test.space if t.test is not None else None
+                Ss = t.trial.space if t.trial is not None else None
+                mT = gidx(T, t.test.field) if (is_prod and t.test is not None) else empty
+                mS = gidx(T, t.trial.field) if (is_prod and t.trial is not None) else empty
+                A.add_point_term(ps, prog, ins, cidx, Ts, a_, mT, Ss, b_, mS)
+        self.A = A
+        self._keep = (sets, fields)                              # the caches stay referenced
+
+    @classmethod
+    def compile(cls, form_, terms):
+        try:
+            return cls(form_, terms)
+        except (_Fallback, TypeError):
+            return None
+
+    def assemble_complex(self, values, owner_values=None):
+        """Rank 0 or 1 with complex values (the complex-step derivative), in C++."""
+        vre, vim = _complex_parts([np.asarray(_source_vector(a, values, owner_values)).reshape(-1) for a in self.sources])
+        k = np.asarray([_scalar(values.get(c.name, c.value)) if isinstance(c, Constant) else c for c in self.consts],
+                       dtype=np.complex128)
+        got = self.A.assemble_complex(vre, vim, np.ascontiguousarray(k.real), np.ascontiguousarray(k.imag))
+        if self.rank == 0:
+            return complex(got[0], got[1])
+        return np.asarray(got[0]) + 1j * np.asarray(got[1])
+
+    def assemble(self, values, owner_values=None):
+        vecs = [np.ascontiguousarray(_source_vector(a, values, owner_values), dtype=np.float64).reshape(-1) for a in self.sources]
+        consts = np.asarray([_scalar(values.get(c.name, c.value)) if isinstance(c, Constant) else c for c in self.consts],
+                            dtype=np.float64)
+        if self.rank == 0:
+            return float(self.A.assemble_scalar(vecs, consts))
+        if self.rank == 1:
+            return self.A.assemble_vector(vecs, consts)
+        from . import Matrix, RectMatrix
+        T = self.T
+        if self.rect:
+            return RectMatrix(self.A.assemble_rect(vecs, consts), T, self.R)
+        if self.is_prod:
+            out = Matrix(_C.AssembledMatrix(T.dim, T.uband), T.periodic, T)
+        else:
+            out = Matrix(_C.AssembledMatrix(T.dim, T.uband), T.bc.is_periodic, self.R)
+        self.A.assemble_matrix(vecs, consts, out._K)
+        return out
+
+
+def _complex_parts(vecs):
+    """The real parts of the coefficient vectors, and their imaginary parts (None for a real vector)."""
+    re, im = [], []
+    for v in vecs:
+        v = np.asarray(v).reshape(-1)
+        if np.iscomplexobj(v):
+            re.append(np.ascontiguousarray(v.real, dtype=np.float64))
+            im.append(np.ascontiguousarray(v.imag, dtype=np.float64))
+        else:
+            re.append(np.ascontiguousarray(v, dtype=np.float64))
+            im.append(None)
+    return re, im
+
+
+def _slip_reduce(K, T0, R0, reduce_rows, ZR):
+    """Z^T K Z of a matrix assembled without the slip condition, in C++ (CSRMatrix products), with
+    the entries that come out exactly zero dropped; symmetric measured when test and trial agree."""
+    from .sparse import SparseMatrix
+    if reduce_rows and ZR is not None:
+        M = K.triple_product(T0._ZT, ZR)                    # one pass, exact zeros dropped
+    else:
+        M = (T0._ZT.multiply(K) if reduce_rows else K.multiply(ZR)).pruned(0.0)
+    S = SparseMatrix(M, R0, T0)
+    S.symmetric = S.is_symmetric() if T0 is R0 else False
+    return S
+
+
+def _group_terms_2d(terms, T):
+    """The terms of a 2D form grouped by point set (dx, Lobatto dx, ds(where), dS) and by the test
+    and trial blocks (field space and offset) they fill: {group key: (key, (Ts, toff), (Rs, roff), terms)}."""
+    def field(a):                                   # (field space, offset) of a test / trial Argument
+        if a.product is not None:
+            return a.product.fields[a.field], a.product.offsets[a.field]
+        return a.space, 0
+
+    groups = {}
+    for t in terms:
+        ft = field(t.test) if t.test is not None else (T, 0)
+        fr = field(t.trial) if t.trial is not None else (None, 0)
+        if t.measure.kind == "dx" and t.measure.scheme == "lobatto":
+            n = t.measure.quad_degree
+            if n is None:                            # the nodal rule of the highest degree among test and trial
+                n = max(getattr(s_, "degree", 1) for s_ in (ft[0], fr[0]) if s_ is not None) + 1
+            key = ("dxL", int(n))
+        elif t.measure.kind == "dS":
+            key = ("dS",)
+        else:
+            key = ("dx",) if t.measure.kind == "dx" else ("ds", t.measure.where)
+        gk = (key, id(ft[0]), ft[1], id(fr[0]), fr[1])
+        groups.setdefault(gk, (key, ft, fr, []))[3].append(t)
+    return groups
 
 
 # ============================================================================ the Form
@@ -1940,6 +2477,42 @@ class Form:
             self._caches[ck] = Q
         return Q
 
+    def _program(self, t):
+        """The Integrand program of a term's coefficient (cached per term), or None when the
+        expression is not covered."""
+        progs = self.__dict__.setdefault("_programs", {})
+        got = progs.get(id(t))
+        if got is None or got[0] is not t:
+            got = progs[id(t)] = (t, _Program.compile(t.coeff))
+        return got[1]
+
+    def _coefficient(self, t, ctx):
+        """The coefficient of a term at the points of a 2D context: the compiled program when there is
+        one and it applies, the NumPy evaluation otherwise."""
+        if _COMPILED:
+            P = self._program(t)
+            if P is not None:
+                c = P.evaluate(ctx)
+                if c is not None:
+                    return c
+        return np.asarray(evaluate(t.coeff, ctx))
+
+    def _compiled_2d(self, terms):
+        """The _Compiled2D of a term list (cached by the list's identity), or None."""
+        comps = self.__dict__.setdefault("_compiled", {})
+        got = comps.get(id(terms))
+        if got is None or got[0] is not terms:
+            got = comps[id(terms)] = (terms, _Compiled2D.compile(self, terms))
+        return got[1]
+
+    def _compiled_1d(self, terms):
+        """The _Compiled1D of a term list (cached by the list's identity), or None."""
+        comps = self.__dict__.setdefault("_compiled1d", {})
+        got = comps.get(id(terms))
+        if got is None or got[0] is not terms:
+            got = comps[id(terms)] = (terms, _Compiled1D.compile(self, terms))
+        return got[1]
+
     def _assemble_terms_2d(self, terms, values, owner_values=None):
         from .sparse import SparseMatrix
         rank = terms[0].rank
@@ -1948,6 +2521,10 @@ class Form:
             any(isinstance(c.value, complex) for c in self._consts.values())
         if cplx and rank == 2:
             raise TypeError("complex field values are supported for rank 0 and rank 1 forms only")
+        if _COMPILED:
+            comp = self._compiled_2d(terms)
+            if comp is not None:                                # the whole form in C++
+                return comp.assemble_complex(values, owner_values) if cplx else comp.assemble(values, owner_values)
         T = self.test_space if rank else next(iter(self.spaces.values()))
         R = self.trial_space if rank == 2 else None
         T0, R0 = T, R
@@ -1957,27 +2534,7 @@ class Form:
             T = T._base
         if ZR is not None:
             R = R._base
-
-        def field(a):                                   # (field space, offset) of a test / trial Argument
-            if a.product is not None:
-                return a.product.fields[a.field], a.product.offsets[a.field]
-            return a.space, 0
-
-        groups = {}
-        for t in terms:
-            ft = field(t.test) if t.test is not None else (T, 0)
-            fr = field(t.trial) if t.trial is not None else (None, 0)
-            if t.measure.kind == "dx" and t.measure.scheme == "lobatto":
-                n = t.measure.quad_degree
-                if n is None:                            # the nodal rule of the highest degree among test and trial
-                    n = max(getattr(s_, "degree", 1) for s_ in (ft[0], fr[0]) if s_ is not None) + 1
-                key = ("dxL", int(n))
-            elif t.measure.kind == "dS":
-                key = ("dS",)
-            else:
-                key = ("dx",) if t.measure.kind == "dx" else ("ds", t.measure.where)
-            gk = (key, id(ft[0]), ft[1], id(fr[0]), fr[1])
-            groups.setdefault(gk, (key, ft, fr, []))[3].append(t)
+        groups = _group_terms_2d(terms, T)
         if rank == 2:
             K = _C.CSRMatrix(_pattern_2d(T, R, facets=any(t.measure.kind == "dS" for t in terms)), False)
         out = np.zeros(T.dim, dtype=np.complex128 if cplx else np.float64) if rank == 1 else 0.0
@@ -1995,7 +2552,7 @@ class Form:
                 npts = Q.nf * Q.nq
                 cs = []
                 for t in ts:
-                    c = np.asarray(evaluate(t.coeff, ctx))
+                    c = self._coefficient(t, ctx)
                     cs.append(np.broadcast_to(c, (npts,)) if c.ndim == 0 or c.shape != (npts,) else c)
                 if rank == 0:
                     for c in cs:
@@ -2031,7 +2588,7 @@ class Form:
             npts = Q.nent * Q.nq
             cs = []
             for t in ts:
-                c = np.asarray(evaluate(t.coeff, ctx))
+                c = self._coefficient(t, ctx)
                 cs.append(np.broadcast_to(c, (npts,)) if c.ndim == 0 or c.shape != (npts,) else c)
             if rank == 0:
                 for c in cs:
@@ -2054,18 +2611,12 @@ class Form:
                                       [np.ascontiguousarray(c, dtype=np.float64) for c in cs], K, toff, roff)
         if rank == 2:
             if ZT is not None or ZR is not None:
-                import scipy.sparse as sp
-                A = sp.csr_matrix((K.data, K.indices, K.indptr), shape=(K.nrows, K.ncols))
-                if ZT is not None:
-                    A = T0._ZT @ A
-                if ZR is not None:
-                    A = A @ ZR
-                return SparseMatrix.from_scipy(A, R0, T0, symmetric=None if T0 is R0 else False)
+                return _slip_reduce(K, T0, R0, ZT is not None, ZR)
             if T is R:
                 K.symmetric = bool(K.asymmetry() <= 1e-13)
             return SparseMatrix(K, R, T)
         if rank == 1 and ZT is not None:
-            out = T0._ZT @ out
+            out = T0._zt(out)
         return out
 
     # ---- setup helpers ------------------------------------------------------
@@ -2247,7 +2798,15 @@ class Form:
         """d(assemble)/d(coefficients of the Function `wrt`) for a rank-1 form -> Matrix.
         `wrt` is the Function object or its name; space= as in derivative()."""
         from . import Matrix
-        target, jterms = self._derivative_terms(wrt, space)
+        # the terms of one (wrt, space) are built once, so their compiled programs and assembler are reused
+        jcache = self.__dict__.setdefault("_jterms", {})
+        wobj = wrt if isinstance(wrt, str) else getattr(wrt, "owner", wrt)
+        jkey = (wobj if isinstance(wobj, str) else id(wobj), id(space))
+        got = jcache.get(jkey)
+        if got is None or (not isinstance(wobj, str) and got[0] is not wobj) or got[1] is not space:
+            target, jterms = self._derivative_terms(wrt, space)
+            got = jcache[jkey] = (wobj, space, target, jterms)
+        target, jterms = got[2], got[3]
         saved = self.trial_space
         self.trial_space = self._row_space([jt.trial for jt in jterms])
         try:
@@ -2304,6 +2863,10 @@ class Form:
             any(isinstance(c.value, complex) for c in self._consts.values())
         if cplx and rank == 2:
             raise TypeError("complex field values are supported for rank 0 and rank 1 forms only")
+        if _COMPILED:
+            comp = self._compiled_1d(terms)
+            if comp is not None:                                # the whole form in C++
+                return comp.assemble_complex(values, owner_values) if cplx else comp.assemble(values, owner_values)
         T = self.test_space if rank else None
         is_prod = rank and hasattr(T, "fields") and not hasattr(T, "degree")
         caches = {sid: self._cache(s) for sid, s in self.spaces.items()}

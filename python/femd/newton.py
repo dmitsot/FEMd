@@ -45,6 +45,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from ._util import _norm2
+
 __all__ = ["newton", "NewtonInfo"]
 
 
@@ -259,10 +261,10 @@ def newton(R, u, left=None, right=None, *, dirichlet=None, tol=1e-10, rtol=0.0, 
     elif jv == "fd":
         def matvec(d):
             c = get_c()
-            nd = np.linalg.norm(d)
+            nd = _norm2(d)
             if nd == 0.0:
                 return np.zeros_like(d)
-            eps = np.sqrt(np.finfo(float).eps) * (1.0 + np.linalg.norm(c)) / nd
+            eps = np.sqrt(np.finfo(float).eps) * (1.0 + _norm2(c)) / nd
             r0 = residual()
             set_c(c + eps * d)
             r1 = residual()
@@ -294,66 +296,42 @@ def newton(R, u, left=None, right=None, *, dirichlet=None, tol=1e-10, rtol=0.0, 
             return frozen[0]
         raise ValueError("newton: precond must be 'frozen', 'linear', 'jacobian', None, a LinearSolver, a Matrix or a callable")
 
-    info = NewtonInfo(False, 0)
-    r = residual()
-    nr = float(np.linalg.norm(r))
-    info.residuals.append(nr)
-    target = max(tol, rtol * nr)
-    if verbose:
-        print(f"newton  0: ||R|| = {nr:.3e}")
-    for it in range(1, maxiter + 1):
-        if nr <= target:
-            info.converged = True
-            break
-        c = get_c()
-        # ---- the Newton direction: J d = -R
+    # ---- the iteration runs in C++ (solve/newton.hpp); Python supplies the residual and the direction
+    from . import _femd as _C
+    linear_its = []
+
+    def residual_at(c):
+        set_c(c)
+        return residual()
+
+    def direction(c, r):
         if linear == "direct":
-            try:
-                d = np.asarray(factor(J.assemble()).solve(-r), dtype=np.float64)
-            except (ValueError, RuntimeError) as e:
-                info.message = f"the Jacobian could not be factored ({e})"
-                break
-            info.linear_iterations.append(0)
-        else:
-            A = J.assemble() if jv == "assembled" else matvec
-            solve = gmres if linear == "gmres" else lgmres
-            M = preconditioner()
-            dsol, kinfo = solve(A, -r, M=M, restart=restart, maxiter=krylov_maxiter, tol=krylov_tol, warn=False)
-            d = np.asarray(dsol, dtype=np.float64)
-            info.linear_iterations.append(kinfo.iterations)
-            if precond == "frozen" and kinfo.iterations > max(5, restart // 2):
-                frozen[0] = None                             # it has gone stale: refactor next time
-            if not kinfo.converged and verbose:
-                print(f"          {kinfo}")
-        if not np.all(np.isfinite(d)):
-            info.message = "the Newton direction is not finite; the Jacobian is singular or nearly so"
-            break
-        # ---- line search on ||R||
-        s = 1.0
-        while True:
-            set_c(c + s * d)
-            r_new = residual()
-            n_new = float(np.linalg.norm(r_new))
-            ok = np.isfinite(n_new) and n_new <= (1.0 - 1e-4 * s) * nr
-            if ok or (not line_search and np.isfinite(n_new)) or s < 2.0**-30:
-                break
-            s *= 0.5
-        if not np.isfinite(n_new) or (line_search and not ok):
-            set_c(c)
-            info.message = ("the residual is not finite along the Newton direction" if not np.isfinite(n_new) else
-                            "the line search could not reduce ||R||; the Jacobian may be singular or the guess too far")
-            break
-        r, nr = r_new, n_new
-        info.iterations, info.steps = it, info.steps + [s]
-        info.residuals.append(nr)
+            return np.asarray(factor(J.assemble()).solve(-r), dtype=np.float64), 0      # may raise: reported
+        A = J.assemble() if jv == "assembled" else matvec
+        solve = gmres if linear == "gmres" else lgmres
+        M = preconditioner()
+        dsol, kinfo = solve(A, -r, M=M, restart=restart, maxiter=krylov_maxiter, tol=krylov_tol, warn=False)
+        if precond == "frozen" and kinfo.iterations > max(5, restart // 2):
+            frozen[0] = None                                 # it has gone stale: refactor next time
+        if not kinfo.converged and verbose:
+            print(f"          {kinfo}")
+        return np.asarray(dsol, dtype=np.float64), int(kinfo.iterations)
+
+    def progress(it, nr, s, lin):
         if verbose:
-            lin = f", {info.linear_iterations[-1]} Krylov iterations" if linear != "direct" else ""
-            print(f"newton {it:2d}: ||R|| = {nr:.3e}, step {s:g}{lin}")
-    else:
-        info.converged = nr <= target
-    if not info.converged and nr <= target:
-        info.converged = True
+            extra = f", {lin} Krylov iterations" if linear != "direct" else ""
+            print(f"newton {it:2d}: ||R|| = {nr:.3e}, step {s:g}{extra}")
+
+    c0 = np.array(get_c(), dtype=np.float64)
+    if verbose:
+        print(f"newton  0: ||R|| = {_norm2(residual_at(c0)):.3e}")
+    converged, iterations, residuals, steps, linear_its, message = _C.newton_solve(
+        c0, residual_at, direction, tol=tol, rtol=rtol, xtol=0.0, maxiter=maxiter, line_search=bool(line_search),
+        progress=progress if verbose else None)
+    set_c(c0)                                                # u at the last accepted iterate
+    info = NewtonInfo(bool(converged), int(iterations), residuals=list(residuals), steps=list(steps),
+                      linear_iterations=[int(k) for k in linear_its], message=str(message))
     if warn and not info.converged:
-        warnings.warn(f"newton did not converge: ||R|| = {nr:.2e} after {info.iterations} iterations"
+        warnings.warn(f"newton did not converge: ||R|| = {info.residual:.2e} after {info.iterations} iterations"
                       + (f" ({info.message})" if info.message else ""), RuntimeWarning, stacklevel=2)
     return info

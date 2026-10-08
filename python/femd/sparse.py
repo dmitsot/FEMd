@@ -16,8 +16,9 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
+
+from ._util import _by_columns
 import scipy.sparse as sp
-import scipy.sparse.linalg as spla
 
 from . import _femd as _C
 from .forms import Function
@@ -46,7 +47,7 @@ class SparseMatrix:
     .tocsr()                      scipy.sparse.csr_matrix VIEW of the store (no copy)
     A @ x                         C++ matvec; a Function when the column space is known
     A + B, A - B, a*A, A.T, A @ B arithmetic, sharing the pattern where the patterns agree
-    .solver(backend)              SparseSolver: "superlu" (default), "cg", "gmres", "dense"
+    .solver(backend)              SparseSolver: "auto" (default), "cholesky", "ldlt", "lu", "superlu", "cg", "gmres", "dense"
     .preconditioner(kind)         "jacobi", "ssor" or "ilu0", for fd.cg / fd.gmres
     .ordering(kind)               a renumbering: "rcm" (narrow band), "amd" (little fill), "natural"
     .bandwidth(p), .permuted(p)   the half-bandwidth in the order p, and P A P^T
@@ -126,7 +127,9 @@ class SparseMatrix:
         """P A P^T, a new matrix whose row and column k are row and column p[k] of A.  It no longer
         follows the numbering of a space, so .space is None."""
         p = self._permutation(p)
-        return SparseMatrix.from_scipy(self.tocsr()[p][:, p], symmetric=self.symmetric)
+        S = SparseMatrix(self._K.permuted(np.asarray(p, dtype=np.int64).tolist()))
+        S.symmetric = self.symmetric
+        return S
 
     def _square(self, what) -> int:
         if self.shape[0] != self.shape[1]:
@@ -155,11 +158,8 @@ class SparseMatrix:
                 raise ValueError(f"A @ B: shapes {self.shape} and {x.shape} do not chain")
             return SparseMatrix(self._K.multiply(x._K), x.space, self.row_space)
         v = _vector(x)
-        if np.iscomplexobj(v):
-            return self.matvec(v.real) + 1j * self.matvec(v.imag) if v.ndim == 1 else self.tocsr() @ v
-        v = np.asarray(v, dtype=np.float64)
-        if v.ndim != 1:
-            return self.tocsr() @ v
+        if np.iscomplexobj(v) or np.ndim(v) != 1:
+            return _by_columns(self.matvec, v, self.shape[0])
         y = self._kernel(np.ascontiguousarray(v))
         # A Function in, a Function out.  A plain array in, a plain array out: wrapping the
         # result costs as much as a fifth of the product, and an ndarray @ VectorFunction fails.
@@ -241,7 +241,8 @@ class SparseMatrix:
     def solver(self, backend="auto", **options) -> "SparseSolver":
         """A factored (or iterative) solver.
 
-        backend: "auto" or "superlu" (SciPy's SuperLU, the default; symmetric mode for a
+        backend: "auto" (the default: cholesky, ldlt or lu by the matrix), "lu" (FEMd's LU with
+                 threshold pivoting, options ordering= and pivot_tol=), "superlu" (SciPy's SuperLU; symmetric mode for a
                  symmetric matrix), "cg" / "gmres" (FEMd's Krylov solvers, preconditioned
                  by options M= ("ilu0" by default), tol=, maxiter=), or "dense" (LU of the
                  dense matrix: small problems and tests)."""
@@ -325,19 +326,35 @@ def _with_lift(space, x, into, lift):
     return _adopt(U, "solution", full)
 
 
+
+def _superlu():
+    """scipy.sparse.linalg.splu, looked up only for the "superlu" backend: SciPy's SuperLU is kept as a
+    reference to compare with, and a SciPy update that removes or breaks it fails that backend alone."""
+    try:
+        import scipy.sparse.linalg as spla
+        spla.splu
+    except Exception as e:                  # ImportError, or a SciPy whose sparse.linalg no longer has splu
+        raise ImportError(f"the 'superlu' backend needs scipy.sparse.linalg.splu, which could not be loaded ({e}). "
+                          "FEMd's own sparse LU, A.solver(\"lu\"), does the same job without SciPy.") from e
+    return spla
+
+
 class SparseSolver:
     """A solver for a SparseMatrix: solve(b, into=None, lift=None) as LinearSolver does.
 
-    .backend  "cholesky", "ldlt", "superlu", "cg", "gmres" or "dense": the one in use
+    .backend  "cholesky", "ldlt", "lu", "superlu", "cg", "gmres" or "dense": the one in use
     .info     the KrylovInfo of the last iterative solve (None for a direct backend)
-    .factor   the C++ SparseCholesky (backend "cholesky": nnz_L, flops, min_pivot, ...) or
-              SparseLDLT (backend "ldlt": nnz_L, inertia, delayed, two_by_two, ...)
+    .factor   the C++ SparseCholesky (backend "cholesky": nnz_L, flops, min_pivot, ...),
+              SparseLDLT (backend "ldlt": nnz_L, inertia, delayed, two_by_two, ...) or
+              SparseLU (backend "lu": nnz_L, nnz_U, off_diagonal_pivots, delayed_pivots, method, ...)
 
     backend "auto" (the default) takes FEMd's own sparse Cholesky (LDL^T with AMD ordering, in
     C++) for a matrix that is symmetric with a positive diagonal.  A symmetric matrix that the
     Cholesky refuses (a pivot <= 0), or whose diagonal is not positive (a saddle point), goes to
     FEMd's pivoting LDL^T ("ldlt": multifrontal, 1x1 and 2x2 threshold pivots), and every
-    other matrix to SuperLU."""
+    other matrix to FEMd's LU with threshold pivoting ("lu", in C++: multifrontal on the pattern
+    of A + A^T by default, method="columns" for the left-looking column algorithm; "superlu"
+    is SciPy's)."""
 
     def __init__(self, A: SparseMatrix, backend="auto", **options):
         b = getattr(backend, "name", backend)
@@ -359,7 +376,7 @@ class SparseSolver:
                 raise TypeError(f"the ldlt backend takes ordering= and threshold=, got {sorted(options)}")
             if not A.symmetric:
                 raise ValueError("solver('ldlt'): the matrix is not symmetric (SparseMatrix.symmetric is False); "
-                                 "use 'superlu'")
+                                 "use 'lu'")
             self.A, self.space, self.backend, self.info = A, A.space, "ldlt", None
             self.factor = _C.SparseLDLT(A._K, ordering, float(u))
             return
@@ -376,14 +393,24 @@ class SparseSolver:
                 self.backend = "ldlt"
                 self.factor = _C.SparseLDLT(A._K, "amd", 0.01)
                 return
-            b = "superlu"
-        if b in ("splu", "superlu", "lu"):
+            b = "lu"
+        if b in ("lu", "femd"):
+            ordering = options.pop("ordering", "auto")
+            tol = options.pop("pivot_tol", 0.1)
+            method = options.pop("method", "frontal")
+            if options:
+                raise TypeError(f"the lu backend takes ordering=, pivot_tol= and method=, got {sorted(options)}")
+            self.A, self.space, self.backend, self.info = A, A.space, "lu", None
+            self.factor = _C.SparseLU(A._K, str(ordering), float(tol), None, str(method))
+            return
+        if b in ("splu", "superlu"):
             b = "superlu"
         self.factor = None
         self.A, self.space, self.backend, self.info = A, A.space, b, None
         if b == "superlu":
             if options:
                 raise TypeError(f"the superlu backend takes no options, got {sorted(options)}")
+            spla = _superlu()
             C = A.tocsr().tocsc()
             self._lu = None
             if A.symmetric:
@@ -404,8 +431,7 @@ class SparseSolver:
         elif b == "dense":
             if options:
                 raise TypeError(f"the dense backend takes no options, got {sorted(options)}")
-            import scipy.linalg as sla
-            self._lu = sla.lu_factor(A.toarray())
+            self._lu = _C.DenseLU(np.ascontiguousarray(A._K.dense()))         # util/dense.hpp
         elif b in ("cg", "gmres", "lgmres"):
             M = options.pop("M", "ilu0")
             if isinstance(M, str):
@@ -413,14 +439,14 @@ class SparseSolver:
             self._M = M
             self._opts = options
         else:
-            raise ValueError(f"unknown backend {backend!r}: 'auto' (default), 'cholesky', 'ldlt', 'superlu', 'cg', "
+            raise ValueError(f"unknown backend {backend!r}: 'auto' (default), 'cholesky', 'ldlt', 'lu', 'superlu', 'cg', "
                              "'gmres', 'lgmres' or 'dense'")
 
     @property
     def size(self): return self.A.shape[0]
 
     def _solve_array(self, b):
-        if self.backend in ("cholesky", "ldlt"):
+        if self.backend in ("cholesky", "ldlt", "lu"):
             b = np.asarray(b, dtype=np.float64)
             if b.ndim == 1:
                 return self.factor.solve(np.ascontiguousarray(b))
@@ -428,8 +454,10 @@ class SparseSolver:
         if self.backend == "superlu":
             return self._lu.solve(b)
         if self.backend == "dense":
-            import scipy.linalg as sla
-            return sla.lu_solve(self._lu, b)
+            b = np.asarray(b, dtype=np.float64)
+            if b.ndim == 1:
+                return self._lu.solve(np.ascontiguousarray(b))
+            return np.asarray(self._lu.solve_many(np.ascontiguousarray(b)))
         from . import krylov
         f = {"cg": krylov.cg, "gmres": krylov.gmres, "lgmres": krylov.lgmres}[self.backend]
         x, self.info = f(self.A._K, b, M=self._M, **self._opts)

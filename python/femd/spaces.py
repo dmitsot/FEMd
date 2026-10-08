@@ -18,13 +18,54 @@ from __future__ import annotations
 
 import numpy as np
 import scipy.sparse as sp
-import scipy.sparse.linalg as spla
 
 from . import _femd as _C
 from ._femd import Mesh1D, BoundaryCondition, BCSpec, QuadratureCache
 from ._util import _vec, _coeff, _real_linear  # noqa: F401
-from .forms import Function
+from .forms import Function, _Context
 from .transfer import Transfer
+
+
+def _point_values(f, pts, what: str = "interpolate") -> np.ndarray:
+    """Values of f at the 1D points pts, one per point.
+
+    f is a callable f(x) (vectorized), an expression in fd.x, numbers, Constants and known
+    Functions (of any 1D space, evaluated at the points, derivatives D(u, k) included), a number,
+    or an array of values at the points."""
+    from .forms import Expr, Argument, collect_arguments, evaluate
+    n = pts.shape[0]
+    if isinstance(f, Expr) and not isinstance(f, Function):
+        if any(isinstance(a, Argument) and a.kind != "func" for a in collect_arguments(f, [])):
+            raise TypeError(f"{what}: an expression may contain fd.x, numbers, Constants and Functions, "
+                            "not test or trial functions")
+        v = evaluate(f, _PointContext(np.ascontiguousarray(pts, dtype=np.float64)))
+    elif callable(f):
+        v = f(pts)
+    else:
+        v = f
+    v = np.asarray(v)
+    if np.iscomplexobj(v):
+        raise TypeError(f"{what}: the values are complex; interpolate the real and imaginary parts separately")
+    v = np.asarray(v, dtype=np.float64)
+    if v.size == 1:
+        return np.full(n, float(v.reshape(-1)[0]))
+    v = v.reshape(-1)
+    if v.size != n:
+        raise ValueError(f"{what}: need {n} values (one per degree of freedom), got {v.size}")
+    return v
+
+
+class _PointContext(_Context):
+    """Pointwise evaluation of an expression at arbitrary points of the line: every known
+    Function is evaluated there by its own space, whatever its grid."""
+    def __init__(self, xs):
+        super().__init__(xs, {})
+
+    def _real_values(self, a, vals):
+        if a.product is not None:
+            vals = a.product.split(np.ascontiguousarray(vals, dtype=np.float64))[a.field]
+        return a.space.evaluate(np.ascontiguousarray(vals, dtype=np.float64), self.xs, a.deriv)
+
 
 # --------------------------------------------------------------------------- bc parsing
 def Robin(alpha: float, beta: float) -> BoundaryCondition:
@@ -127,6 +168,13 @@ class _SpaceMixin:
         """Raw -> adapted coefficients (C r).  A complex vector gives a complex result."""
         return _real_linear(lambda r: _C.FunctionSpace.restrict(self, _vec(r)), raw)
 
+    def _basis_csr(self, x, k: int = 0):
+        """d^k N_j(x_i) as a _femd.CSRMatrix (len(x) x dim), duplicates summed."""
+        x = np.atleast_1d(np.asarray(x, dtype=np.float64))
+        r, c, v = _C.FunctionSpace.basis_at(self, np.ascontiguousarray(x), int(k))
+        return _C.csr_from_triplets(len(x), self.dim, np.ascontiguousarray(r, dtype=np.int32),
+                                    np.ascontiguousarray(c, dtype=np.int32), np.ascontiguousarray(v, dtype=np.float64))
+
     def basis_matrix(self, x, k: int = 0) -> sp.csr_matrix:
         """Sparse (len(x) x dim) matrix of d^k N_j(x_i)."""
         x = np.atleast_1d(np.asarray(x, dtype=np.float64))
@@ -160,13 +208,15 @@ class _SpaceMixin:
         return Matrix(K, self.bc.is_periodic, self)
 
     def project(self, f, npts: int | None = None) -> np.ndarray:
-        """L2 projection of a callable f(x), an expression in fd.x (or values at the cache nodes) onto the space.
+        """L2 projection of a callable f(x), an expression in fd.x, a number (or values at the cache nodes) onto the space.
 
         A Function of another space is projected exactly, whatever the two grids, through
         transfer_matrix(f.space); npts is then ignored."""
         if isinstance(f, Function):
             return Transfer(self, f.space, "project")(f.vector, _stacklevel=4)
-        from .forms import Expr, TestFunction, form, dx
+        from .forms import Expr, TestFunction, form, dx, _lift
+        if isinstance(f, (int, float, np.integer, np.floating)):
+            f = _lift(float(f))
         if isinstance(f, Expr):                      # an expression in fd.x (and Functions): (f, v) by the form language
             v = TestFunction(self)
             b = np.asarray(form(f * v * (dx(npts) if npts is not None else dx)).assemble(), dtype=np.float64)
@@ -253,15 +303,18 @@ class _SpaceMixin:
         Lagrange (where the matrix is the identity) and the Greville abscissae for
         splines (Schoenberg-Whitney guarantees a nonsingular, banded system).  f is a
         callable or an array of values at those points.  The interpolant satisfies the
-        built-in boundary conditions, so f should too for the result to be meaningful."""
+        built-in boundary conditions, so f should too for the result to be meaningful.
+
+        f is a callable f(x), an expression in fd.x, numbers, Constants and Functions (such as
+        fd.sin(fd.pi*fd.x) or u**2 for a Function u of any 1D space), a number, or an array of
+        values at dof_coordinates()."""
         pts = self.dof_coordinates()
-        vals = np.asarray(f(pts) if callable(f) else f, dtype=np.float64).reshape(-1)
-        if vals.shape != pts.shape:
-            raise ValueError(f"interpolate: need {pts.size} values (one per degree of freedom), got {vals.size}")
-        B = self.basis_matrix(pts)
-        if abs(B - sp.identity(self.dim)).max() < 1e-13:          # nodal basis: nothing to solve
+        vals = _point_values(f, pts)
+        B = self._basis_csr(pts)
+        if B.identity_defect() < 1e-13:                           # nodal basis: nothing to solve
             return vals
-        return spla.spsolve(B.tocsc(), vals)
+        from .linalg import Matrix
+        return np.asarray(Matrix.from_csr(B, periodic=self.bc.is_periodic).solver().solve(vals), dtype=np.float64)
 
     def transfer_matrix(self, source, kind: str = "project") -> "Transfer":
         """The operator taking a Function of `source` to this space, assembled and factored once.
@@ -576,14 +629,13 @@ class DGSpace(_SpaceMixin, _C.DGSpace):
     def interpolate(self, f) -> np.ndarray:
         """Coefficients of the element-wise interpolant of f: at the Gauss points of each element
         (Legendre) or at its Gauss-Lobatto nodes (Lobatto, where the coefficients are the values).
-        f is a callable, or an array of values at dof_coordinates().
+        f is a callable, an expression in fd.x, numbers, Constants and Functions, a number, or an
+        array of values at dof_coordinates().
 
         Lobatto samples the element ends, so at a vertex where f jumps both elements receive the
         one value f has there.  Legendre samples inside the elements and reproduces such a jump."""
         pts = self.dof_coordinates()
-        vals = np.asarray(f(pts) if callable(f) else f, dtype=np.float64).reshape(-1)
-        if vals.shape != pts.shape:
-            raise ValueError(f"interpolate: need {pts.size} values (one per degree of freedom), got {vals.size}")
+        vals = _point_values(f, pts)
         return np.asarray(self.interpolate_values(np.ascontiguousarray(vals)))
 
     def _coefficients_are(self) -> str:

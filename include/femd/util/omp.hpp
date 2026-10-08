@@ -55,6 +55,16 @@
 #  define FEMD_OMP(x)
 #endif
 
+// Inside a function body: no fused multiply-adds in this scope.  Clang (Apple's included) may
+// fuse a*b + c into one rounding and decides per loop whether to, so two loops that add the same
+// products in the same order could round differently; GCC under -std=c++17 never fuses.  Used
+// where two code paths are promised to give the same bits (the banded matvec).
+#if defined(__clang__)
+#  define FEMD_NO_FP_CONTRACT _Pragma("clang fp contract(off)")
+#else
+#  define FEMD_NO_FP_CONTRACT
+#endif
+
 namespace femd {
 namespace detail {
 /// Element loops go parallel when elements x quadrature points passes the threshold.

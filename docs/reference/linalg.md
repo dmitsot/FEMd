@@ -46,6 +46,7 @@ periodic space.
 | `matvec(x, out=None)` | `x` a vector or Function. `out` a C-contiguous `float64` array of length `n` that does not overlap `x`. | array | $Ax$ as a plain array. With `out` it is written there and nothing is allocated. |
 | `inner(x, y=None)` | `x`, `y` vectors or Functions of length `n` | float | $y^{\mathsf T}Ax$, or $x^{\mathsf T}Ax$ without `y`, straight off the band without forming $Ax$ and without BLAS (E.5). An energy is `0.5 * M.inner(u)`. |
 | `tocsr()`, `tocoo()` | none | SciPy sparse matrix | A copy in CSR or COO format. |
+| `Matrix.from_scipy(S, periodic=False, space=None, symmetric=False)` | square SciPy sparse matrix | `Matrix` | The band holding the entries of `S` (entries farther than $n/2$ from the diagonal become periodic corners when `periodic=True`), ready for `.solver()`. |
 | `copy()` | none | `Matrix` | An independent copy. Take one before updating in place a matrix returned by a constant form, since the form returns the same cached object each time. |
 | `T` | attribute | `Matrix` | The transpose. For a skew matrix `A.T` equals `-A`. |
 
@@ -68,13 +69,16 @@ periodic space.
 
 An operator from a trial space $V$ to a test space $W \ne V$ on the same grid,
 $B_{ij} = a(S_j, T_i)$. It comes from a rank-2 form whose test and trial
-symbols live in different spaces. Stored as SciPy CSR and never factored.
+symbols live in different spaces. Stored in FEMd's compressed sparse row store
+(`_femd.CSRMatrix`, attribute `_K`) and never factored; the products, the transpose and
+the algebra run in C++, and a square one serves `fd.gmres` and `newton_system` through the
+C++ matvec and FEMd's sparse LU.
 
 **Constructor** (rarely needed)
 
 | argument | type | default | meaning |
 |---|---|---|---|
-| `A` | SciPy sparse matrix or dense array | required | The entries, shape `(row_space.dim, col_space.dim)`. |
+| `A` | `_femd.CSRMatrix`, SciPy sparse matrix or dense array | required | The entries, shape `(row_space.dim, col_space.dim)`. A SciPy or dense input is copied into the CSR store, duplicates summed. |
 | `row_space` | space | required | $W$, the test space. |
 | `col_space` | space | required | $V$, the trial space. |
 
@@ -83,14 +87,15 @@ symbols live in different spaces. Stored as SciPy CSR and never factored.
 | member | inputs | returns | meaning |
 |---|---|---|---|
 | `shape` | attribute | tuple | `(W.dim, V.dim)`. |
+| `nnz` | attribute | int | Stored entries. |
 | `row_space`, `col_space` | attribute | space | $W$ and $V$. |
 | `space` | attribute | space | `row_space`, where `B @ x` lives. |
-| `B @ x` | `x` an array of length `V.dim` or a Function of $V$ | `Function` of $W$ | The product. |
+| `B @ x` | `x` an array of length `V.dim` or a Function of $V$, or a 2-D array with `V.dim` rows | `Function` of $W$, or an array | The product (column by column for a 2-D array). |
 | `B @ A`, `B @ C` | `A` a `Matrix` on $V$, `C` a `RectMatrix` with row space $V$ | `RectMatrix` | Products, spaces checked. |
 | `B.T` | attribute | `RectMatrix` | The transpose, from $W$ to $V$. |
-| `B + C`, `B - C`, `-B`, `a*B`, `B/a` | `C` a `RectMatrix` on the same two spaces, `a` a number | `RectMatrix` | Algebra. |
-| `matvec(x, out=None)` | `x` a vector or Function of $V$. `out` an array to copy the result into. | array | $Bx$ as a plain array. |
-| `tocsr()`, `tocoo()`, `toarray()` | none | SciPy or dense | Copies. |
+| `B + C`, `B - C`, `-B`, `a*B`, `B/a` | `C` a `RectMatrix` on the same two spaces, `a` a number | `RectMatrix` | Algebra (a sum on the union of the two patterns; `B/a` is `(1/a)*B`). |
+| `matvec(x, out=None)` | `x` a vector or Function of $V$. `out` an array to write the result into. | array | $Bx$ as a plain array, in C++. |
+| `tocsr()`, `tocoo()`, `toarray()` | none | SciPy or dense | Copies, for inspection and interoperability. |
 | `copy()` | none | `RectMatrix` | An independent copy. |
 
 `solver()` raises `TypeError`. Put the block into a square system with `block`.
@@ -243,9 +248,10 @@ different `restart` default and one more argument.
 
 ### F.7 `eigs(a, m=None, k=6, sigma=0.0, symmetric=None, which="nearest", tol=0.0, maxiter=None, ncv=None, vectors=True, backend="auto", v0=None)`
 
-The $k$ eigenpairs of $A x = \lambda M x$ nearest `sigma`, by shift-invert Lanczos (`eigsh`, symmetric)
-or Arnoldi (`eigs`), with $(A - \sigma M)^{-1}$ applied through FEMd's factorization of the
-shifted matrix (manual, [Section 7.10](../manual.md#710-eigenproblems)).
+The $k$ eigenpairs of $A x = \lambda M x$ nearest `sigma`, by shift-invert Arnoldi in C++
+(`solve/eigen.hpp`, `_femd.arnoldi_largest`; Lanczos in the $M$ inner product when symmetric), with
+$(A - \sigma M)^{-1}$ applied through FEMd's factorization of the shifted matrix (manual,
+[Section 7.10](../manual.md#710-eigenproblems)).
 
 | argument | type | default | meaning |
 |---|---|---|---|
@@ -253,11 +259,11 @@ shifted matrix (manual, [Section 7.10](../manual.md#710-eigenproblems)).
 | `k` | int | `6` | Number of eigenpairs, $1 \le k < n - 1$. |
 | `sigma` | float | `0.0` | The shift. It must not be an eigenvalue. |
 | `symmetric` | bool or None | `None` | `None` measures $A$ and $M$. `True` needs $M$ positive definite. |
-| `which` | str | `"nearest"` | `"largest"` or `"smallest"` magnitude drop the shift. |
-| `tol`, `maxiter`, `ncv` | | ARPACK's | Passed to ARPACK. |
+| `which` | str | `"nearest"` | `"largest"` iterates on $M^{-1}A$ without a shifted factorization, `"smallest"` is the shift $0$. |
+| `tol`, `maxiter`, `ncv` | float, int, int | `0`, `None`, `None` | The relative residual tolerance of a Ritz pair ($10^{-10}$), the restarts (300), the Arnoldi vectors per restart ($\max(2k+1, 20)$). |
 | `vectors` | bool | `True` | `False` skips the eigenvectors. |
 | `backend` | str | `"auto"` | The solver of the shifted matrix. |
-| `v0` | array or None | `None` | ARPACK's starting vector. `None` is a fixed pseudo-random vector, so results are reproducible. |
+| `v0` | array or None | `None` | The starting vector. `None` is a fixed pseudo-random vector, so results are reproducible. |
 
 **Returns** an `EigenResult`: `values` (sorted by distance to `sigma`, then by value), `vectors` (the
 eigenvectors as columns), `functions` (one Function per eigenvector, when the matrix knows its
@@ -265,5 +271,5 @@ space), `residuals` (the backward error $\lVert Ax - \lambda Mx\rVert / ((\lVert
 \lVert M\rVert_1)\lVert x\rVert)$ of each pair), `symmetric`, `sigma`. `lam, X = fd.eigs(...)` unpacks it.
 
 **Raises** `ValueError` for a `k` out of range, an unknown `which`, or a shifted matrix that cannot be
-factored, `TypeError` for an argument that is not a form or a matrix, and SciPy's
-`ArpackNoConvergence` when ARPACK does not converge.
+factored or an iteration that does not converge within `maxiter` restarts, and `TypeError` for an
+argument that is not a form or a matrix.

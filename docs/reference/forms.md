@@ -17,6 +17,7 @@ Weak forms are written with symbols and measures and compiled by `form`
 | `sin`, `cos`, `exp`, `log`, `tanh`, `sqrt` | function | pointwise functions of known fields and `x` |
 | `dx` | measure | integral over the interval |
 | `set_quadrature_degree(n)`, `quadrature_degree()` | function | one rule for every form of a code, or the inferred rules |
+| `set_compiled_integrands(on=True)`, `compiled_integrands()` | function | assemble forms in C++ with the `Integrand` programs (default) or with the Python driver and NumPy |
 | `ds` | measure | evaluation at the ends |
 | `dS` | measure | the interior facets (vertices between elements, and the periodic seam) |
 | `e('-')`, `e('+')` | restriction | the value from the left or the right element on a facet |
@@ -132,6 +133,10 @@ One quadrature rule for every form created afterwards, instead of a rule inferre
 | `degree` | positive int or `None` | `None` | What `dx(degree)` would set on each measure of a form: on a 1D mesh the number of Gauss points per element (exact to degree $2n-1$), on a 2D mesh the degree of exactness on the cells, the sides and the interior facets. `None` returns to the inferred rules. |
 
 A measure with its own `quad_degree=` keeps it, `dx(scheme="lobatto")` is not affected, and forms made before the call keep their rule. **Raises** `ValueError` for a degree that is not a positive integer. `quadrature_degree()` returns the current setting, `None` when the rules are inferred ([manual, Section 6.7](../manual.md#67-quadrature)).
+
+### D.4b `set_compiled_integrands(on=True)` and `compiled_integrands()`
+
+The coefficient of each term of a form (known fields and their derivatives, numbers and `Constant`s, `x`, `y`, the facet normal, sums, products, powers and the elementary functions) is compiled once into a register program, `_femd.Integrand`, and evaluated at the quadrature points in C++, in parallel, with the same bits for any number of threads. `set_compiled_integrands(False)` evaluates the expression tree with NumPy instead. Complex-valued fields and Constants (the complex-step derivative, rank 0 and 1) run the same programs in complex arithmetic with NumPy's rules (`Integrand.evaluate_complex`), the fields and kernels acting on the real and imaginary parts separately. The two agree to rounding ([manual, Section 6.2](../manual.md#62-compiling-and-assembling)). `compiled_integrands()` returns the switch. With the switch on, the assembly itself is one C++ call as well (`_femd.FormAssembler2D` and `_femd.FormAssembler1D`, built once per form by `Form._compiled_2d` and `Form._compiled_1d`; a rectangular 1D form comes out as a `RectMatrix` on the CSR store): the fields at the quadrature points, the coefficients and the kernels, without the GIL, so threads may assemble one form concurrently; the Python driver that calls the kernels term by term serves the switch off.
 
 ### D.5 `form(expr, space=None)`
 

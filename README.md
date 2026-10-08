@@ -2,7 +2,7 @@
 
 ![FEMd](docs/mascot/femd_logo.jpg)
 
-**Version 0.1.3** · [License: GPL v3 or later](LICENSE)
+**Version 0.1.4** · [License: GPL v3 or later](LICENSE)
 
 **FEMd** is a Finite Element Library for problems in one and two space dimensions. Its core is header-only C++17 and is used from Python. You give a domain, a polynomial degree and boundary conditions, write the equations in weak form, and FEMd assembles and solves them. The form language follows FEniCS, so FEniCS users will find the workflow familiar.
 
@@ -80,6 +80,8 @@ The notebooks in [`examples/`](examples) run as they are after installation.
 | [example15](examples/example15.ipynb) | vortex shedding behind a cylinder at $Re = 100$ (DFG benchmark 2D-2), the time-dependent Navier-Stokes equations with Radau IIA (`fd.IRK`) from the Stokes flow with a frozen Jacobian, the speed and the pressure at $t = 4$ and a movie of the speed (a few minutes) |
 | [example16](examples/example16.ipynb) | output for ParaView: the heat equation in a plate with a hole, temperature and heat flux on quadratic VTK cells, a time series with `fd.VTKSeries` and the mesh with its boundary markers |
 | [example17](examples/example17.ipynb) | a mesh from Gmsh (`pip install gmsh`): a plate with a circular inclusion, named sides and regions read with `fd.read_gmsh`, a piecewise constant conductivity from the regions, heat flux and output for ParaView |
+| [example18](examples/example18.ipynb) | the Bona-Smith system in 2D with OpenMP, the solitary wave of `example4` in the channel of `example6`, the third derivative $c\,\nabla\Delta\eta$ through the discrete Laplacian $(\Delta_h\eta, \phi) = -(\nabla\eta, \nabla\phi)$, RK4 with a Python right-hand side |
+| [example19](examples/example19.ipynb) | the KdV equation with periodic cubic splines and OpenMP, the solitary wave, `D(u, 2)` on splines, the Gauss method with two stages (`fd.IRK`, Newton with the exact Jacobian), the three invariants |
 
 ## Documentation
 

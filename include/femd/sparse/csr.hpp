@@ -397,6 +397,202 @@ inline CSRMatrix multiply(const CSRMatrix &A, const CSRMatrix &B)
     return C;
 }
 
+/**
+ * @brief The nrows x ncols matrix of the triplets (I[t], J[t], V[t]): duplicates are summed in the
+ *        order they come (each entry's sum is left to right over its triplets), explicit zeros
+ *        are kept, rows sorted.  The same result for any thread count (it is serial).
+ */
+inline CSRMatrix from_triplets(int nrows, int ncols, const std::vector<int> &I, const std::vector<int> &J,
+                               const std::vector<double> &V)
+{
+    if (nrows < 0 || ncols < 0) throw std::invalid_argument("from_triplets: negative shape");
+    if (I.size() != J.size() || I.size() != V.size()) throw std::invalid_argument("from_triplets: I, J and V differ in length");
+    const std::size_t m = I.size();
+    std::vector<int> cnt(static_cast<std::size_t>(nrows) + 1, 0);
+    for (std::size_t t = 0; t < m; ++t)
+    {
+        if (I[t] < 0 || I[t] >= nrows || J[t] < 0 || J[t] >= ncols) throw std::out_of_range("from_triplets: index out of range");
+        ++cnt[static_cast<std::size_t>(I[t]) + 1];
+    }
+    for (int i = 0; i < nrows; ++i) cnt[i + 1] += cnt[i];
+    std::vector<std::size_t> order(m);                       // the triplets row by row, stable
+    {
+        std::vector<int> fill(cnt.begin(), cnt.end() - 1);
+        for (std::size_t t = 0; t < m; ++t) order[static_cast<std::size_t>(fill[I[t]]++)] = t;
+    }
+    auto P = std::make_shared<SparsityPattern>();
+    P->nrows = nrows; P->ncols = ncols;
+    P->indptr.assign(static_cast<std::size_t>(nrows) + 1, 0);
+    std::vector<double> v;
+    v.reserve(m);
+    P->indices.reserve(m);
+    for (int i = 0; i < nrows; ++i)
+    {
+        auto b = order.begin() + cnt[i], e = order.begin() + cnt[i + 1];
+        std::stable_sort(b, e, [&J](std::size_t x, std::size_t y) { return J[x] < J[y]; });
+        for (auto it = b; it != e; ++it)
+        {
+            const int j = J[*it];
+            if (static_cast<int>(P->indices.size()) > P->indptr[i] && P->indices.back() == j) v.back() += V[*it];
+            else { P->indices.push_back(j); v.push_back(V[*it]); }
+        }
+        P->indptr[i + 1] = static_cast<int>(P->indices.size());
+    }
+    CSRMatrix C(P, false);
+    C.data = std::move(v);
+    return C;
+}
+
+/**
+ * @brief C = PT A P in one pass over the rows of PT, entries that come out exactly zero dropped.
+ *        Each row is formed as the two products would form it: row i of PT A with the rows of A
+ *        added in the order of PT's row, then that row times P, its entries taken in the order
+ *        their columns first appeared (no sort, as SciPy's product does it).  An entry that
+ *        collects at most two products in each stage (the reduction Z^T A Z of a slip condition,
+ *        whose Z has one entry per row) therefore has the bits of multiply(multiply(PT, A), P) and
+ *        of SciPy's PT @ A @ P; in general they agree to rounding.  Rows in parallel, the same
+ *        result for any thread count.
+ */
+inline CSRMatrix triple_product(const CSRMatrix &PT, const CSRMatrix &A, const CSRMatrix &P)
+{
+    if (PT.ncols() != A.nrows() || A.ncols() != P.nrows()) throw std::invalid_argument("triple_product: inner dimensions differ");
+    const int n = PT.nrows(), m = A.ncols(), k = P.ncols();
+    // each thread takes a contiguous block of rows (static schedule) into one buffer of its own
+    std::vector<int> rowlen(static_cast<std::size_t>(n), 0);
+    std::vector<std::vector<int>> bc;
+    std::vector<std::vector<double>> bv;
+    std::vector<int> first;
+    const bool par = n > 256 && static_cast<long>(A.nnz()) > FEMD_OMP_THRESHOLD;
+    (void) par;
+    FEMD_OMP_PARALLEL_IF(par)
+    {
+    const int me = detail::thread_id(), nth = detail::thread_count();
+    FEMD_OMP(single)
+    {
+        bc.resize(static_cast<std::size_t>(nth)); bv.resize(static_cast<std::size_t>(nth));
+        first.assign(static_cast<std::size_t>(nth), -1);
+    }
+    std::vector<int> &oc = bc[static_cast<std::size_t>(me)];
+    std::vector<double> &ov = bv[static_cast<std::size_t>(me)];
+    std::vector<double> acc1(static_cast<std::size_t>(m), 0.0), acc2(static_cast<std::size_t>(k), 0.0);
+    std::vector<int> mark1(static_cast<std::size_t>(m), -1), mark2(static_cast<std::size_t>(k), -1), c1, c2;
+    FEMD_OMP_FOR
+    for (int i = 0; i < n; ++i)
+    {
+        if (first[static_cast<std::size_t>(me)] < 0) first[static_cast<std::size_t>(me)] = i;
+        c1.clear();
+        for (int p = PT.indptr()[i]; p < PT.indptr()[i + 1]; ++p)
+        {
+            const int r = PT.indices()[p];
+            const double a = PT.data[p];
+            for (int q = A.indptr()[r]; q < A.indptr()[r + 1]; ++q)
+            {
+                const int j = A.indices()[q];
+                if (mark1[j] != i) { mark1[j] = i; acc1[j] = 0.0; c1.push_back(j); }
+                acc1[j] += a * A.data[q];
+            }
+        }
+        c2.clear();                                     // the row of PT A in the order its columns appeared
+        for (int j : c1)
+        {
+            const double t = acc1[j];
+            if (t == 0.0) continue;
+            for (int q = P.indptr()[j]; q < P.indptr()[j + 1]; ++q)
+            {
+                const int c = P.indices()[q];
+                if (mark2[c] != i) { mark2[c] = i; acc2[c] = 0.0; c2.push_back(c); }
+                acc2[c] += t * P.data[q];
+            }
+        }
+        std::sort(c2.begin(), c2.end());
+        int len = 0;
+        for (int c : c2) if (acc2[c] != 0.0) { oc.push_back(c); ov.push_back(acc2[c]); ++len; }
+        rowlen[static_cast<std::size_t>(i)] = len;
+    }
+    }
+    auto Pn = std::make_shared<SparsityPattern>();
+    Pn->nrows = n; Pn->ncols = k;
+    Pn->indptr.assign(static_cast<std::size_t>(n) + 1, 0);
+    for (int i = 0; i < n; ++i) Pn->indptr[i + 1] = Pn->indptr[i] + rowlen[static_cast<std::size_t>(i)];
+    Pn->indices.resize(static_cast<std::size_t>(Pn->indptr[n]));
+    CSRMatrix C(Pn, false);
+    C.data.resize(Pn->indices.size());
+    for (std::size_t t = 0; t < bc.size(); ++t)
+    {
+        if (first[t] < 0) continue;
+        std::copy(bc[t].begin(), bc[t].end(), Pn->indices.begin() + Pn->indptr[first[t]]);
+        std::copy(bv[t].begin(), bv[t].end(), C.data.begin() + Pn->indptr[first[t]]);
+    }
+    return C;
+}
+
+/// @brief A - sigma I for a square A, entries that come out exactly zero dropped (as SciPy's sum).
+inline CSRMatrix shifted(const CSRMatrix &A, double sigma)
+{
+    if (A.nrows() != A.ncols()) throw std::invalid_argument("shifted: the matrix is not square");
+    std::vector<int> I, J;
+    std::vector<double> V;
+    I.reserve(static_cast<std::size_t>(A.nnz()) + A.nrows()); J.reserve(I.capacity()); V.reserve(I.capacity());
+    for (int i = 0; i < A.nrows(); ++i)
+    {
+        bool diag = false;
+        for (int p = A.indptr()[i]; p < A.indptr()[i + 1]; ++p)
+        {
+            const int j = A.indices()[p];
+            double v = A.data[p];
+            if (j == i) { v = v - sigma; diag = true; }
+            if (v != 0.0) { I.push_back(i); J.push_back(j); V.push_back(v); }
+        }
+        if (!diag && sigma != 0.0) { I.push_back(i); J.push_back(i); V.push_back(-sigma); }
+    }
+    CSRMatrix C = from_triplets(A.nrows(), A.ncols(), I, J, V);
+    C.symmetric = A.symmetric;
+    return C;
+}
+
+/// @brief max_j sum_i |a_ij|, the largest column sum (1 for an empty matrix, a neutral scale).
+inline double norm1(const CSRMatrix &A)
+{
+    if (A.nnz() == 0) return 1.0;
+    std::vector<double> col(static_cast<std::size_t>(A.ncols()), 0.0);
+    for (int p = 0; p < A.nnz(); ++p) col[static_cast<std::size_t>(A.indices()[p])] += std::abs(A.data[p]);
+    double m = 0.0;
+    for (double c : col) m = std::max(m, c);
+    return m;
+}
+
+/// @brief max |a_ij - delta_ij| over the stored entries and the diagonal (0 for the identity).
+inline double identity_defect(const CSRMatrix &A)
+{
+    double m = 0.0;
+    std::vector<char> seen(static_cast<std::size_t>(std::min(A.nrows(), A.ncols())), 0);
+    for (int i = 0; i < A.nrows(); ++i)
+        for (int p = A.indptr()[i]; p < A.indptr()[i + 1]; ++p)
+        {
+            const int j = A.indices()[p];
+            if (j == i) seen[static_cast<std::size_t>(i)] = 1;
+            m = std::max(m, std::abs(A.data[p] - (j == i ? 1.0 : 0.0)));
+        }
+    for (std::size_t i = 0; i < seen.size(); ++i) if (!seen[i]) m = std::max(m, 1.0);
+    if (A.nrows() != A.ncols()) m = std::max(m, 1.0);
+    return m;
+}
+
+/// @brief The nonzero entries of a dense nr x nc row-major array as a CSRMatrix.
+inline CSRMatrix csr_from_dense(const std::vector<double> &D, int nr, int nc)
+{
+    if (D.size() != static_cast<std::size_t>(nr) * nc) throw std::invalid_argument("csr_from_dense: size != nr nc");
+    std::vector<int> I, J;
+    std::vector<double> V;
+    for (int i = 0; i < nr; ++i)
+        for (int j = 0; j < nc; ++j)
+        {
+            const double v = D[static_cast<std::size_t>(i) * nc + j];
+            if (v != 0.0) { I.push_back(i); J.push_back(j); V.push_back(v); }
+        }
+    return from_triplets(nr, nc, I, J, V);
+}
+
 /// @brief Relative asymmetry max |a_ij - a_ji| / max |a_ij| (0 for an exactly symmetric matrix).
 inline double asymmetry(const CSRMatrix &A)
 {

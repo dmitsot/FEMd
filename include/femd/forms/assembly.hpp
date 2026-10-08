@@ -26,11 +26,13 @@ namespace femd {
 
 namespace detail {
 /// Rows [lo, hi) of y = K x with a compile-time band width, so the inner loop is
-/// unrolled into 2P+1 fused multiply-adds with no bounds.  Same summation order as
-/// the generic loop, so the result is bit-identical.
+/// unrolled into 2P+1 multiply-adds with no bounds.  Same summation order as the
+/// generic loop (row_dot), and neither fuses a multiply with its add
+/// (FEMD_NO_FP_CONTRACT), so the result is bit-identical on every compiler.
 template <int P>
 inline void band_apply_interior(int lo, int hi, const double *band, const double *x, double *y)
 {
+    FEMD_NO_FP_CONTRACT
     constexpr int W = 2 * P + 1;
     FEMD_OMP_FOR_IF(hi - lo > FEMD_OMP_THRESHOLD)
     for (int i = lo; i < hi; ++i)
@@ -96,6 +98,7 @@ struct AssembledMatrix {
      */
     void apply(const double *x, double *y) const
     {
+        FEMD_NO_FP_CONTRACT
         // Rows p .. n-p-1 see the whole band; the first and last p rows are clipped.
         const int a = std::min(p, n), e = std::max(n - p, a);
         const double *b = band.data();
@@ -139,6 +142,7 @@ struct AssembledMatrix {
     /// @brief Row i of the band times x, clipped to the columns 0..n-1 (the generic loop).
     double row_dot(int i, const double *x) const
     {
+        FEMD_NO_FP_CONTRACT
         const double *row = &band[static_cast<std::size_t>(i) * w];
         const int lo = (i - p < 0) ? -i : -p;
         const int hi = (i + p >= n) ? n - 1 - i : p;

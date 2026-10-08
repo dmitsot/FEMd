@@ -489,7 +489,6 @@ class DGSpace2D(_Lagrange2D, _C.DGSpace2D):
 
     def _join_periodic(self):
         """Pair the edges of each periodic side pair into interior facets, and the vertices into classes."""
-        from scipy.spatial import cKDTree
         P = np.asarray(self.mesh.points, dtype=np.float64)
         tol = 1e-8 * float(np.ptp(P, axis=0).max())
         present = set(np.asarray(self.mesh.segment_markers).tolist())
@@ -515,7 +514,8 @@ class DGSpace2D(_Lagrange2D, _C.DGSpace2D):
                 raise ValueError(f"DGSpace2D: periodic ({a}, {b}): side {a} has {ia.size} edges and side {b} has "
                                  f"{ib.size}; the mesh must match edge for edge across the two sides")
             shift = mid[ib].mean(axis=0) - mid[ia].mean(axis=0)
-            d, j = cKDTree(mid[ia]).query(mid[ib] - shift)
+            d, j = _C.nearest_points(np.ascontiguousarray(mid[ia]), np.ascontiguousarray(mid[ib] - shift))
+            d, j = np.asarray(d), np.asarray(j, dtype=np.int64)
             if np.any(d > tol) or np.unique(j).size != j.size:
                 raise ValueError(f"DGSpace2D: periodic ({a}, {b}): side {b} is not side {a} shifted by "
                                  f"({shift[0]:.6g}, {shift[1]:.6g}) edge for edge")
@@ -524,7 +524,8 @@ class DGSpace2D(_Lagrange2D, _C.DGSpace2D):
             # vertex classes, for the vertex patches of a limiter
             va = np.unique(np.concatenate([cv[cell[ia], (local[ia] + 1) % 3], cv[cell[ia], (local[ia] + 2) % 3]]))
             vb = np.unique(np.concatenate([cv[cell[ib], (local[ib] + 1) % 3], cv[cell[ib], (local[ib] + 2) % 3]]))
-            dv, jv = cKDTree(P[va]).query(P[vb] - shift)
+            dv, jv = _C.nearest_points(np.ascontiguousarray(P[va]), np.ascontiguousarray(P[vb] - shift))
+            jv = np.asarray(jv, dtype=np.int64)
             for s_, m_ in zip(vb, va[jv]):
                 ra, rb = find(int(s_)), find(int(m_))
                 if ra != rb:
@@ -580,15 +581,7 @@ def _dg_tables(V):
     vertices, and the P1 (barycentric) functions at the nodes."""
     T = getattr(V, "_dgtab", None)
     if T is None:
-        r = _C.triangle_rule(2 * V.degree + 2)
-        x, y, w = (np.asarray(v, dtype=np.float64) for v in r)
-        tab = np.array([np.asarray(V.ref_eval(a, b, 0))[0] for a, b in zip(x, y)])        # (nq, nloc)
-        mean = (w @ tab) / w.sum()                                                          # (nloc,)
-        lam = np.column_stack([1 - x - y, x, y])                                           # (nq, 3)
-        M1 = lam.T @ (w[:, None] * lam)
-        Pi = np.linalg.solve(M1, lam.T @ (w[:, None] * tab))                               # (3, nloc): vertex values of the P1 projection
-        R = np.asarray(V.ref_nodes())
-        E = np.column_stack([1 - R[:, 0] - R[:, 1], R[:, 0], R[:, 1]])                     # (nloc, 3)
+        mean, Pi, E = (np.asarray(a) for a in _C.dg_vertex_tables(V))     # fe/dg_tables.hpp
         T = dict(mean=mean, Pi=Pi, E=E)
         V._dgtab = T
     return T

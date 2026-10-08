@@ -121,9 +121,10 @@ Made by `A.solver(backend, **options)`.
 
 | backend | options | meaning |
 |---|---|---|
-| `"auto"` | none | `"cholesky"` for a symmetric matrix with a positive diagonal, falling back to `"ldlt"` when it meets a pivot $\le 0$. `"ldlt"` for any other symmetric matrix (a saddle point), and `"superlu"` for a nonsymmetric one. `S.backend` says which. |
-| `"cholesky"` (also `"chol"`) | `ordering="amd"` or `"natural"`, `positive_definite=True` | FEMd's sparse $LDL^T$ in C++ ([manual, Section 12.3](../manual.md#123-matrices-and-solvers)). Raises `RuntimeError` on a pivot $\le 0$, or with `positive_definite=False` on a zero pivot. `S.factor` is the C++ `SparseCholesky`. |
+| `"auto"` | none | `"cholesky"` for a symmetric matrix with a positive diagonal, falling back to `"ldlt"` when it meets a pivot $\le 0$. `"ldlt"` for any other symmetric matrix (a saddle point), and `"lu"` for a nonsymmetric one. `S.backend` says which. |
+| `"cholesky"` (also `"chol"`) | `ordering="amd"` or `"natural"`, `positive_definite=True` | FEMd's sparse $LDL^T$ in C++ ([manual, Section 12.3](../manual.md#123-matrices-and-solvers)). Raises `RuntimeError` on a pivot $\le 0$, or with `positive_definite=False` on a zero pivot. `S.factor` is the C++ `SparseCholesky`, with `nnz_L`, `flops`, `min_pivot`, `max_pivot`, `ordering`, `permutation()`, `etree()`, `factors()` and `refactor(K)`, and the cut of the elimination tree that the solves run in parallel with OpenMP ([manual, Section 1.1](../manual.md#11-openmp)): `subtrees`, `top_nodes`, `top_supernodes`, `top_fraction`. |
 | `"ldlt"` (also `"ldl"`, `"indefinite"`) | `ordering="amd"` or `"natural"`, `threshold=0.01` | FEMd's pivoting sparse $LDL^T$ for symmetric matrices, definite or not: multifrontal, with $1\times1$ and $2\times2$ pivots accepted by a threshold test in $(0, 0.5]$ ([manual, Section 12.3](../manual.md#123-matrices-and-solvers)). `S.factor` is the C++ `SparseLDLT`, with `inertia` (positive, negative, zero eigenvalues), `nnz_L`, `delayed`, `two_by_two`, `supernodes`, `max_front`, `min_pivot` and `refactor(K)`. Raises `ValueError` for a nonsymmetric matrix and `RuntimeError` for a singular one. |
+| `"lu"` (also `"femd"`) | `method="frontal"` (or `"columns"`), `ordering="auto"` (`"ata"`, `"amd"`, `"natural"`), `pivot_tol=0.1` | FEMd's sparse LU with threshold pivoting in C++, multifrontal on the pattern of $A + A^T$ by default (`method="columns"` for the left-looking column algorithm) ([manual, Section 12.3](../manual.md#123-matrices-and-solvers)). `"auto"` orders by AMD of $A + A^T$ when the diagonal is full and nonzero and by AMD of the pattern of $A^T A$ otherwise. `S.factor` is the C++ `SparseLU`, with `nnz_L`, `nnz_U`, `off_diagonal_pivots`, `min_pivot`, `max_pivot`, `ordering`, `pivot_tol`, `column_order()`, `row_pivots()` and `refactor(K)`. Raises `RuntimeError` for a singular matrix. The solves run in parallel through the elimination tree of $L + U$, the same bits for any number of threads. `S.factor` reports `subtrees`, `top_nodes`, `top_chains`, `top_levels`, `top_steps`, `top_fraction` and `tree_contained`. |
 | `"superlu"` | none | SciPy's SuperLU. For a symmetric matrix it tries symmetric mode (minimum degree on $A + A^T$, no pivoting), checks one solve and refactors with partial pivoting when the backward error exceeds $10^{-11}$. |
 | `"cg"`, `"gmres"`, `"lgmres"` | `M="ilu0"` (a kind, a `Preconditioner` or anything `fd.cg` takes), `tol`, `maxiter`, ... | FEMd's Krylov solvers. |
 | `"dense"` | none | LU of the dense matrix. |
@@ -222,7 +223,7 @@ components, each `LagrangeSpace(mesh, degree, **options)`. The family may be lef
 | `block_space(b)` | int | space | Block `b` on its own. |
 | `unconstrained` | attribute | `ProductSpace2D` | The same system with nothing eliminated. |
 | `split(x)`, `gather(parts)` | vector, list | list, vector | Per-field views and their concatenation (with a slip condition, the field values $Zx$, and $Z^T$ of the concatenation). |
-| `slip_matrix` | attribute | `scipy.sparse` or `None` | $Z$: the coefficients without the slip condition are $Z x$. |
+| `slip_matrix` | attribute | `RectMatrix` or `None` | $Z$, from this space to the one without the slip condition: the coefficients without the condition are $Z x$. `Z.T @ Z` is the identity. |
 | `slip_info` | attribute | list of dict | Per slip condition: `markers`, `nodes` (raw indices), `points`, `normals`, `corners`, `corner_points`, `fields`. |
 | `prolongate(c)`, `restrict(raw)` | vector | vector | Field by field, as for `LagrangeSpace2D`. |
 | `lift(g)`, `interpolate(f)` | per-block data | ProductFunction, vector | Data as in [manual, Section 12.5](../manual.md#125-systems-vector-fields-and-several-unknowns). |
@@ -301,6 +302,7 @@ The inputs are those of [G.6](time-stepping.md#g6-irkm-rhs-dt-methodgauss-stages
 | `dirichlet` | Anything `V.lift` takes, with callables $g(x, y, t)$ or $g(t)$ for data in time. The state is then a Function of `V.unconstrained`. `left=`, `right=` are refused. Without it, the data given with the space are used, if any. |
 | `newton` | `"simplified"` (default), `"frozen"` or `"exact"`, see the table in [manual, Section 12.6](../manual.md#126-implicit-time-stepping). |
 | `backend` | `SparseSolver` backend for the real stage systems (`"auto"`: Cholesky or SuperLU). |
+| `refresh` | `"auto"` (default) or a positive int. When `"frozen"` renews its factorization at the next step: `"auto"` after a step with more than `maxiter // 2` iterations, or after a step on an older factorization with more than the last new one's count plus half of it (at least 2 more); `k` after a step with more than `k` iterations. |
 
 | member | meaning |
 |---|---|
@@ -310,7 +312,7 @@ The inputs are those of [G.6](time-stepping.md#g6-irkm-rhs-dt-methodgauss-stages
 | `jacobian(Us, ts=None)` | The $sn \times sn$ stage Jacobian as a `SparseMatrix`. |
 | `stage_solver(cn)` | The simplified-Newton solver at $(t, c^n)$, with `.solve(r)` and `.kinds` (the backend of each factored system). |
 | `factorizations` | Sparse factorizations so far. |
-| `refresh` | Iteration count above which `"frozen"` renews its factorization at the next step (6). |
+| `refresh` | The `refresh=` rule, `"auto"` or an int (can be changed between steps). |
 | `data` | The `_Data2D` of `dirichlet=`: `lift(t)`, `lift_rate(t)`, `timedep`. |
 
 A tableau that is not diagonalizable (a custom `(A, b)`) falls back to the $sn$ block matrix in the

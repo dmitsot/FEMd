@@ -27,6 +27,7 @@ live at assembly ([manual, Section 5](../manual.md#5-functions)).
 
 **Output.** A `Function`. **Raises** `ValueError` when the vector length is
 not `V.dim`, or when an expression is not linear in Functions of `V`.
+On a `ProductSpace` (1D or 2D) the output is a `ProductFunction`, the same as `fd.Functions(P)` ([C.2](#c2-productfunction-and-functionsp-namenone-vectornone)).
 
 **Attributes**
 
@@ -44,8 +45,8 @@ not `V.dim`, or when an expression is not linear in Functions of `V`.
 | `u(x, k=0)` | `x` scalar or array_like of points. `k` int, derivative order. | array | $d^k u/dx^k$ at the points. |
 | `derivative(x, k=1)` | as `u(x, k)` | array | The same, with `k` defaulting to 1. |
 | `at_quad(cache, k=0)` | `cache` a `QuadratureCache` of `V`. `k` int. | array, length `nelem*nq` | Values at the quadrature nodes, `[e*nq + q]`. |
-| `project(f, npts=None)` | `f` a callable, an expression in `fd.x`, values at the cache nodes, or a `Function` of another space. `npts` int, as in `V.project`. | `self` | Sets the coefficients to the $L^2$ projection. |
-| `interpolate(f)` | `f` a callable or values at `V.dof_coordinates()`. | `self` | Sets the coefficients to the interpolant. |
+| `project(f, npts=None)` | `f` a callable, a number, an expression in `fd.x`, values at the cache nodes, or a `Function` of another space. `npts` int, as in `V.project`. | `self` | Sets the coefficients to the $L^2$ projection. |
+| `interpolate(f)` | `f` a callable, a number, an expression in `fd.x`, numbers, Constants and Functions, or values at `V.dof_coordinates()`. | `self` | Sets the coefficients to the interpolant. |
 | `project_to(W, check=True)` | `W` the target space. `check` bool, warn when `u` violates a condition built into `W`. | new `Function` of `W`, same name | Exact $L^2$ projection ([manual, Section 5.4](../manual.md#54-moving-a-function-to-another-space)). Builds a new operator on every call. |
 | `interpolate_to(W, check=True)` | as `project_to` | new `Function` of `W` | Interpolation at `W.dof_coordinates()`. |
 | `assign(other)` | `other` a `Function` of `V`, an array of length `V.dim`, or a linear combination such as `u0 + 0.5*dt*k1`. | `self` | Overwrites the coefficients. A nonlinear expression raises `ValueError`. |
@@ -63,7 +64,7 @@ not `V.dim`, or when an expression is not linear in Functions of `V`.
 
 ### C.2 `ProductFunction` and `Functions(P, name=None, vector=None)`
 
-A known field on a `ProductSpace`. Build it with `Functions`.
+A known field on a `ProductSpace`. Build it with `Functions(P)` or `Function(P)`, which are the same on a `ProductSpace`.
 
 **Inputs of `Functions`**
 
@@ -86,7 +87,7 @@ A known field on a `ProductSpace`. Build it with `Functions`.
 | `U[i]` | `i` int | symbol | Component `i`. |
 | `split()` | none | tuple of `Function` | One Function per field, copies of the current coefficients, named `name[i]`. |
 | `assign(other)` | `other` an array or `ProductFunction` of length `P.dim` | `self` | Overwrites the global vector. |
-| `project(f, degree=None)`, `interpolate(f)` | `f` a list with one entry per field, each an expression in `fd.x`, a callable or `None` (zero). `degree` the number of Gauss points | `self` | Sets each field by $L^2$ projection or interpolation in its own space. |
+| `project(f, degree=None)`, `interpolate(f)` | `f` a list with one entry per field, each an expression in `fd.x`, a callable, a number or `None` (zero). `degree` the number of Gauss points | `self` | Sets each field by $L^2$ projection or interpolation in its own space. |
 
 ### C.3 `mixed_mass(W, V)`
 
