@@ -6,7 +6,7 @@
 
 | function | inputs | returns | meaning |
 |---|---|---|---|
-| `__version__` | attribute | str | The installed version, such as `"0.1.0"`. The C++ core has the same string as `FEMD_VERSION` and `femd::version` in `femd/version.hpp`. |
+| `__version__` | attribute | str | The installed version, such as `"0.5"`. The C++ core has the same string as `FEMD_VERSION` and `femd::version` in `femd/version.hpp`. |
 | `has_fftw()` | none | bool | Whether the build links FFTW, which `Solver.Circulant` needs. |
 | `has_openmp()` | none | bool | Whether the build uses OpenMP ([manual, Section 1.1](../manual.md#11-openmp)). |
 | `set_num_threads(k)` | `k` int $\ge 1$ | `None` | Threads for the OpenMP loops. A no-op without OpenMP. |
