@@ -2729,7 +2729,7 @@ class Form:
     def derivative(self, wrt, space=None, part="all"):
         """The Jacobian of a rank-1 form as a rank-2 FORM, d R / d wrt, not yet assembled.
 
-            J = R.derivative(u)            # J.assemble() is R.jacobian(u)
+            J = R.derivative(u)            # J.assemble() is R.jacobian(u), same quadrature as R
             Jv = J.action(dv).assemble()   # the Jacobian-vector product, matrix-free
 
         space=: the trial space of the result.  By default it is the space of `wrt`.  For u
@@ -2744,7 +2744,31 @@ class Form:
                 raise ValueError(f"the Jacobian with respect to '{target.name}' has no constant-coefficient part")
         elif part != "all":
             raise ValueError("derivative(part=...): 'all' or 'constant'")
-        return Form(FormExpr([Integral(Prod([t.coeff, t.test, t.trial]), t.measure) for t in jterms]))
+        # the rule of the residual is kept, so J.assemble() is R.jacobian(u) and the Newton matrix is the
+        # exact derivative of the assembled residual (a new Form would re-infer the degree from dc)
+        return Form(FormExpr([Integral(Prod([t.coeff, t.test, t.trial]), self._residual_measure(t)) for t in jterms]))
+
+    def _residual_measure(self, t):
+        """The measure of a term of this rank-1 form with its quadrature rule written out: the rule
+        the form uses for it, so a form built from derived terms (derivative()) integrates them alike.
+        A measure that names its own rule, and the point measures of 1D (ds, dS), are kept."""
+        m = t.measure
+        if m.quad_degree is not None:
+            return m
+        if m.scheme == "lobatto":
+            if getattr(self, "tdim", 1) == 2:
+                s = t.test.product.fields[t.test.field] if t.test.product is not None else t.test.space
+                n = getattr(s, "degree", 1) + 1
+            else:
+                n = self._lobatto_points(t)
+            return Measure(m.kind, m.where, n, m.scheme)
+        if getattr(self, "tdim", 1) == 2:
+            n = {"dx": self.quad_degree, "ds": self.facet_degree, "dS": self.interior_degree}[m.kind]
+        elif m.kind == "dx":
+            n = self.quad_degree
+        else:
+            return m
+        return Measure(m.kind, m.where, n, m.scheme)
 
     def _derivative_terms(self, wrt, space=None):
         if self.rank != 1:
