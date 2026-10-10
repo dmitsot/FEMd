@@ -4,7 +4,7 @@
 
 **Version 0.6** · [License: GPL v3 or later](LICENSE)
 
-**FEMd** is a Finite Element Library for problems in one and two space dimensions. Its core is header-only C++17 and is used from Python. You give a domain, a polynomial degree and boundary conditions, write the equations in weak form, and FEMd assembles and solves them. The form language follows FEniCS, so FEniCS users will find the workflow familiar.
+**FEMd** is a Finite Element Library for problems in one and two space dimensions designed to run simulations efficiently on modern personal computers. Its core is header-only C++17 and is used from Python. You give a domain, a polynomial degree and boundary conditions, write the equations in weak form, and FEMd assembles and solves them. The form language follows FEniCS, so FEniCS users will find the workflow familiar.
 
 - **1D.** B-splines of any degree and continuity, Lagrange and DG elements. Dirichlet, Neumann, clamped, periodic and Robin conditions are built into the basis. Banded, cyclic and FFT solvers.
 - **2D.** A Delaunay mesh generator with a guaranteed minimum angle, holes, markers, local refinement and coarsening, structured meshes and Gmsh import. Continuous $P_k$ elements on triangles and $Q_k$ on quadrilaterals of any degree, vector and mixed spaces (Stokes, Navier-Stokes), Raviart-Thomas, Nédélec and DG elements. Dirichlet, natural, periodic and slip conditions. VTK output for ParaView.
