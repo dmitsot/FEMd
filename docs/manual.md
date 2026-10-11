@@ -10,6 +10,8 @@ Both dimensions share the same form language, with symbolic Jacobians for nonlin
 
 FEMd was designed and developed by D. Mitsotakis. The Delaunay mesh generator was developed in collaboration with T. Katsaounis. The code has been tested and used by the developer only on macOS.
 
+**How to cite.** If you use FEMd in your work, please cite the technical report, D. Mitsotakis, *FEMd: a finite element library*, 2026, [doi:10.5281/zenodo.23289708](https://doi.org/10.5281/zenodo.23289708), and the software, [doi:10.5281/zenodo.23289658](https://doi.org/10.5281/zenodo.23289658). The second DOI always points to the latest release, and each release has a DOI of its own on that page.
+
 This is the user manual. Every function and class is documented in the [API reference](reference/index.md).
 
 ---

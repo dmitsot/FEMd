@@ -88,6 +88,33 @@ The notebooks in [`examples/`](examples) run as they are after installation.
 - [Manual](docs/manual.md), the main ideas and worked examples in 1D and 2D.
 - [API reference](docs/reference/index.md), every function and class.
 
+## How to cite
+
+If you use FEMd in your work, please cite the technical report
+
+> D. Mitsotakis, *FEMd: a finite element library*, technical report, 2026. [doi:10.5281/zenodo.23289708](https://doi.org/10.5281/zenodo.23289708)
+
+and the software, [doi:10.5281/zenodo.23289658](https://doi.org/10.5281/zenodo.23289658). This DOI always points to the latest release. Each release also has a DOI of its own, listed on that page, for the exact version you used. The "Cite this repository" button on GitHub gives the same in APA and BibTeX.
+
+```bibtex
+@misc{femd_report,
+  author    = {Mitsotakis, Dimitrios},
+  title     = {{FEMd}: a finite element library},
+  note      = {Technical report},
+  publisher = {Zenodo},
+  year      = {2026},
+  doi       = {10.5281/zenodo.23289708}
+}
+@software{femd,
+  author    = {Mitsotakis, Dimitrios},
+  title     = {{FEMd}: a finite element library},
+  publisher = {Zenodo},
+  year      = {2026},
+  doi       = {10.5281/zenodo.23289658},
+  url       = {https://github.com/dmitsot/FEMd}
+}
+```
+
 ## License
 
 Copyright (C) 2026 D. Mitsotakis.
