@@ -94,7 +94,7 @@ If you use FEMd in your work, please cite the technical report
 
 > D. Mitsotakis, *FEMd: a finite element library*, technical report, 2026. [doi:10.5281/zenodo.23289708](https://doi.org/10.5281/zenodo.23289708)
 
-and the software, [doi:10.5281/zenodo.23289658](https://doi.org/10.5281/zenodo.23289658). This DOI always points to the latest release. Each release also has a DOI of its own, listed on that page, for the exact version you used. The "Cite this repository" button on GitHub gives the same in APA and BibTeX.
+and the software, [doi:10.5281/zenodo.23289658](https://doi.org/10.5281/zenodo.23289658). This DOI always points to the latest release.
 
 ```bibtex
 @misc{femd_report,
