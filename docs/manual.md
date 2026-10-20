@@ -69,7 +69,7 @@ Restart the Python kernel afterwards. `fd.omp_threshold()` then reports the new 
 pip install . -C cmake.define.FEMD_OPENMP=ON -C cmake.define.CMAKE_CXX_FLAGS=""
 ```
 
-The solves with a sparse Cholesky factor, $L y = b$ and $L^T x = y$, are sequential by nature, since each unknown needs the ones before it. They run in parallel through the elimination tree of the factor. The tree is cut into independent subtrees, which are solved concurrently. The nodes above them hold the long columns. They are swept as dense blocks (supernodes), and the rows of each block are shared between the threads.
+The solves with a sparse Cholesky factor, $L y = b$ and $L^T x = y$, are sequential by nature, since each unknown needs the ones before it. They run in parallel through the elimination tree of the factor. The tree is cut into independent subtrees, which are solved concurrently. The nodes above them hold the long columns. They first gather what the subtrees owe them, in parallel. Then they are swept as dense blocks (supernodes, cut into chunks of at most 32 columns), and the rows of each block are shared between the threads.
 
 The solves with the sparse LU factors run in parallel the same way. They use the elimination tree of the pattern of $L + U$, which holds the dependencies of both sweeps whatever pivots were taken. The top of the tree is swept by rows in blocks, and the rows of a block gather their entries in parallel.
 
@@ -1223,6 +1223,8 @@ The preconditioners `"jacobi"`, `"ssor"` (with `omega`) and `"ilu0"` are built i
 On the unit square with $P_2$ and $h = 1/150$ (89 401 unknowns), CG with ILU(0) needs 207 iterations, against 353 in the natural numbering. The sparse Cholesky solves this system faster than SuperLU and than CG.
 
 **The sparse Cholesky.** `sparse/cholesky.hpp` factors $P A P^T = L D L^T$ with $L$ unit lower triangular, in three phases. The ordering $P$ is an approximate minimum degree ordering (`sparse/amd.hpp`, after Amestoy, Davis and Duff), with supervariables, mass elimination, aggressive absorption, dense rows held back, and a post-order of the assembly tree. The symbolic phase finds the elimination tree and the column counts of $L$. The numeric phase is up-looking, one row of $L$ per sparse triangular solve. No square roots are taken and no pivoting is done, which a symmetric positive definite matrix never needs. `S.factor` of `S = A.solver()` holds the factorization, with `nnz_L`, `flops`, `min_pivot`, `permutation()` and `refactor(K)` for new values on the same pattern. It is a `SparsePreconditioner`, so `fd.cg(A, b, M=S)`, and `fd.ERK` on a `SparseMatrix`, apply it in C++ without a Python round trip.
+
+**Exact zeros in the pattern.** The sparse Cholesky, the pivoting $LDL^T$ and the sparse LU leave the stored entries that are exactly zero out of the ordering and the factor. A form on a `ProductSpace` stores every pair of fields, also the pairs that no term couples, such as the $\eta$-$u$ blocks of a Boussinesq left side or the pressure block of Stokes. Counted as couplings, these zeros would join independent fields and fill the factor with entries that come out zero. `S.factor.dropped_zeros` gives the number of entries left out. A `refactor(K)` with values that are nonzero where zeros were left out orders and analyses the matrix again.
 
 | BBM-BBM matrix (205 531 unknowns, P2, slip) | stored factor |
 |---|---|

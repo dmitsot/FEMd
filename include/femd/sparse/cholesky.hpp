@@ -26,21 +26,27 @@
 //  The class is a SparsePreconditioner (an exact one), so it drops into CG,
 //  GMRES and the explicit Runge-Kutta stage loop wherever z = M^{-1} r is taken.
 //  The matrix must hold both triangles (FEMd assembles full symmetric patterns);
-//  only the entries with row >= column in the new order are read.
+//  only the entries with row >= column in the new order are read.  Stored entries that
+//  are exactly zero (the uncoupled blocks of a ProductSpace pattern) are left out of the
+//  ordering and the factor (prune.hpp); a refactor with values that are nonzero there
+//  orders and analyses the matrix again.
 //
 //  The triangular solves run in parallel with OpenMP over the elimination tree.
 //  After the factorization the tree is cut into independent subtrees of about
 //  1/64 of the work each (partition()); the nodes above them are the top.  In the
 //  forward solve the subtrees are done concurrently, each a column-oriented sweep
-//  whose updates stay inside the subtree, and the top nodes follow in order, each
-//  one gathering what the subtrees owe it from its row of L.  In the backward
-//  solve the top goes first, then the subtrees concurrently.  The top holds the
-//  long columns (the separators), so it is swept by fundamental supernodes, runs
-//  of columns with nested structure: the update of the rows below a supernode is
-//  one dense block, done in parallel over its rows (forward) or its columns
-//  (backward).  Every entry of the solution is formed by one thread in a fixed
-//  order, so the result has the same bits for any number of threads, and the
-//  serial build runs the same sweeps.
+//  whose updates stay inside the subtree; then every top node gathers what the
+//  subtrees owe it from its row of L, in parallel over the nodes; then the top
+//  nodes follow in order.  In the backward solve the top goes first, then the
+//  subtrees concurrently.  The top holds the long columns (the separators), so it
+//  is swept by fundamental supernodes, runs of columns with nested structure, cut
+//  into chunks of at most FEMD_CHOL_SNCHUNK (32) columns: the triangle inside a
+//  chunk is done by one thread, and the update of the rows below it (the rest of
+//  the supernode included) is one dense block, done in parallel over its rows
+//  (forward) or its columns (backward).  The whole solve is one parallel region.
+//  Every entry of the solution is formed by one thread in a fixed order, so the
+//  result has the same bits for any number of threads, and the serial build runs
+//  the same sweeps.
 //
 #ifndef FEMD_SPARSE_CHOLESKY_HPP
 #define FEMD_SPARSE_CHOLESKY_HPP
@@ -48,6 +54,7 @@
 #include "femd/sparse/amd.hpp"
 #include "femd/sparse/csr.hpp"
 #include "femd/sparse/precond.hpp"
+#include "femd/sparse/prune.hpp"
 #include "femd/util/omp.hpp"
 #include <algorithm>
 #include <cmath>
@@ -63,6 +70,11 @@
 #endif
 #ifndef FEMD_CHOL_BLOCK
 #define FEMD_CHOL_BLOCK 4096
+#endif
+// the top supernodes are cut into chunks of at most this many columns, so that the dense
+// triangle done by one thread stays small and the rest of the supernode is updated in parallel
+#ifndef FEMD_CHOL_SNCHUNK
+#define FEMD_CHOL_SNCHUNK 32
 #endif
 
 namespace femd {
@@ -83,13 +95,8 @@ public:
         check_square(A, "Cholesky");
         n_ = A.nrows();
         pattern_ = A.pattern;
-        perm_ = (ordering == Ordering::AMD) ? ordering::amd_order(n_, A.indptr(), A.indices())
-                                            : ordering::natural_order(n_);
-        pinv_.assign(static_cast<std::size_t>(n_), 0);
-        for (int k = 0; k < n_; ++k) pinv_[perm_[k]] = k;
-        symbolic(A);
-        numeric(A);
-        partition();
+        prune_.build(n_, A.indptr(), A.indices(), A.data.data(), true);
+        analyse(A);
     }
 
     /// @brief New values on the same pattern: the numeric phase only.
@@ -100,7 +107,15 @@ public:
         if (A.pattern != pattern_ &&
             (A.pattern->indptr != pattern_->indptr || A.pattern->indices != pattern_->indices))
             throw std::invalid_argument("Cholesky::refactor: the matrix has a different pattern");
-        numeric(A);
+        if (!prune_.fits(A.data.data()))
+        {
+            // nonzero where the analysis dropped exact zeros: order and analyse again
+            prune_.build(n_, A.indptr(), A.indices(), A.data.data(), true, true);
+            analyse(A);
+            return;
+        }
+        if (prune_.active) { prune_.gather(A.data.data(), B_.data); numeric(B_); }
+        else numeric(A);
     }
 
     /// @brief z = A^{-1} r.
@@ -112,98 +127,136 @@ public:
         const int *Lp = Lp_.data(), *Li = Li_.data(), *perm = perm_.data();
         const double *Lx = Lx_.data(), *D = D_.data();
         const int *nodes = nodes_.data(), *partptr = partptr_.data(), *root = root_.data();
-        const int nparts = nparts_;
+        const int *top = top_.data(), *snp = topsn_ptr_.data();
+        const int *trp = toprow_ptr_.data(), *trj = toprow_j_.data(), *trx = toprow_p_.data();
+        const int nparts = nparts_, ntop = ntop_;
+        const int nsn = static_cast<int>(topsn_ptr_.size()) - 1;
         double *yv = y.data();
         const bool par = n > FEMD_OMP_THRESHOLD && nparts > 1;
         (void)par;
-        FEMD_OMP_FOR_IF(par)
-        for (int k = 0; k < n; ++k) yv[k] = r[perm[k]];
-        // L y = b.  The subtrees concurrently: a column sweep whose updates stay below the root of
-        // the subtree (the entries of a column are sorted, the rows above the root come last).
-        FEMD_OMP(parallel for schedule(dynamic, 1) if(par))
-        for (int s = 0; s < nparts; ++s)
-        {
-            const int rs = root[s];
-            for (int q = partptr[s]; q < partptr[s + 1]; ++q)
-            {
-                const int j = nodes[q];
-                const double yj = yv[j];
-                if (yj == 0.0) continue;
-                for (int p = Lp[j]; p < Lp[j + 1] && Li[p] <= rs; ++p) yv[Li[p]] -= Lx[p] * yj;
-            }
-        }
-        // then the top, supernode by supernode: its nodes gather what the subtrees owe them (their
-        // rows of L below the top), the dense triangle inside the supernode is solved, and the rows
-        // below it are updated as one block, in parallel over the rows
-        const int *top = top_.data(), *snp = topsn_ptr_.data();
-        const int nsn = static_cast<int>(topsn_ptr_.size()) - 1;
-        for (int u = 0; u < nsn; ++u)
-        {
-            const int a = snp[u], sz = snp[u + 1] - a, j1 = top[a];
-            for (int q = a; q < a + sz; ++q)
-            {
-                const int t = top[q];
-                double v = yv[t];
-                for (int p = toprow_ptr_[q]; p < toprow_ptr_[q + 1]; ++p) v -= Lx[toprow_p_[p]] * yv[toprow_j_[p]];
-                yv[t] = v;
-            }
-            for (int i = 0; i < sz; ++i)                                // the triangle: rows j+1 .. j1+sz-1 of column j
-            {
-                const int j = j1 + i;
-                const double yj = yv[j];
-                if (yj == 0.0) continue;
-                for (int k = 0; k < sz - 1 - i; ++k) yv[j + 1 + k] -= Lx[Lp[j] + k] * yj;
-            }
-            const int jl = j1 + sz - 1, below = Lp[jl + 1] - Lp[jl];    // the rows below: those of the last column
-            const int *rows = Li + Lp[jl];
-            FEMD_OMP_FOR_IF(par && static_cast<long>(sz) * below > FEMD_CHOL_BLOCK)
-            for (int k = 0; k < below; ++k)
-            {
-                double v = yv[rows[k]];
-                for (int i = 0; i < sz; ++i) v -= Lx[Lp[j1 + i] + (sz - 1 - i) + k] * yv[j1 + i];
-                yv[rows[k]] = v;
-            }
-        }
-        FEMD_OMP_FOR_IF(par)
-        for (int j = 0; j < n; ++j) yv[j] /= D[j];                    // D
-        // L^T x = y.  The top from its last supernode: each column gathers the rows below the
-        // supernode (one dot product per column, in parallel over the columns), then the triangle;
-        // then the subtrees concurrently, each from its root down (ancestors done, inside or top).
         std::vector<double> &w = work2_;
-        for (int u = nsn - 1; u >= 0; --u)
+        w.resize(static_cast<std::size_t>(std::max(FEMD_CHOL_SNCHUNK, 1)));
+        double *wv = w.data();
+        // One parallel region for the whole solve; every loop and single below ends in a barrier.
+        // Which of omp for / omp single a block takes depends on shared sizes only, so every
+        // thread takes the same branch.
+        FEMD_OMP_PARALLEL_IF(par)
         {
-            const int a = snp[u], sz = snp[u + 1] - a, j1 = top[a];
-            const int jl = j1 + sz - 1, below = Lp[jl + 1] - Lp[jl];
-            const int *rows = Li + Lp[jl];
-            if (static_cast<int>(w.size()) < sz) w.resize(static_cast<std::size_t>(sz));
-            double *wv = w.data();
-            FEMD_OMP_FOR_IF(par && static_cast<long>(sz) * below > FEMD_CHOL_BLOCK)
-            for (int i = 0; i < sz; ++i)
+            FEMD_OMP_FOR
+            for (int k = 0; k < n; ++k) yv[k] = r[perm[k]];
+            // L y = b.  The subtrees concurrently: a column sweep whose updates stay below the root
+            // of the subtree (the entries of a column are sorted, the rows above the root come last).
+            FEMD_OMP(for schedule(dynamic, 1))
+            for (int s = 0; s < nparts; ++s)
             {
-                const double *col = Lx + Lp[j1 + i] + (sz - 1 - i);
+                const int rs = root[s];
+                for (int q = partptr[s]; q < partptr[s + 1]; ++q)
+                {
+                    const int j = nodes[q];
+                    const double yj = yv[j];
+                    if (yj == 0.0) continue;
+                    for (int p = Lp[j]; p < Lp[j + 1] && Li[p] <= rs; ++p) yv[Li[p]] -= Lx[p] * yj;
+                }
+            }
+            // what the subtrees owe the top (their rows of L below the top): final once the
+            // subtrees are done, so gathered for every top node at once, in parallel over the nodes
+            FEMD_OMP_FOR
+            for (int q = 0; q < ntop; ++q)
+            {
                 double v = 0.0;
-                for (int k = 0; k < below; ++k) v += col[k] * yv[rows[k]];
-                wv[i] = v;
+                for (int p = trp[q]; p < trp[q + 1]; ++p) v += Lx[trx[p]] * yv[trj[p]];
+                yv[top[q]] -= v;
             }
-            for (int i = sz - 1; i >= 0; --i)
+            // then the top by supernodes (cut into chunks of at most FEMD_CHOL_SNCHUNK columns, so
+            // the rest of a long supernode is part of the block below a chunk): the dense triangle
+            // inside the chunk, then the rows below it as one block, in parallel over the rows
+            for (int u = 0; u < nsn; ++u)
             {
-                const int j = j1 + i;
-                double v = yv[j];
-                for (int k = 0; k < sz - 1 - i; ++k) v -= Lx[Lp[j] + k] * yv[j + 1 + k];
-                yv[j] = v - wv[i];
+                const int a = snp[u], sz = snp[u + 1] - a, j1 = top[a];
+                const int jl = j1 + sz - 1, below = Lp[jl + 1] - Lp[jl];
+                const int *rows = Li + Lp[jl];
+                const bool big = par && static_cast<long>(sz) * below > FEMD_CHOL_BLOCK;
+                FEMD_OMP(single)
+                {
+                    for (int i = 0; i < sz; ++i)                            // the triangle
+                    {
+                        const int j = j1 + i;
+                        const double yj = yv[j];
+                        if (yj == 0.0) continue;
+                        for (int k = 0; k < sz - 1 - i; ++k) yv[j + 1 + k] -= Lx[Lp[j] + k] * yj;
+                    }
+                    if (!big)
+                        for (int k = 0; k < below; ++k)
+                        {
+                            double v = yv[rows[k]];
+                            for (int i = 0; i < sz; ++i) v -= Lx[Lp[j1 + i] + (sz - 1 - i) + k] * yv[j1 + i];
+                            yv[rows[k]] = v;
+                        }
+                }
+                if (big)
+                {
+                    FEMD_OMP_FOR
+                    for (int k = 0; k < below; ++k)
+                    {
+                        double v = yv[rows[k]];
+                        for (int i = 0; i < sz; ++i) v -= Lx[Lp[j1 + i] + (sz - 1 - i) + k] * yv[j1 + i];
+                        yv[rows[k]] = v;
+                    }
+                }
             }
+            FEMD_OMP_FOR
+            for (int j = 0; j < n; ++j) yv[j] /= D[j];                     // D
+            // L^T x = y.  The top from its last chunk: each column gathers the rows below the chunk
+            // (one dot product per column, in parallel over the columns), then the triangle; then
+            // the subtrees concurrently, each from its root down (ancestors done, inside or top).
+            for (int u = nsn - 1; u >= 0; --u)
+            {
+                const int a = snp[u], sz = snp[u + 1] - a, j1 = top[a];
+                const int jl = j1 + sz - 1, below = Lp[jl + 1] - Lp[jl];
+                const int *rows = Li + Lp[jl];
+                const bool big = par && static_cast<long>(sz) * below > FEMD_CHOL_BLOCK;
+                if (big)
+                {
+                    FEMD_OMP_FOR
+                    for (int i = 0; i < sz; ++i)
+                    {
+                        const double *col = Lx + Lp[j1 + i] + (sz - 1 - i);
+                        double v = 0.0;
+                        for (int k = 0; k < below; ++k) v += col[k] * yv[rows[k]];
+                        wv[i] = v;
+                    }
+                }
+                FEMD_OMP(single)
+                {
+                    if (!big)
+                        for (int i = 0; i < sz; ++i)
+                        {
+                            const double *col = Lx + Lp[j1 + i] + (sz - 1 - i);
+                            double v = 0.0;
+                            for (int k = 0; k < below; ++k) v += col[k] * yv[rows[k]];
+                            wv[i] = v;
+                        }
+                    for (int i = sz - 1; i >= 0; --i)
+                    {
+                        const int j = j1 + i;
+                        double v = yv[j];
+                        for (int k = 0; k < sz - 1 - i; ++k) v -= Lx[Lp[j] + k] * yv[j + 1 + k];
+                        yv[j] = v - wv[i];
+                    }
+                }
+            }
+            FEMD_OMP(for schedule(dynamic, 1))
+            for (int s = 0; s < nparts; ++s)
+                for (int q = partptr[s + 1] - 1; q >= partptr[s]; --q)
+                {
+                    const int j = nodes[q];
+                    double v = yv[j];
+                    for (int p = Lp[j]; p < Lp[j + 1]; ++p) v -= Lx[p] * yv[Li[p]];
+                    yv[j] = v;
+                }
+            FEMD_OMP_FOR
+            for (int k = 0; k < n; ++k) z[perm[k]] = yv[k];
         }
-        FEMD_OMP(parallel for schedule(dynamic, 1) if(par))
-        for (int s = 0; s < nparts; ++s)
-            for (int q = partptr[s + 1] - 1; q >= partptr[s]; --q)
-            {
-                const int j = nodes[q];
-                double v = yv[j];
-                for (int p = Lp[j]; p < Lp[j + 1]; ++p) v -= Lx[p] * yv[Li[p]];
-                yv[j] = v;
-            }
-        FEMD_OMP_FOR_IF(par)
-        for (int k = 0; k < n; ++k) z[perm[k]] = yv[k];
     }
     std::string name() const override { return "cholesky"; }
 
@@ -245,6 +298,8 @@ public:
     }
     std::string ordering_name() const { return ordering_ == Ordering::AMD ? "amd" : "natural"; }
     bool positive_definite() const { return spd_; }
+    /// @brief Stored entries of A that are exactly zero and were left out of the ordering and the factor.
+    long long dropped_zeros() const { return prune_.ndropped(); }
 
     /// @brief L (unit diagonal not stored) by columns, and D, in the permuted order.
     const std::vector<int> &Lp() const { return Lp_; }
@@ -256,6 +311,8 @@ private:
     bool spd_;
     Ordering ordering_;
     std::shared_ptr<const SparsityPattern> pattern_;
+    ZeroPruning<double> prune_;              // the exact zeros of A left out (prune.hpp)
+    CSRMatrix B_;                            // A without them, when prune_.active
     std::vector<int> perm_, pinv_, parent_, Lp_, Li_;
     std::vector<double> Lx_, D_;
     mutable std::vector<double> work_;
@@ -268,6 +325,29 @@ private:
     std::vector<int> toprow_ptr_, toprow_j_, toprow_p_;   // for top node q: the entries L(t, j) with j in a subtree, (j, index into Lx)
     std::vector<int> topsn_ptr_;             // the top as fundamental supernodes: top_[topsn_ptr_[u] .. topsn_ptr_[u+1]) are consecutive columns with nested structure
     mutable std::vector<double> work2_;
+
+    /// Order, analyse and factor: on A without its exact zeros when some were found.
+    void analyse(const CSRMatrix &A)
+    {
+        if (prune_.active)
+        {
+            auto P = std::make_shared<SparsityPattern>();
+            P->nrows = P->ncols = n_;
+            P->indptr.swap(prune_.Bp);
+            P->indices.swap(prune_.Bi);
+            B_ = CSRMatrix(P, A.symmetric);
+            prune_.gather(A.data.data(), B_.data);
+        }
+        else B_ = CSRMatrix();
+        const CSRMatrix &M = prune_.active ? B_ : A;
+        perm_ = (ordering_ == Ordering::AMD) ? ordering::amd_order(n_, M.indptr(), M.indices())
+                                             : ordering::natural_order(n_);
+        pinv_.assign(static_cast<std::size_t>(n_), 0);
+        for (int k = 0; k < n_; ++k) pinv_[perm_[k]] = k;
+        symbolic(M);
+        numeric(M);
+        partition();
+    }
 
     /// Cut the elimination tree into subtrees of at most 1/64 of the work of the factor each,
     /// biggest first, and list the entries of L that join the subtrees to the top.
@@ -323,7 +403,7 @@ private:
             const int t = top_[q];
             const bool chain = q + 1 < ntop_ && top_[q + 1] == t + 1 && parent_[t] == t + 1 &&
                                Lp_[t + 1] - Lp_[t] == Lp_[t + 2] - Lp_[t + 1] + 1;
-            if (!chain) topsn_ptr_.push_back(q + 1);
+            if (!chain || q + 1 - topsn_ptr_.back() >= FEMD_CHOL_SNCHUNK) topsn_ptr_.push_back(q + 1);
         }
         // the entries L(t, j) with t in the top and j in a part, grouped by t, j increasing within t
         std::vector<int> toppos(static_cast<std::size_t>(n), -1);

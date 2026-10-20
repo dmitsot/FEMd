@@ -34,6 +34,9 @@
 //  (its diagonal last) are kept by columns in the pivoted numbering.  solve() permutes, does
 //  the two triangular sweeps and permutes back.  The input is CSR (FEMd's store); it is
 //  transposed once into CSC at construction and the transposition is kept for refactor().
+//  Stored entries that are exactly zero (the uncoupled blocks of a ProductSpace pattern) are
+//  left out of the ordering and the factors (prune.hpp); a refactor with values that are
+//  nonzero there orders and analyses the matrix again.
 //
 //  Parallel solves.  After the factorization the symmetric pattern of L + U is given its
 //  elimination tree (Liu's algorithm on the rows of L and the columns of U): L(i, j) != 0 or
@@ -57,6 +60,7 @@
 
 #include "femd/sparse/amd.hpp"
 #include "femd/sparse/lu_frontal.hpp"
+#include "femd/sparse/prune.hpp"
 #include "femd/util/omp.hpp"
 #include <algorithm>
 #include <cmath>
@@ -98,65 +102,32 @@ public:
      */
     SparseLU(int n, const int *Ap, const int *Ai, const T *Ax, Ordering ordering = Ordering::Auto, double pivot_tol = 0.1,
              const std::vector<int> &q = std::vector<int>(), Method method = Method::Frontal)
-        : n_(n), tol_(pivot_tol), ordering_(ordering), method_(method)
+        : n_(n), tol_(pivot_tol), ordering_(ordering), method_(method), req_ordering_(ordering), req_q_(ordering == Ordering::Given ? q : std::vector<int>())
     {
         if (n < 0) throw std::invalid_argument("LU: negative dimension");
         if (!(pivot_tol > 0.0 && pivot_tol <= 1.0)) throw std::invalid_argument("LU: pivot_tol must lie in (0, 1]");
-        transpose(Ap, Ai);
-        if (method == Method::Frontal)
-        {
-            // the pattern of A + A^T, and the ordering on it: AMD, natural, or the given one
-            std::vector<int> Sp(static_cast<std::size_t>(n) + 1, 0), Si;
-            Si.reserve(static_cast<std::size_t>(2) * static_cast<std::size_t>(Ap[n]));
-            {
-                std::vector<int> mark(static_cast<std::size_t>(n), -1);
-                for (int i = 0; i < n; ++i)
-                {
-                    for (int p = Ap[i]; p < Ap[i + 1]; ++p) if (Ai[p] != i && mark[Ai[p]] != i) { mark[Ai[p]] = i; Si.push_back(Ai[p]); }
-                    for (int p = Cp_[i]; p < Cp_[i + 1]; ++p) if (Ci_[p] != i && mark[Ci_[p]] != i) { mark[Ci_[p]] = i; Si.push_back(Ci_[p]); }
-                    Sp[i + 1] = static_cast<int>(Si.size());
-                }
-            }
-            std::vector<int> p0;
-            if (ordering == Ordering::Given)
-            {
-                if (static_cast<int>(q.size()) != n) throw std::invalid_argument("LU: the given order must have n entries");
-                p0 = q;
-            }
-            else if (ordering == Ordering::Natural) p0 = ordering::natural_order(n);
-            else { p0 = ordering::amd_order(n, Sp.data(), Si.data()); ordering_ = Ordering::AMD; }
-            frontal_.u = pivot_tol;
-            frontal_.symbolic(n, Sp, Si, p0);
-            numeric_frontal(Ax);
-            partition();
-            return;
-        }
-        if (ordering == Ordering::Given)
-        {
-            if (static_cast<int>(q.size()) != n) throw std::invalid_argument("LU: the given column order must have n entries");
-            q_ = q;
-        }
-        else
-        {
-            if (ordering == Ordering::Auto)
-            {
-                bool full = true;
-                for (int i = 0; i < n && full; ++i)
-                {
-                    full = false;
-                    for (int p = Ap[i]; p < Ap[i + 1]; ++p) if (Ai[p] == i) { full = Ax[p] != T(0); break; }
-                }
-                ordering_ = ordering = full ? Ordering::AMD : Ordering::ATA;
-            }
-            if (ordering == Ordering::ATA) q_ = ata_order(Ap, Ai);
-            else q_ = (ordering == Ordering::AMD) ? ordering::amd_order(n, Ap, Ai) : ordering::natural_order(n);
-        }
-        numeric(Ax);
-        partition();
+        if (ordering == Ordering::Given && static_cast<int>(q.size()) != n)
+            throw std::invalid_argument("LU: the given order must have n entries");
+        prune_.build(n, Ap, Ai, Ax, false);
+        analyse(Ap, Ai, Ax);
     }
 
     /// @brief New values on the same pattern (same ordering, pivots chosen afresh).
-    void refactor(const T *Ax) { if (method_ == Method::Frontal) numeric_frontal(Ax); else numeric(Ax); partition(); }
+    void refactor(const T *Ax)
+    {
+        if (!prune_.fits(Ax))
+        {
+            // nonzero where the analysis dropped exact zeros: order and analyse again
+            const std::vector<int> Ap0 = prune_.Ap0, Ai0 = prune_.Ai0;
+            prune_.build(n_, Ap0.data(), Ai0.data(), Ax, false, true);
+            analyse(Ap0.data(), Ai0.data(), Ax);
+            return;
+        }
+        const T *v = Ax;
+        if (prune_.active) { prune_.gather(Ax, Bx_); v = Bx_.data(); }
+        if (method_ == Method::Frontal) numeric_frontal(v); else numeric(v);
+        partition();
+    }
 
     /// @brief x = A^{-1} b (x and b of length n, may not alias).
     void solve(const T *b, T *x) const
@@ -292,6 +263,8 @@ public:
         return all > 0 ? static_cast<double>(t) / static_cast<double>(all) : 0.0;
     }
     std::string method_name() const { return method_ == Method::Frontal ? "frontal" : "columns"; }
+    /// @brief Stored entries of A that are exactly zero and were left out of the ordering and the factors.
+    long long dropped_zeros() const { return prune_.ndropped(); }
     /// @brief Frontal method: pivots delayed to a parent front, the largest front, the supernodes.
     int delayed_pivots() const { return method_ == Method::Frontal ? frontal_.delayed : 0; }
     int max_front() const { return method_ == Method::Frontal ? frontal_.max_front : 0; }
@@ -307,6 +280,10 @@ private:
     double tol_;
     Ordering ordering_;
     Method method_ = Method::Columns;
+    Ordering req_ordering_;                  // the ordering asked for (Auto resolves at each analysis)
+    std::vector<int> req_q_;                 // the given order, for Ordering::Given
+    ZeroPruning<T> prune_;                   // the exact zeros of A left out (prune.hpp)
+    std::vector<T> Bx_;                      // the kept values, when prune_.active
     frontal::Factor<T> frontal_;
     std::vector<int> Ap_, Ai_;               // the pattern of A by rows (kept for the frontal method)
     std::vector<int> Cp_, Ci_, Cpos_;        // A by columns (CSC) and, for each CSR entry, its place in it
@@ -569,6 +546,70 @@ private:
         frontal_.export_csc(q_, pinv_, Lp_, Li_, Lx_, Up_, Ui_, Ux_);
         offdiag_ = frontal_.offdiag; minpiv_ = frontal_.minpiv; maxpiv_ = frontal_.maxpiv;
         std::vector<typename frontal::Factor<T>::Front>().swap(frontal_.fronts);   // the dense panels are in the CSC factors now
+    }
+
+    // Order, analyse and factor, on A without its exact zeros when some were found (prune.hpp).
+    void analyse(const int *Ap_in, const int *Ai_in, const T *Ax_in)
+    {
+        const int n = n_;
+        Ordering ordering = req_ordering_;
+        ordering_ = ordering;
+        const int *Ap = Ap_in, *Ai = Ai_in;
+        const T *Ax = Ax_in;
+        if (prune_.active)
+        {
+            prune_.gather(Ax_in, Bx_);
+            Ap = prune_.Bp.data(); Ai = prune_.Bi.data(); Ax = Bx_.data();
+        }
+        else std::vector<T>().swap(Bx_);
+        // the pruned pattern is copied by transpose(); it is not needed after the analysis
+        auto done = [&]() { std::vector<int>().swap(prune_.Bp); std::vector<int>().swap(prune_.Bi); };
+        transpose(Ap, Ai);
+        if (method_ == Method::Frontal)
+        {
+            // the pattern of A + A^T, and the ordering on it: AMD, natural, or the given one
+            std::vector<int> Sp(static_cast<std::size_t>(n) + 1, 0), Si;
+            Si.reserve(static_cast<std::size_t>(2) * static_cast<std::size_t>(Ap[n]));
+            {
+                std::vector<int> mark(static_cast<std::size_t>(n), -1);
+                for (int i = 0; i < n; ++i)
+                {
+                    for (int p = Ap[i]; p < Ap[i + 1]; ++p) if (Ai[p] != i && mark[Ai[p]] != i) { mark[Ai[p]] = i; Si.push_back(Ai[p]); }
+                    for (int p = Cp_[i]; p < Cp_[i + 1]; ++p) if (Ci_[p] != i && mark[Ci_[p]] != i) { mark[Ci_[p]] = i; Si.push_back(Ci_[p]); }
+                    Sp[i + 1] = static_cast<int>(Si.size());
+                }
+            }
+            std::vector<int> p0;
+            if (ordering == Ordering::Given) p0 = req_q_;
+            else if (ordering == Ordering::Natural) p0 = ordering::natural_order(n);
+            else { p0 = ordering::amd_order(n, Sp.data(), Si.data()); ordering_ = Ordering::AMD; }
+            frontal_ = frontal::Factor<T>();
+            frontal_.u = tol_;
+            frontal_.symbolic(n, Sp, Si, p0);
+            numeric_frontal(Ax);
+            partition();
+            done();
+            return;
+        }
+        if (ordering == Ordering::Given) q_ = req_q_;
+        else
+        {
+            if (ordering == Ordering::Auto)
+            {
+                bool full = true;
+                for (int i = 0; i < n && full; ++i)
+                {
+                    full = false;
+                    for (int p = Ap[i]; p < Ap[i + 1]; ++p) if (Ai[p] == i) { full = Ax[p] != T(0); break; }
+                }
+                ordering_ = ordering = full ? Ordering::AMD : Ordering::ATA;
+            }
+            if (ordering == Ordering::ATA) q_ = ata_order(Ap, Ai);
+            else q_ = (ordering == Ordering::AMD) ? ordering::amd_order(n, Ap, Ai) : ordering::natural_order(n);
+        }
+        numeric(Ax);
+        partition();
+        done();
     }
 
     // the plain sweeps, used when the factors do not lie in the elimination tree

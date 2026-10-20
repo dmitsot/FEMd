@@ -22,7 +22,9 @@
 //  that is not singular, at the price of some extra fill where pivots are delayed.
 //
 //  The matrix must hold both triangles with a symmetric pattern (FEMd assembles full
-//  symmetric patterns).  D is block diagonal with 1x1 and 2x2 blocks, which also gives the
+//  symmetric patterns).  Stored entries that are exactly zero (the uncoupled blocks of a
+//  ProductSpace pattern) are left out of the ordering and the fronts (prune.hpp); a
+//  refactor with values that are nonzero there analyses the matrix again.  D is block diagonal with 1x1 and 2x2 blocks, which also gives the
 //  inertia (the numbers of positive, negative and zero eigenvalues, by Sylvester's law).
 //
 #ifndef FEMD_SPARSE_LDLT_HPP
@@ -31,6 +33,7 @@
 #include "femd/sparse/amd.hpp"
 #include "femd/sparse/csr.hpp"
 #include "femd/sparse/precond.hpp"
+#include "femd/sparse/prune.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -58,8 +61,8 @@ public:
         if (!(u > 0.0 && u <= 0.5)) throw std::invalid_argument("LDL^T: the pivot threshold u must lie in (0, 0.5]");
         n_ = A.nrows();
         pattern_ = A.pattern;
-        symbolic(A);
-        numeric(A);
+        prune_.build(n_, A.indptr(), A.indices(), A.data.data(), true);
+        analyse(A);
     }
 
     /// @brief New values on the same pattern: the numeric phase only (pivots are chosen afresh).
@@ -68,7 +71,15 @@ public:
         if (A.nrows() != n_ || A.ncols() != n_ || A.nnz() != pattern_->nnz() ||
             (A.pattern != pattern_ && (A.pattern->indptr != pattern_->indptr || A.pattern->indices != pattern_->indices)))
             throw std::invalid_argument("LDL^T::refactor: the matrix has a different pattern");
-        numeric(A);
+        if (!prune_.fits(A.data.data()))
+        {
+            // nonzero where the analysis dropped exact zeros: order and analyse again
+            prune_.build(n_, A.indptr(), A.indices(), A.data.data(), true, true);
+            analyse(A);
+            return;
+        }
+        if (prune_.active) { prune_.gather(A.data.data(), B_.data); numeric(B_); }
+        else numeric(A);
     }
 
     /// @brief z = A^{-1} r.
@@ -165,6 +176,8 @@ public:
     int max_front() const { return max_front_; }
     double threshold() const { return u_; }
     std::string ordering_name() const { return ordering_ == Ordering::AMD ? "amd" : "natural"; }
+    /// @brief Stored entries of A that are exactly zero and were left out of the ordering and the factor.
+    long long dropped_zeros() const { return prune_.ndropped(); }
     const std::vector<int> &permutation() const { return perm_; }
     /// @brief Smallest |eigenvalue| of a pivot block, over all blocks.
     double min_pivot() const { return min_piv_; }
@@ -181,6 +194,8 @@ private:
     Ordering ordering_;
     double u_;
     std::shared_ptr<const SparsityPattern> pattern_;
+    ZeroPruning<double> prune_;              // the exact zeros of A left out (prune.hpp)
+    CSRMatrix B_;                            // A without them, when prune_.active
     std::vector<int> perm_, pinv_, parent_;
     std::vector<int> sn_first_, sn_parent_;            // supernode s has columns sn_first_[s] .. sn_first_[s+1]-1
     std::vector<std::vector<int>> sn_rows_, sn_children_;
@@ -189,6 +204,24 @@ private:
     int delayed_ = 0, n2x2_ = 0, max_front_ = 0;
     double min_piv_ = 0.0;
     mutable std::vector<double> work_;
+
+    /// Analyse and factor: on A without its exact zeros when some were found.
+    void analyse(const CSRMatrix &A)
+    {
+        if (prune_.active)
+        {
+            auto P = std::make_shared<SparsityPattern>();
+            P->nrows = P->ncols = n_;
+            P->indptr.swap(prune_.Bp);
+            P->indices.swap(prune_.Bi);
+            B_ = CSRMatrix(P, A.symmetric);
+            prune_.gather(A.data.data(), B_.data);
+        }
+        else B_ = CSRMatrix();
+        const CSRMatrix &M = prune_.active ? B_ : A;
+        symbolic(M);
+        numeric(M);
+    }
 
     // ---- symbolic -----------------------------------------------------------------------
     static std::vector<int> etree_of(int n, const int *Ap, const int *Ai, const std::vector<int> &p,
