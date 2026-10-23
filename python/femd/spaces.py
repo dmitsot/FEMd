@@ -31,9 +31,11 @@ def _point_values(f, pts, what: str = "interpolate") -> np.ndarray:
 
     f is a callable f(x) (vectorized), an expression in fd.x, numbers, Constants and known
     Functions (of any 1D space, evaluated at the points, derivatives D(u, k) included), a number,
-    or an array of values at the points."""
+    an array of values at the points, or None (zero)."""
     from .forms import Expr, Argument, collect_arguments, evaluate
     n = pts.shape[0]
+    if f is None:
+        return np.zeros(n)
     if isinstance(f, Expr) and not isinstance(f, Function):
         if any(isinstance(a, Argument) and a.kind != "func" for a in collect_arguments(f, [])):
             raise TypeError(f"{what}: an expression may contain fd.x, numbers, Constants and Functions, "
@@ -306,8 +308,8 @@ class _SpaceMixin:
         built-in boundary conditions, so f should too for the result to be meaningful.
 
         f is a callable f(x), an expression in fd.x, numbers, Constants and Functions (such as
-        fd.sin(fd.pi*fd.x) or u**2 for a Function u of any 1D space), a number, or an array of
-        values at dof_coordinates()."""
+        fd.sin(fd.pi*fd.x) or u**2 for a Function u of any 1D space), a number, an array of
+        values at dof_coordinates(), or None (zero)."""
         pts = self.dof_coordinates()
         vals = _point_values(f, pts)
         B = self._basis_csr(pts)
@@ -629,8 +631,8 @@ class DGSpace(_SpaceMixin, _C.DGSpace):
     def interpolate(self, f) -> np.ndarray:
         """Coefficients of the element-wise interpolant of f: at the Gauss points of each element
         (Legendre) or at its Gauss-Lobatto nodes (Lobatto, where the coefficients are the values).
-        f is a callable, an expression in fd.x, numbers, Constants and Functions, a number, or an
-        array of values at dof_coordinates().
+        f is a callable, an expression in fd.x, numbers, Constants and Functions, a number, an
+        array of values at dof_coordinates(), or None (zero).
 
         Lobatto samples the element ends, so at a vertex where f jumps both elements receive the
         one value f has there.  Legendre samples inside the elements and reproduces such a jump."""

@@ -46,7 +46,7 @@ On a `ProductSpace` (1D or 2D) the output is a `ProductFunction`, the same as `f
 | `derivative(x, k=1)` | as `u(x, k)` | array | The same, with `k` defaulting to 1. |
 | `at_quad(cache, k=0)` | `cache` a `QuadratureCache` of `V`. `k` int. | array, length `nelem*nq` | Values at the quadrature nodes, `[e*nq + q]`. |
 | `project(f, npts=None)` | `f` a callable, a number, an expression in `fd.x`, values at the cache nodes, or a `Function` of another space. `npts` int, as in `V.project`. | `self` | Sets the coefficients to the $L^2$ projection. |
-| `interpolate(f)` | `f` a callable, a number, an expression in `fd.x`, numbers, Constants and Functions, or values at `V.dof_coordinates()`. | `self` | Sets the coefficients to the interpolant. |
+| `interpolate(f)` | `f` a callable, a number, an expression in `fd.x` (and `fd.y` on a 2D mesh), numbers, Constants and Functions, values at `V.dof_coordinates()`, or `None` (zero). | `self` | Sets the coefficients to the interpolant. |
 | `project_to(W, check=True)` | `W` the target space. `check` bool, warn when `u` violates a condition built into `W`. | new `Function` of `W`, same name | Exact $L^2$ projection ([manual, Section 5.4](../manual.md#54-moving-a-function-to-another-space)). Builds a new operator on every call. |
 | `interpolate_to(W, check=True)` | as `project_to` | new `Function` of `W` | Interpolation at `W.dof_coordinates()`. |
 | `assign(other)` | `other` a `Function` of `V`, an array of length `V.dim`, or a linear combination such as `u0 + 0.5*dt*k1`. | `self` | Overwrites the coefficients. A nonlinear expression raises `ValueError`. |

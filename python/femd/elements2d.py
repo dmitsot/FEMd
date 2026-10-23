@@ -31,7 +31,7 @@ from __future__ import annotations
 import numpy as np
 from . import _femd as _C
 from .forms import VectorElementFunction, Function
-from .spaces2d import _Lagrange2D, _markers, _points, _arr, _NODES
+from .spaces2d import _Lagrange2D, _markers, _points, _arr, _NODES, _PointContext2D, _expr_values
 from ._util import _real_linear
 
 __all__ = ["RTSpace", "N1curlSpace", "DGSpace2D"]
@@ -264,9 +264,21 @@ class _VectorElement2D:
     def interpolate(self, f) -> np.ndarray:
         """The canonical interpolant of a vector field f(x, y) -> (fx, fy) (or a pair of callables /
         numbers): its edge and interior moments.  Exact on RT_k (N1curl_k), and it commutes with
-        div (curl): div of the interpolant is the L^2 projection of div f onto DG_{k-1}."""
+        div (curl): div of the interpolant is the L^2 projection of div f onto DG_{k-1}.  f may also be
+        a vector expression (fd.as_vector([...]) in fd.x, fd.y, numbers, Constants and Functions, a
+        VectorFunction, a Function of an RT or N1curl space), evaluated at the points by point location,
+        or None (zero)."""
+        from .forms import ListTensor
+        if f is None:
+            return np.zeros(self.dim)
         P = np.asarray(self.interpolation_points())
-        F = _vector_values(f, P[:, 0], P[:, 1])
+        if isinstance(f, ListTensor):
+            if f.rank != 1 or f.shape[0] != 2:
+                raise ValueError("interpolate: a vector expression of 2 components")
+            ctx = _PointContext2D(P)
+            F = np.column_stack([_expr_values(f[k], ctx, "interpolate") for k in range(2)])
+        else:
+            F = _vector_values(f, P[:, 0], P[:, 1])
         raw = np.asarray(self.interpolate_raw(np.ascontiguousarray(F)))
         return self.restrict(raw) if self.n_constraints else raw
 

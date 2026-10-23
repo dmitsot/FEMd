@@ -30,9 +30,10 @@
 //  less (half, on a convection-diffusion grid).  The default, Ordering::Auto, takes AMD when
 //  every diagonal entry is present and nonzero and ATA otherwise (a saddle point).
 //
-//  L (unit lower, its diagonal stored first in each column, the other rows sorted) and U
-//  (its diagonal last) are kept by columns in the pivoted numbering.  solve() permutes, does
-//  the two triangular sweeps and permutes back.  The input is CSR (FEMd's store); it is
+//  L (unit lower, its diagonal stored first in each column, the other rows sorted) is kept by
+//  columns and U by rows (its diagonal first, the other columns sorted), in the pivoted
+//  numbering: the frontal method produces them so, a front holding whole columns of L and
+//  whole rows of U.  solve() permutes, does the two triangular sweeps and permutes back.  The input is CSR (FEMd's store); it is
 //  transposed once into CSC at construction and the transposition is kept for refactor().
 //  Stored entries that are exactly zero (the uncoupled blocks of a ProductSpace pattern) are
 //  left out of the ordering and the factors (prune.hpp); a refactor with values that are
@@ -41,11 +42,14 @@
 //  Parallel solves.  After the factorization the symmetric pattern of L + U is given its
 //  elimination tree (Liu's algorithm on the rows of L and the columns of U): L(i, j) != 0 or
 //  U(j, i) != 0 only when i is an ancestor of j, whatever pivots were taken, so the tree holds
-//  the dependencies of both sweeps.  The tree is cut into independent subtrees of about 1/64
-//  of the work each (partition()), the nodes above them are the top.  The subtrees run
-//  concurrently, column by column: L y = b scatters each column into the rows below the root
-//  of its subtree, U z = y scatters each column into its subtree after gathering the row's
-//  entries in the top columns.  The top is done row by row (gathers).  Its nodes form chains
+//  the dependencies of both sweeps.  The frontal method gives the tree of its fronts (a chain
+//  through the steps of each front, joined to the first step that eliminates one of the front's
+//  remaining variables), the column method Liu's algorithm; either way the containment is
+//  verified.  The tree is cut into independent subtrees of about 1/64 of the work each
+//  (partition()), the nodes above them are the top.  The subtrees run concurrently: L y = b
+//  scatters each column into the rows below the root of its subtree, U z = y gathers each row
+//  (its columns are ancestors: in the top, done first, or later in the subtree).  The top is
+//  done row by row (gathers).  Its nodes form chains
 //  (a node with a single child in the top continues the child's chain), the chains are
 //  scheduled by their height in the tree, and each is cut into blocks of rows; a step of the
 //  schedule takes one block of every chain at that height: first every row gathers its
@@ -63,6 +67,7 @@
 #include "femd/sparse/prune.hpp"
 #include "femd/util/omp.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <stdexcept>
@@ -125,8 +130,11 @@ public:
         }
         const T *v = Ax;
         if (prune_.active) { prune_.gather(Ax, Bx_); v = Bx_.data(); }
-        if (method_ == Method::Frontal) numeric_frontal(v); else numeric(v);
+        tm_ = Timings();
+        if (method_ == Method::Frontal) numeric_frontal(v); else { const double t0 = now(); numeric(v); tm_.numeric = now() - t0; }
+        const double t1 = now();
         partition();
+        tm_.partition = now() - t1;
     }
 
     /// @brief x = A^{-1} b (x and b of length n, may not alias).
@@ -196,9 +204,9 @@ public:
                 FEMD_OMP_FOR
                 for (int r = step_ptr_[st]; r < step_ptr_[st + 1]; ++r)
                 {
-                    const int c = step_c_[r], q = gnodes[c];
+                    const int c = step_c_[r], q = gnodes[c], i = top[q];
                     T v = T(0);
-                    for (int p = urow_blk_[q]; p < urow_ptr_[q + 1]; ++p) v += urow_x_[p] * yv[urow_k_[p]];
+                    for (int p = urow_blk_[q]; p < Up[i + 1]; ++p) v += Ux[p] * yv[Ui[p]];
                     wv[c] = v;
                 }
                 FEMD_OMP(for schedule(dynamic, 1))
@@ -207,24 +215,20 @@ public:
                     {
                         const int c = step_c_[r], q = gnodes[c], i = top[q];
                         T v = yv[i] - wv[c];
-                        for (int p = urow_ptr_[q]; p < urow_blk_[q]; ++p) v -= urow_x_[p] * yv[urow_k_[p]];
-                        yv[i] = v / Ux[Up[i + 1] - 1];
+                        for (int p = Up[i] + 1; p < urow_blk_[q]; ++p) v -= Ux[p] * yv[Ui[p]];
+                        yv[i] = v / Ux[Up[i]];
                     }
             }
-            // then the subtrees concurrently, each node first gathering the entries of its row of U
-            // in the top columns, then applying its column, which stays inside the subtree
+            // then the subtrees concurrently, each node gathering its row of U: the columns are
+            // ancestors, in the top (final by now) or later in the subtree (done before it)
             FEMD_OMP(for schedule(dynamic, 1))
             for (int s = 0; s < nparts; ++s)
                 for (int q = partptr[s + 1] - 1; q >= partptr[s]; --q)
                 {
                     const int i = nodes[q];
                     T v = yv[i];
-                    for (int p = uprow_ptr_[q]; p < uprow_ptr_[q + 1]; ++p) v -= uprow_x_[p] * yv[uprow_i_[p]];
-                    const int pd = Up[i + 1] - 1;
-                    v /= Ux[pd];
-                    yv[i] = v;
-                    if (v == T(0)) continue;
-                    for (int p = Up[i]; p < pd; ++p) yv[Ui[p]] -= Ux[p] * v;
+                    for (int p = Up[i] + 1; p < Up[i + 1]; ++p) v -= Ux[p] * yv[Ui[p]];
+                    yv[i] = v / Ux[Up[i]];
                 }
             FEMD_OMP_FOR
             for (int k = 0; k < n; ++k) x[q_[k]] = yv[k];                     // undo the column order
@@ -258,7 +262,9 @@ public:
     double top_fraction() const
     {
         long long t = 0;
-        for (int q = 0; q < ntop_; ++q) t += (Lp_[top_[q] + 1] - Lp_[top_[q]]) + (Up_[top_[q] + 1] - Up_[top_[q]]);
+        for (int q = 0; q < ntop_; ++q) t += Lp_[top_[q] + 1] - Lp_[top_[q]];
+        for (int i = 0; i < n_ && !part_.empty(); ++i)
+            for (int p = Up_[i]; p < Up_[i + 1]; ++p) t += part_[Ui_[p]] < 0;
         const long long all = nnz_L() + nnz_U();
         return all > 0 ? static_cast<double>(t) / static_cast<double>(all) : 0.0;
     }
@@ -275,7 +281,16 @@ public:
     }
     double pivot_tol() const { return tol_; }
 
+    /// @brief Seconds spent in the phases of the last analysis or refactorization: ordering (with the
+    /// pattern of A + A^T), symbolic (supernodes and amalgamation), numeric, export (the fronts to L and
+    /// U) and partition (the cut of the tree for the solves).  Ordering and symbolic are 0 on a refactor;
+    /// the column method has no symbolic or export phase.
+    struct Timings { double ordering = 0, symbolic = 0, numeric = 0, export_ = 0, partition = 0; };
+    const Timings &timings() const { return tm_; }
+
 private:
+    Timings tm_;
+    static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     int n_;
     double tol_;
     Ordering ordering_;
@@ -306,9 +321,8 @@ private:
     std::vector<int> step_ptr_, step_c_;     // the steps of the top schedule: positions (in grpnodes_) of the rows of step s, by chain
     std::vector<int> sseg_, segb_;           // the blocks of step s: segments [sseg_[s], sseg_[s+1]) of step_c_, segment m = [segb_[m], segb_[m+1])
     std::vector<int> lrow_ptr_, lrow_j_, lrow_blk_;   // for top node q: the entries L(t, j) by rows, j increasing; from lrow_blk_ on, j lies in the block of t
-    std::vector<int> urow_ptr_, urow_k_, urow_blk_;   // for top node q: the entries U(i, k) with k in the top, k increasing; from urow_blk_ on, k lies beyond the block of i
-    std::vector<int> uprow_ptr_, uprow_i_;             // for subtree node q (position in nodes_): the entries U(j, i) with i in the top
-    std::vector<T> lrow_x_, urow_x_, uprow_x_;         // their values, copied from L and U so that the gathers read them in order
+    std::vector<int> urow_blk_;                        // for top node q, row i = top_[q] of U: from urow_blk_[q] on, its columns lie beyond the block of i
+    std::vector<T> lrow_x_;                            // the values of the rows of L, copied so that the gathers read them in order
 
     void transpose(const int *Ap, const int *Ai)
     {
@@ -357,17 +371,19 @@ private:
 
     // The elimination tree of the symmetric pattern of L + U (Liu's algorithm with path
     // compression): node k joins, for every i < k with L(k, i) != 0 or U(i, k) != 0, the path
-    // from i upwards.  The rows of L come from a transposition of its pattern.
+    // from i upwards.  Those i, for each k, come from the columns of L and the rows of U.
     void factor_etree()
     {
         const int n = n_;
         parent_.assign(static_cast<std::size_t>(n), -1);
-        std::vector<int> Rp(static_cast<std::size_t>(n) + 1, 0), Ri(static_cast<std::size_t>(Lp_[n]));
+        std::vector<int> Rp(static_cast<std::size_t>(n) + 1, 0), Ri(static_cast<std::size_t>(Lp_[n] + Up_[n]));
         for (int j = 0; j < n; ++j) for (int p = Lp_[j] + 1; p < Lp_[j + 1]; ++p) ++Rp[Li_[p] + 1];
+        for (int i = 0; i < n; ++i) for (int p = Up_[i] + 1; p < Up_[i + 1]; ++p) ++Rp[Ui_[p] + 1];
         for (int k = 0; k < n; ++k) Rp[k + 1] += Rp[k];
         {
             std::vector<int> next(Rp.begin(), Rp.end() - 1);
             for (int j = 0; j < n; ++j) for (int p = Lp_[j] + 1; p < Lp_[j + 1]; ++p) Ri[next[Li_[p]]++] = j;
+            for (int i = 0; i < n; ++i) for (int p = Up_[i] + 1; p < Up_[i + 1]; ++p) Ri[next[Ui_[p]]++] = i;
         }
         std::vector<int> ancestor(static_cast<std::size_t>(n), -1);
         auto join = [&](int i, int k) {
@@ -380,10 +396,23 @@ private:
             }
         };
         for (int k = 0; k < n; ++k)
-        {
             for (int p = Rp[k]; p < Rp[k + 1]; ++p) join(Ri[p], k);
-            for (int p = Up_[k]; p < Up_[k + 1] - 1; ++p) join(Ui_[p], k);
-        }
+    }
+
+    // U by columns (its diagonal last), as the column method builds it, to U by rows (diagonal first,
+    // the other columns increasing)
+    void columns_to_rows()
+    {
+        const int n = n_;
+        std::vector<int> Rp(static_cast<std::size_t>(n) + 1, 0), Ri(static_cast<std::size_t>(Up_[n]));
+        std::vector<T> Rx(Ri.size());
+        for (int k = 0; k < n; ++k) for (int p = Up_[k]; p < Up_[k + 1]; ++p) ++Rp[Ui_[p] + 1];
+        for (int i = 0; i < n; ++i) Rp[i + 1] += Rp[i];
+        std::vector<int> next(Rp.begin(), Rp.end() - 1);
+        for (int i = 0; i < n; ++i) { Ri[next[i]] = i; Rx[next[i]++] = Ux_[Up_[i + 1] - 1]; }      // the diagonal first
+        for (int k = 0; k < n; ++k)
+            for (int p = Up_[k]; p < Up_[k + 1] - 1; ++p) { const int i = Ui_[p]; Ri[next[i]] = k; Rx[next[i]++] = Ux_[p]; }
+        Up_.swap(Rp); Ui_.swap(Ri); Ux_.swap(Rx);
     }
 
     static void grow(std::vector<int> &I, std::vector<T> &X, std::size_t need)
@@ -535,6 +564,8 @@ private:
             for (int k = 0; k < len; ++k) { ti[k] = Li_[order[k]]; tx[k] = Lx_[order[k]]; }
             for (int k = 0; k < len; ++k) { Li_[p0 + k] = ti[k]; Lx_[p0 + k] = tx[k]; }
         }
+        columns_to_rows();
+        factor_etree();
     }
 
     void numeric_frontal(const T *Ax)
@@ -542,8 +573,11 @@ private:
         const int n = n_;
         std::vector<T> Cx(static_cast<std::size_t>(Cp_[n]));
         for (int p = 0; p < Cp_[n]; ++p) Cx[Cpos_[p]] = Ax[p];
+        const double t0 = now();
         frontal_.numeric(Ap_.data(), Ai_.data(), Ax, Cp_.data(), Ci_.data(), Cx.data());
-        frontal_.export_csc(q_, pinv_, Lp_, Li_, Lx_, Up_, Ui_, Ux_);
+        const double t1 = now();
+        frontal_.export_factors(q_, pinv_, Lp_, Li_, Lx_, Up_, Ui_, Ux_, parent_);
+        tm_.numeric = t1 - t0; tm_.export_ = now() - t1;
         offdiag_ = frontal_.offdiag; minpiv_ = frontal_.minpiv; maxpiv_ = frontal_.maxpiv;
         std::vector<typename frontal::Factor<T>::Front>().swap(frontal_.fronts);   // the dense panels are in the CSC factors now
     }
@@ -556,6 +590,8 @@ private:
         ordering_ = ordering;
         const int *Ap = Ap_in, *Ai = Ai_in;
         const T *Ax = Ax_in;
+        tm_ = Timings();
+        const double ta = now();
         if (prune_.active)
         {
             prune_.gather(Ax_in, Bx_);
@@ -583,11 +619,16 @@ private:
             if (ordering == Ordering::Given) p0 = req_q_;
             else if (ordering == Ordering::Natural) p0 = ordering::natural_order(n);
             else { p0 = ordering::amd_order(n, Sp.data(), Si.data()); ordering_ = Ordering::AMD; }
+            const double tb = now();
             frontal_ = frontal::Factor<T>();
             frontal_.u = tol_;
             frontal_.symbolic(n, Sp, Si, p0);
+            const double tc = now();
+            tm_.ordering = tb - ta; tm_.symbolic = tc - tb;
             numeric_frontal(Ax);
+            const double td = now();
             partition();
+            tm_.partition = now() - td;
             done();
             return;
         }
@@ -607,8 +648,13 @@ private:
             if (ordering == Ordering::ATA) q_ = ata_order(Ap, Ai);
             else q_ = (ordering == Ordering::AMD) ? ordering::amd_order(n, Ap, Ai) : ordering::natural_order(n);
         }
+        const double tb = now();
+        tm_.ordering = tb - ta;
         numeric(Ax);
+        const double tc = now();
+        tm_.numeric = tc - tb;
         partition();
+        tm_.partition = now() - tc;
         done();
     }
 
@@ -627,33 +673,20 @@ private:
             if (yj == T(0)) continue;
             for (int p = Lp[j] + 1; p < Lp[j + 1]; ++p) y[Li[p]] -= Lx[p] * yj;
         }
-        for (int j = n - 1; j >= 0; --j)
+        for (int i = n - 1; i >= 0; --i)
         {
-            const int pd = Up[j + 1] - 1;
-            y[j] /= Ux[pd];
-            const T yj = y[j];
-            if (yj == T(0)) continue;
-            for (int p = Up[j]; p < pd; ++p) y[Ui[p]] -= Ux[p] * yj;
+            T v = y[i];
+            for (int p = Up[i] + 1; p < Up[i + 1]; ++p) v -= Ux[p] * y[Ui[p]];
+            y[i] = v / Ux[Up[i]];
         }
         for (int k = 0; k < n; ++k) x[q_[k]] = y[k];
     }
 
-    /// Build the elimination tree of L + U, check that the factors lie in it, cut the tree into
-    /// subtrees of at most 1/64 of the work of the factors each, biggest first, group the top into
-    /// chains by height cut into blocks, and list the rows of L and U that the top and the subtrees gather.
-    void partition()
+    // Whether L(i, j) != 0 only for i an ancestor of j and U(i, k) != 0 only for k an ancestor of i
+    // in parent_ (postorder: i is an ancestor of j, or j itself, iff first[i] <= post[j] <= post[i]).
+    bool contained() const
     {
         const int n = n_;
-        factor_etree();
-        nparts_ = ntop_ = 0;
-        tree_ok_ = true;
-        part_.assign(static_cast<std::size_t>(n), -1);
-        nodes_.clear(); root_.clear(); top_.clear(); grpnodes_.clear(); step_c_.clear();
-        lrow_j_.clear(); lrow_x_.clear(); lrow_blk_.clear(); urow_k_.clear(); urow_x_.clear(); urow_blk_.clear(); uprow_i_.clear(); uprow_x_.clear();
-        partptr_.assign(1, 0); grpptr_.assign(1, 0); step_ptr_.assign(1, 0); sseg_.assign(1, 0); segb_.assign(1, 0); lrow_ptr_.assign(1, 0); urow_ptr_.assign(1, 0); uprow_ptr_.assign(1, 0);
-        nlevels_ = 0;
-        if (n == 0) return;
-        // postorder of the tree: i is an ancestor of j (or j itself) iff first[i] <= post[j] <= post[i]
         std::vector<int> head(static_cast<std::size_t>(n), -1), next(static_cast<std::size_t>(n), -1);
         for (int j = n - 1; j >= 0; --j) if (parent_[j] >= 0) { next[j] = head[parent_[j]]; head[parent_[j]] = j; }
         std::vector<int> post(static_cast<std::size_t>(n)), first(static_cast<std::size_t>(n)), stack;
@@ -672,20 +705,46 @@ private:
                 else { post[j] = count++; stack.pop_back(); }
             }
         }
-        for (int j = 0; j < n && tree_ok_; ++j)
+        if (count != n) return false;                       // not a forest
+        int bad = 0;
+        FEMD_OMP(parallel for reduction(+ : bad) schedule(static) if (n > 4 * FEMD_OMP_THRESHOLD))
+        for (int j = 0; j < n; ++j)
         {
             for (int p = Lp_[j] + 1; p < Lp_[j + 1]; ++p)                  // L(i, j): i an ancestor of j
             {
                 const int i = Li_[p];
-                if (!(first[i] <= post[j] && post[j] <= post[i])) { tree_ok_ = false; break; }
+                if (!(first[i] <= post[j] && post[j] <= post[i])) ++bad;
             }
-            for (int p = Up_[j]; p < Up_[j + 1] - 1; ++p)                  // U(i, j): j an ancestor of i
+            for (int p = Up_[j] + 1; p < Up_[j + 1]; ++p)                  // U(j, k): k an ancestor of j
             {
-                const int i = Ui_[p];
-                if (!(first[j] <= post[i] && post[i] <= post[j])) { tree_ok_ = false; break; }
+                const int k = Ui_[p];
+                if (!(first[k] <= post[j] && post[j] <= post[k])) ++bad;
             }
         }
-        if (!tree_ok_) return;
+        return bad == 0;
+    }
+
+    /// Check that the factors lie in the elimination tree parent_ (else take Liu's tree of L + U, and
+    /// failing that the plain sweeps), cut the tree into subtrees of at most 1/64 of the work of the
+    /// factors each, biggest first, group the top into chains by height cut into blocks, and list
+    /// the rows of L that the top gathers.
+    void partition()
+    {
+        const int n = n_;
+        nparts_ = ntop_ = 0;
+        tree_ok_ = true;
+        part_.assign(static_cast<std::size_t>(n), -1);
+        nodes_.clear(); root_.clear(); top_.clear(); grpnodes_.clear(); step_c_.clear();
+        lrow_j_.clear(); lrow_x_.clear(); lrow_blk_.clear(); urow_blk_.clear();
+        partptr_.assign(1, 0); grpptr_.assign(1, 0); step_ptr_.assign(1, 0); sseg_.assign(1, 0); segb_.assign(1, 0); lrow_ptr_.assign(1, 0);
+        nlevels_ = 0;
+        if (n == 0) return;
+        if (!contained())
+        {
+            factor_etree();                                  // the given tree does not hold the factors: Liu's
+            if (!contained()) { tree_ok_ = false; return; }
+        }
+        part_.assign(static_cast<std::size_t>(n), -1);
         // the work of a node is its column of L and U; of a subtree, the sum (children before parents)
         std::vector<double> W(static_cast<std::size_t>(n));
         for (int j = 0; j < n; ++j) W[j] = static_cast<double>(Lp_[j + 1] - Lp_[j] + Up_[j + 1] - Up_[j]);
@@ -786,23 +845,51 @@ private:
                 sseg_.push_back(static_cast<int>(segb_.size()) - 1);
             }
         }
-        // the rows of L of the top nodes, j increasing, split where j enters the block of the row
-        lrow_ptr_.assign(static_cast<std::size_t>(ntop_) + 1, 0);
-        for (int j = 0; j < n; ++j)
-            for (int p = Lp_[j] + 1; p < Lp_[j + 1]; ++p) if (part_[Li_[p]] < 0) ++lrow_ptr_[toppos[Li_[p]] + 1];
-        for (int q = 0; q < ntop_; ++q) lrow_ptr_[q + 1] += lrow_ptr_[q];
-        lrow_j_.resize(static_cast<std::size_t>(lrow_ptr_[ntop_]));
-        lrow_x_.resize(lrow_j_.size());
+        // the rows of L of the top nodes, j increasing, split where j enters the block of the row: a
+        // transposition in parallel over NCH chunks of columns of about equal size (the counts of each
+        // chunk, then each chunk fills its own places; the result does not depend on the chunks)
         {
-            std::vector<int> pos(lrow_ptr_.begin(), lrow_ptr_.end() - 1);
-            for (int j = 0; j < n; ++j)
-                for (int p = Lp_[j] + 1; p < Lp_[j + 1]; ++p)
-                {
-                    const int t = Li_[p];
-                    if (part_[t] >= 0) continue;
-                    const int d = pos[toppos[t]]++;
-                    lrow_j_[d] = j; lrow_x_[d] = Lx_[p];
-                }
+            constexpr int NCH = 16;
+            const long long tot = Lp_[n];
+            std::vector<int> cb(NCH + 1, 0);
+            for (int c = 1, j = 0; c < NCH; ++c)
+            {
+                while (j < n && Lp_[j] < tot * c / NCH) ++j;
+                cb[c] = j;
+            }
+            cb[NCH] = n;
+            std::vector<int> cnt(static_cast<std::size_t>(NCH) * (ntop_ + 1), 0);
+            const bool par = n > 2 * FEMD_OMP_THRESHOLD;
+            (void)par;
+            FEMD_OMP(parallel for schedule(dynamic, 1) if (par))
+            for (int c = 0; c < NCH; ++c)
+            {
+                int *cc = &cnt[static_cast<std::size_t>(c) * (ntop_ + 1)];
+                for (int j = cb[c]; j < cb[c + 1]; ++j)
+                    for (int p = Lp_[j] + 1; p < Lp_[j + 1]; ++p) { const int q = toppos[Li_[p]]; if (q >= 0) ++cc[q]; }
+            }
+            lrow_ptr_.assign(static_cast<std::size_t>(ntop_) + 1, 0);
+            for (int q = 0; q < ntop_; ++q)                  // chunk c of row q starts after the chunks before it
+            {
+                int at = lrow_ptr_[q];
+                for (int c = 0; c < NCH; ++c) { int &v = cnt[static_cast<std::size_t>(c) * (ntop_ + 1) + q]; const int k = v; v = at; at += k; }
+                lrow_ptr_[q + 1] = at;
+            }
+            lrow_j_.resize(static_cast<std::size_t>(lrow_ptr_[ntop_]));
+            lrow_x_.resize(lrow_j_.size());
+            FEMD_OMP(parallel for schedule(dynamic, 1) if (par))
+            for (int c = 0; c < NCH; ++c)
+            {
+                int *pos = &cnt[static_cast<std::size_t>(c) * (ntop_ + 1)];
+                for (int j = cb[c]; j < cb[c + 1]; ++j)
+                    for (int p = Lp_[j] + 1; p < Lp_[j + 1]; ++p)
+                    {
+                        const int q = toppos[Li_[p]];
+                        if (q < 0) continue;
+                        const int d = pos[q]++;
+                        lrow_j_[d] = j; lrow_x_[d] = Lx_[p];
+                    }
+            }
         }
         lrow_blk_.assign(static_cast<std::size_t>(ntop_), 0);
         for (int q = 0; q < ntop_; ++q)
@@ -811,42 +898,14 @@ private:
             while (p < lrow_ptr_[q + 1] && lrow_j_[p] < blk0[q]) ++p;
             lrow_blk_[q] = p;
         }
-        // the rows of U of the top nodes within the top columns, k increasing, split where k leaves
-        // the block of the row; and the entries of the top columns in subtree rows, listed by row
-        urow_ptr_.assign(static_cast<std::size_t>(ntop_) + 1, 0);
-        uprow_ptr_.assign(static_cast<std::size_t>(partptr_[nparts_]) + 1, 0);
-        for (int q = 0; q < ntop_; ++q)
-        {
-            const int k = top_[q];
-            for (int p = Up_[k]; p < Up_[k + 1] - 1; ++p)
-            {
-                const int r = Ui_[p];
-                if (part_[r] < 0) ++urow_ptr_[toppos[r] + 1];
-                else ++uprow_ptr_[nodepos[r] + 1];
-            }
-        }
-        for (int q = 0; q < ntop_; ++q) urow_ptr_[q + 1] += urow_ptr_[q];
-        for (int q = 0; q < partptr_[nparts_]; ++q) uprow_ptr_[q + 1] += uprow_ptr_[q];
-        urow_k_.resize(static_cast<std::size_t>(urow_ptr_[ntop_]));  urow_x_.resize(urow_k_.size());
-        uprow_i_.resize(static_cast<std::size_t>(uprow_ptr_[partptr_[nparts_]]));  uprow_x_.resize(uprow_i_.size());
-        {
-            std::vector<int> pos(urow_ptr_.begin(), urow_ptr_.end() - 1), ppos(uprow_ptr_.begin(), uprow_ptr_.end() - 1);
-            for (int q = 0; q < ntop_; ++q)
-            {
-                const int k = top_[q];
-                for (int p = Up_[k]; p < Up_[k + 1] - 1; ++p)
-                {
-                    const int r = Ui_[p];
-                    if (part_[r] < 0) { const int d = pos[toppos[r]]++; urow_k_[d] = k; urow_x_[d] = Ux_[p]; }
-                    else { const int d = ppos[nodepos[r]]++; uprow_i_[d] = k; uprow_x_[d] = Ux_[p]; }
-                }
-            }
-        }
+        // the rows of U of the top nodes (their columns are top nodes, increasing), split where the
+        // columns leave the block of the row
         urow_blk_.assign(static_cast<std::size_t>(ntop_), 0);
         for (int q = 0; q < ntop_; ++q)
         {
-            int p = urow_ptr_[q];
-            while (p < urow_ptr_[q + 1] && urow_k_[p] <= blk1[q]) ++p;
+            const int i = top_[q];
+            int p = Up_[i] + 1;
+            while (p < Up_[i + 1] && Ui_[p] <= blk1[q]) ++p;
             urow_blk_[q] = p;
         }
     }

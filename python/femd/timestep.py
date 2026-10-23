@@ -805,6 +805,15 @@ class _StageSolver:
     def solve(self, r):
         return self._core.solve(np.ascontiguousarray(r, dtype=np.float64).reshape(-1))
 
+    def refactor(self, M, J, dt):
+        """New M, J and dt on the same patterns: the orderings and symbolic analyses are kept, only the
+        numeric factorizations run.  False, with nothing changed, when a pattern differs."""
+        M, J = _as_sparse(M), _as_sparse(J)
+        if not self._core.refactor(M._K, None if J is None else J._K, float(dt)):
+            return False
+        self.kinds = list(self._core.kinds)
+        return True
+
 
 class _IRK2D(IRK):
     """IRK on a 2D space: fd.IRK dispatches here when M is a SparseMatrix, or a rank-2 Form, on a 2D mesh.
@@ -926,9 +935,14 @@ class _IRK2D(IRK):
         """The simplified-Newton solver, with f' frozen at (t_n, c^n): decoupled by the eigenvalues of A
         (_StageSolver), or the s n block matrix when A is not diagonalizable."""
         J = self.rhs.J(self.t, self._full(self.t, cn))
+        S = getattr(self, "_stage", None)
+        if S is not None and S.refactor(self.M, J, self.dt):           # same patterns: keep the analyses
+            self.factorizations += len(S.kinds)
+            return S
         try:
             S = _StageSolver(self.M, J, self.A, self.dt, self.backend)
             self.factorizations += len(S.kinds)
+            self._stage = S
             return S
         except ValueError:
             self.factorizations += 1

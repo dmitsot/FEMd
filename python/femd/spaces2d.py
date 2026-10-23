@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 from . import _femd as _C
-from .forms import Function
+from .forms import Function, _Context
 from .sparse import SparseMatrix
 from ._util import _real_linear
 
@@ -293,11 +293,19 @@ class _Lagrange2D:
 
     def interpolate(self, f) -> np.ndarray:
         """Nodal interpolant: f(x, y) at dof_coordinates() (f vectorized over arrays), an expression in
-        fd.x and fd.y, or the values."""
+        fd.x, fd.y, numbers, Constants and Functions, a number, the values, or None (zero).
+
+        A Function in the expression may live on any 2D space (derivatives and components included).
+        On this space's mesh it is read in a cell that holds the node, with no point location (where a
+        field or a derivative jumps across cells, the value of one of them); on another mesh it is
+        evaluated at the node, NaN outside that mesh (with a warning)."""
         from .forms import Expr
+        if f is None:
+            return np.zeros(self.dim)
         pts = self.dof_coordinates()
-        if isinstance(f, Expr):                          # an expression in fd.x, fd.y and Constants
-            vals = np.array(_values(f, pts), dtype=np.float64)
+        if isinstance(f, Expr):
+            cells, xi, eta = self._dof_cells()
+            vals = _expr_values(f, _PointContext2D(pts, self.mesh, cells, xi, eta), "interpolate")
         elif callable(f):
             vals = np.asarray(f(pts[:, 0], pts[:, 1]), dtype=np.float64)
             vals = np.broadcast_to(vals, (pts.shape[0],)).copy()
@@ -308,6 +316,25 @@ class _Lagrange2D:
         if vals.shape != (self.dim,):
             raise ValueError(f"interpolate: need {self.dim} values (one per degree of freedom), got {vals.size}")
         return vals
+
+    def _dof_cells(self):
+        """(cells, xi, eta): one cell holding each degree of freedom (dof_coordinates() order) and the
+        node's reference coordinates there (created once)."""
+        got = self.__dict__.get("_dof_cells_")
+        if got is None:
+            C = np.asarray(self.cell_raw_dofs())
+            nc, nl = C.shape
+            cell = np.full(self.raw_dim, -1, dtype=np.int32)
+            loc = np.zeros(self.raw_dim, dtype=np.intp)
+            cell[C.ravel()] = np.repeat(np.arange(nc, dtype=np.int32), nl)
+            loc[C.ravel()] = np.tile(np.arange(nl), nc)
+            r = np.asarray(self.adapted_to_raw())
+            R = np.asarray(self.ref_nodes())
+            got = (np.ascontiguousarray(cell[r]), np.ascontiguousarray(R[loc[r], 0]), np.ascontiguousarray(R[loc[r], 1]))
+            if (got[0] < 0).any():
+                got = (None, None, None)                 # not expected: fall back to point location
+            self.__dict__["_dof_cells_"] = got
+        return got
 
     def mass_matrix(self, lumped: bool = False) -> SparseMatrix:
         """int u v.  lumped=True gives a diagonal matrix: the Gauss-Lobatto rule at the nodes of a
@@ -461,6 +488,53 @@ def _arr(c):
 
 def _is_zero(g):
     return isinstance(g, (int, float)) and g == 0
+
+
+class _PointContext2D(_Context):
+    """Pointwise evaluation of an expression at points of a 2D mesh.  A known Function on `mesh`
+    is read in the given cells at the reference points (xi, eta), with no point location; any other
+    one (or every one when cells is None) by point location, NaN outside its mesh."""
+    def __init__(self, xy, mesh=None, cells=None, xi=None, eta=None):
+        xy = np.asarray(xy, dtype=np.float64)
+        super().__init__(np.ascontiguousarray(xy[:, 0]), {})
+        self.ys = np.ascontiguousarray(xy[:, 1])
+        self._mesh, self._cells, self._xi, self._eta = mesh, cells, xi, eta
+        self.outside = 0                      # points outside the mesh of a Function read by location
+
+    def _real_values(self, a, vals):
+        S = a.space
+        if getattr(S, "tdim", 1) != 2:
+            raise TypeError(f"{a!r} lives on a 1D mesh and cannot be evaluated on a 2D one")
+        if a.product is not None:
+            vals = a.product.split(np.ascontiguousarray(vals, dtype=np.float64))[a.field]
+        vals = np.ascontiguousarray(vals, dtype=np.float64)
+        code = a.code()
+        if self._cells is not None and S.mesh is self._mesh:
+            raw = np.ascontiguousarray(S.prolongate(vals) if S.n_constraints else vals, dtype=np.float64)
+            return np.asarray(S.evaluate_ref(raw, self._cells, self._xi, self._eta, code))
+        pts = np.column_stack([self.xs, self.ys])
+        out = np.asarray(S.evaluate(vals, pts, what=code) if a.comp is not None else S.evaluate(vals, pts, deriv=code))
+        self.outside = max(self.outside, int(np.isnan(out).sum()))
+        return out
+
+
+def _expr_values(f, ctx, what):
+    """Values of a scalar expression in fd.x, fd.y, numbers, Constants and Functions at the points of
+    the context, one per point."""
+    from .forms import Argument, evaluate, collect_arguments, _lift
+    import warnings
+    f = _lift(f)
+    if any(isinstance(a, Argument) and a.kind != "func" for a in collect_arguments(f, [])):
+        raise TypeError(f"{what}: an expression may contain fd.x, fd.y, numbers, Constants and Functions, "
+                        "not test or trial functions")
+    n = ctx.xs.shape[0]
+    v = np.asarray(evaluate(f, ctx))
+    if np.iscomplexobj(v):
+        raise TypeError(f"{what}: the values are complex; interpolate the real and imaginary parts separately")
+    if ctx.outside:
+        warnings.warn(f"{what}: {ctx.outside} of the {n} points lie outside the mesh of a Function in the "
+                      "expression; the values there are NaN", RuntimeWarning, stacklevel=4)
+    return np.broadcast_to(np.asarray(v, dtype=np.float64), (n,)).copy()
 
 
 def _values(g, xy):
@@ -805,13 +879,23 @@ class ProductSpace2D:
         return _product_function(U, "lift", np.concatenate(parts))
 
     def interpolate(self, f):
-        """Nodal interpolant, per block as in lift() (a vector block takes a pair or a callable
-        returning a pair)."""
+        """Nodal interpolant, per block as in lift(), None for zero.  A vector block takes a pair, a
+        callable returning a pair, or a vector expression (fd.as_vector([...]), a VectorFunction); a
+        scalar entry anything LagrangeSpace2D.interpolate takes, expressions with Functions included."""
+        from .forms import ListTensor
+        if f is None:
+            return np.zeros(self.dim)
         per_block = [f] if self.is_vector else list(f)
         if len(per_block) != len(self.blocks):
-            raise ValueError(f"interpolate(): one entry per block ({len(self.blocks)})")
+            raise ValueError(f"interpolate(): one entry per block ({len(self.blocks)}), None for zero")
         parts = [None] * len(self._fields)
         for (kind, idx), fb in zip(self.blocks, per_block):
+            if kind == "vector" and isinstance(fb, ListTensor):
+                if fb.rank != 1 or fb.shape[0] != len(idx):
+                    raise ValueError(f"interpolate(): a vector block needs a vector of {len(idx)} components")
+                for k, i in enumerate(idx):
+                    parts[i] = self._fields[i].interpolate(fb[k])
+                continue
             if kind == "vector" and callable(fb):
                 pts = [self._fields[i].dof_coordinates() for i in idx]
                 for k, i in enumerate(idx):

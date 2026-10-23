@@ -5,22 +5,26 @@
 //  (finite element matrices: the Navier-Stokes Jacobian, saddle points, convection-diffusion).
 //
 //  The symbolic phase works on the pattern of A + A^T: it post-orders the elimination tree
-//  of the ordered pattern and groups its chains into supernodes, each with the row structure
-//  of its columns.  The numeric phase walks the supernodes children first.  A supernode's
-//  front is a dense square matrix on its variables, the rows and columns below them, and the
-//  variables its children could not eliminate; it is assembled from the entries of A and the
-//  children's contribution blocks.  Its fully summed variables are eliminated in panels: a
-//  pivot for column j is the entry of a fully summed row that is at least u times the
-//  largest entry of the whole column (the diagonal when it passes, else the largest), the
-//  pivot row and column are swapped into place, the column of L and the row of U are
-//  computed with the panel's earlier pivots applied, and when the panel is full the trailing
-//  matrix receives the panel's update as one dense product, in parallel over its columns.  A
-//  column with no acceptable pivot is delayed, with its row, to the parent front, where more
-//  of it is summed.  Pivoting inside the fronts keeps the fill of the symmetric pattern (plus
-//  what the delays add) and bounds the growth by 1/u per step.
+//  of the ordered pattern, groups its chains into supernodes, each with the row structure of
+//  its columns, and merges a supernode with the child just before it when the merged front
+//  keeps few explicit zeros (relaxed amalgamation, CHOLMOD's rule).  The numeric phase walks
+//  the supernodes children first.  A supernode's front is a dense square matrix on its
+//  variables, the rows and columns below them, and the variables its children could not
+//  eliminate; it is assembled from the entries of A and the children's contribution blocks.
+//  Its fully summed variables are eliminated in panels of FEMD_LU_PANEL: a pivot for column j
+//  is the entry of a fully summed row that is at least u times the largest entry of the whole
+//  column (the diagonal when it passes, else the largest), the pivot row and column are
+//  swapped into place, the column of L and the row of U in the fully summed columns are
+//  computed with the panel's earlier pivots applied, and when the panel is full the other
+//  columns receive the panel's rows of U (a small triangular solve) and the trailing update,
+//  a dense product in register blocks, in parallel over the columns.  A column with no
+//  acceptable pivot is delayed, with its row, to the parent front, where more of it is
+//  summed.  Pivoting inside the fronts keeps the fill of the symmetric pattern (plus what the
+//  delays add) and bounds the growth by 1/u per step.
 //
-//  The factors come out in the form lu.hpp uses, L and U by columns in the pivoted numbering,
-//  so the parallel solves of lu.hpp apply unchanged.
+//  The factors come out in the form lu.hpp uses, in the pivoted numbering: L by columns and U
+//  by rows (a front holds whole columns of L and whole rows of U, so the export runs in
+//  parallel over the fronts), with the tree of the fronts for the parallel solves of lu.hpp.
 //
 #ifndef FEMD_SPARSE_LU_FRONTAL_HPP
 #define FEMD_SPARSE_LU_FRONTAL_HPP
@@ -34,6 +38,9 @@
 #include <string>
 #include <vector>
 
+#ifndef FEMD_LU_RELAX
+#define FEMD_LU_RELAX 1
+#endif
 #ifndef FEMD_LU_PANEL
 #define FEMD_LU_PANEL 32
 #endif
@@ -41,13 +48,156 @@
 namespace femd {
 namespace frontal {
 
+// acc -= a b, and |x|^2, with complex products by components (no NaN recovery, so loops vectorize)
+inline void msub(double &acc, double a, double b) { acc -= a * b; }
+inline void msub(std::complex<double> &acc, const std::complex<double> &a, const std::complex<double> &b)
+{
+    acc = std::complex<double>(acc.real() - (a.real() * b.real() - a.imag() * b.imag()), acc.imag() - (a.real() * b.imag() + a.imag() * b.real()));
+}
+inline double absq(double x) { return x * x; }
+inline double absq(const std::complex<double> &z) { return z.real() * z.real() + z.imag() * z.imag(); }
+inline double inverse(double x) { return 1.0 / x; }
+inline std::complex<double> inverse(const std::complex<double> &z) { const double d = absq(z); return std::complex<double>(z.real() / d, -z.imag() / d); }
+inline double mul(double a, double b) { return a * b; }
+inline std::complex<double> mul(const std::complex<double> &a, const std::complex<double> &b)
+{
+    return std::complex<double>(a.real() * b.real() - a.imag() * b.imag(), a.real() * b.imag() + a.imag() * b.real());
+}
+
+// The trailing update of a front, F(i, j) -= sum_t L(i, t) U(t, j) for rows i >= k0 and the columns
+// j0 <= j < j1 (at most NC of them), t in [ps0, k0): F is m x m column-major, L(i, t) = F(i, t) and
+// U(t, j) = F(t, j).  The rows ps0 .. k0-1 of the columns j >= jt are first solved for U (panel_solve);
+// those of the columns before jt were updated pivot by pivot.  Register blocks of MR rows by the NC columns accumulate the sum over t in order
+// and subtract it once, so each entry is read and written once per panel.  Complex values are
+// multiplied by components (no NaN recovery of the library product, which keeps the loop vectorizable).
+template <class T> struct Kernel;
+
+// The rows ps0 .. k0-1 of column j of U from those of F: the forward substitution with the panel's unit
+// lower triangle L(t2, t) = F(t2, t), t < t2 < k0 (column j of F is m long, column-major).
+template <class T>
+inline void panel_solve(T *F, int m, int k0, int ps0, int j)
+{
+    T *Fj = F + static_cast<std::size_t>(j) * m;
+    for (int t = ps0; t < k0; ++t)
+    {
+        const T u = Fj[t];
+        if (u == T(0)) continue;
+        const T *Lt = F + static_cast<std::size_t>(t) * m;
+        for (int t2 = t + 1; t2 < k0; ++t2) msub(Fj[t2], Lt[t2], u);
+    }
+}
+
+template <>
+struct Kernel<double> {
+    static constexpr int NC = 4, MR = 4;
+    template <int C>
+    static void cols(double *F, int m, int k0, int ps0, int j0)
+    {
+        const int nt = k0 - ps0;
+        double b[C][FEMD_LU_PANEL];
+        double *Cc[C];
+        for (int c = 0; c < C; ++c) { Cc[c] = F + static_cast<std::size_t>(j0 + c) * m; for (int t = 0; t < nt; ++t) b[c][t] = Cc[c][ps0 + t]; }
+        const double *A0 = F + static_cast<std::size_t>(ps0) * m;
+        int i = k0;
+        for (; i + MR <= m; i += MR)
+        {
+            double acc[C][MR] = {};
+            const double *A = A0 + i;
+            for (int t = 0; t < nt; ++t, A += m)
+                for (int c = 0; c < C; ++c)
+                    for (int r = 0; r < MR; ++r) acc[c][r] += A[r] * b[c][t];
+            for (int c = 0; c < C; ++c)
+                for (int r = 0; r < MR; ++r) Cc[c][i + r] -= acc[c][r];
+        }
+        for (; i < m; ++i)
+        {
+            double acc[C] = {};
+            const double *A = A0 + i;
+            for (int t = 0; t < nt; ++t, A += m)
+                for (int c = 0; c < C; ++c) acc[c] += A[0] * b[c][t];
+            for (int c = 0; c < C; ++c) Cc[c][i] -= acc[c];
+        }
+    }
+    static void update(double *F, int m, int k0, int ps0, int j0, int j1, int jt)
+    {
+        for (int j = std::max(j0, jt); j < j1; ++j) panel_solve(F, m, k0, ps0, j);
+        switch (j1 - j0)
+        {
+            case 4: cols<4>(F, m, k0, ps0, j0); break;
+            case 3: cols<3>(F, m, k0, ps0, j0); break;
+            case 2: cols<2>(F, m, k0, ps0, j0); break;
+            case 1: cols<1>(F, m, k0, ps0, j0); break;
+            default: break;
+        }
+    }
+};
+
+template <>
+struct Kernel<std::complex<double>> {
+    using cd = std::complex<double>;
+    static constexpr int NC = 2, MR = 4;
+    template <int C>
+    static void cols(cd *Fc, int m, int k0, int ps0, int j0)
+    {
+        const int nt = k0 - ps0;
+        double *F = reinterpret_cast<double *>(Fc);                   // (re, im) pairs, as the standard guarantees
+        double br[C][FEMD_LU_PANEL], bi[C][FEMD_LU_PANEL];
+        double *Cc[C];
+        for (int c = 0; c < C; ++c)
+        {
+            Cc[c] = F + 2 * static_cast<std::size_t>(j0 + c) * m;
+            for (int t = 0; t < nt; ++t) { br[c][t] = Cc[c][2 * (ps0 + t)]; bi[c][t] = Cc[c][2 * (ps0 + t) + 1]; }
+        }
+        const double *A0 = F + 2 * static_cast<std::size_t>(ps0) * m;
+        int i = k0;
+        for (; i + MR <= m; i += MR)
+        {
+            double ar[C][MR] = {}, ai[C][MR] = {};
+            const double *A = A0 + 2 * i;
+            for (int t = 0; t < nt; ++t, A += 2 * m)
+                for (int c = 0; c < C; ++c)
+                    for (int r = 0; r < MR; ++r)
+                    {
+                        const double xr = A[2 * r], xi = A[2 * r + 1];
+                        ar[c][r] += xr * br[c][t] - xi * bi[c][t];
+                        ai[c][r] += xr * bi[c][t] + xi * br[c][t];
+                    }
+            for (int c = 0; c < C; ++c)
+                for (int r = 0; r < MR; ++r) { Cc[c][2 * (i + r)] -= ar[c][r]; Cc[c][2 * (i + r) + 1] -= ai[c][r]; }
+        }
+        for (; i < m; ++i)
+        {
+            double ar[C] = {}, ai[C] = {};
+            const double *A = A0 + 2 * i;
+            for (int t = 0; t < nt; ++t, A += 2 * m)
+                for (int c = 0; c < C; ++c)
+                {
+                    ar[c] += A[0] * br[c][t] - A[1] * bi[c][t];
+                    ai[c] += A[0] * bi[c][t] + A[1] * br[c][t];
+                }
+            for (int c = 0; c < C; ++c) { Cc[c][2 * i] -= ar[c]; Cc[c][2 * i + 1] -= ai[c]; }
+        }
+    }
+    static void update(cd *F, int m, int k0, int ps0, int j0, int j1, int jt)
+    {
+        for (int j = std::max(j0, jt); j < j1; ++j) panel_solve(F, m, k0, ps0, j);
+        switch (j1 - j0)
+        {
+            case 2: cols<2>(F, m, k0, ps0, j0); break;
+            case 1: cols<1>(F, m, k0, ps0, j0); break;
+            default: break;
+        }
+    }
+};
+
 template <class T>
 struct Factor {
+    using kernel = Kernel<T>;
     struct Front {
         int m = 0, ne = 0, p = 0;
         std::vector<int> ridx, cidx;   // the m row and column variables; the first ne are eliminated in this order
         std::vector<T> L;              // m x ne, column-major: L(i, c) for i > c, the pivot at (c, c)
-        std::vector<T> Ut;             // ne x m, row-major: U(c, j) for j > c
+        std::vector<T> U;              // ne x m, column-major: U(c, j) at [j ne + c], for j > c
     };
     int n = 0;
     double u = 0.1;
@@ -75,6 +225,47 @@ struct Factor {
                 }
             }
         return parent;
+    }
+
+    /// Relaxed amalgamation (on by default): a supernode absorbs the child that ends just before it
+    /// when the merged front keeps few explicit zeros.  Fewer, larger fronts: less assembly and
+    /// copying per entry, longer panels, more room for pivots, for some arithmetic on zeros.
+    bool relax = FEMD_LU_RELAX != 0;
+
+    // Merge supernodes (sn_first, contiguous in the post-order) bottom up.  The node just before s in
+    // the post-order is its last child when s has children; with nc and ns columns, rc and rs rows
+    // below them, the merged node has the rows of s, nc + ns columns and (nc+ns)(nc+ns-1)/2 + (nc+ns) rs
+    // entries in L, of which the zeros are those of the two plus what the child's columns gain.  The
+    // test is CHOLMOD's: always for at most 4 columns, at most 80% zeros for 16, 10% for 48, 5% beyond.
+    void amalgamate(const std::vector<int> &cc)
+    {
+        const int nsf = static_cast<int>(sn_first.size());
+        std::vector<int> last(static_cast<std::size_t>(nsf));
+        for (int t = 0; t < nsf; ++t) last[t] = (t + 1 < nsf ? sn_first[t + 1] : n) - 1;
+        std::vector<int> first(sn_first), sn_of_col(static_cast<std::size_t>(n));
+        for (int t = 0; t < nsf; ++t) for (int j = first[t]; j <= last[t]; ++j) sn_of_col[j] = t;
+        std::vector<double> zeros(static_cast<std::size_t>(nsf), 0.0);
+        std::vector<char> keep(static_cast<std::size_t>(nsf), 1);
+        auto entries = [](double nc, double r) { return nc * (nc - 1.0) / 2.0 + nc * r; };
+        for (int t = 1; t < nsf; ++t)
+        {
+            const int c = t - 1;                               // the node (maybe merged) that ends just before t
+            const int pc = parent[last[c]];
+            if (pc < 0 || sn_of_col[pc] != t) continue;        // not a child of t
+            const double nc = last[c] - first[c] + 1, nt = last[t] - first[t] + 1;
+            const double rc = cc[last[c]], rt = cc[last[t]];
+            const double ncol = nc + nt;
+            const double total = entries(ncol, rt);
+            const double z = zeros[c] + zeros[t] + total - entries(nc, rc) - entries(nt, rt);
+            const double frac = total > 0.0 ? z / total : 0.0;
+            const bool merge = ncol <= 4 || (ncol <= 16 && frac < 0.8) || (ncol <= 48 && frac < 0.1) || frac < 0.05;
+            if (!merge) continue;
+            keep[c] = 0;
+            first[t] = first[c];
+            zeros[t] = z;
+        }
+        sn_first.clear();
+        for (int t = 0; t < nsf; ++t) if (keep[t]) sn_first.push_back(first[t]);
     }
 
     /// Sp/Si: the symmetric pattern (A + A^T, no diagonal needed); p0: the ordering to post-order.
@@ -115,13 +306,15 @@ struct Factor {
         for (int j = 0; j < n; ++j) if (parent[j] >= 0) ++nchild[parent[j]];
         // fundamental supernodes: chains j -> j+1 with j the only child and one row less in L
         sn_first.clear();
-        std::vector<int> sn_of(static_cast<std::size_t>(n));
         for (int j = 0; j < n; ++j)
         {
             const bool merge = j > 0 && parent[j - 1] == j && nchild[j] == 1 && cc[j - 1] == cc[j] + 1;
             if (!merge) sn_first.push_back(j);
-            sn_of[j] = static_cast<int>(sn_first.size()) - 1;
         }
+        if (relax) amalgamate(cc);
+        std::vector<int> sn_of(static_cast<std::size_t>(n));
+        for (std::size_t t = 0; t + 1 <= sn_first.size(); ++t)
+            for (int j = sn_first[t]; j < (t + 1 < sn_first.size() ? sn_first[t + 1] : n); ++j) sn_of[j] = static_cast<int>(t);
         const int ns = static_cast<int>(sn_first.size());
         sn_first.push_back(n);
         sn_parent.assign(static_cast<std::size_t>(ns), -1);
@@ -148,7 +341,7 @@ struct Factor {
 
     // ---- numeric -------------------------------------------------------------------------
     struct Scratch {
-        std::vector<int> locr, locc;
+        std::vector<int> locr, locc, rloc;
         std::vector<T> F, col;
     };
     struct Stats {
@@ -272,11 +465,15 @@ private:
             const std::vector<int> &cr = cb_r_[c], &ccol = cb_c_[c];
             const std::vector<T> &C = cb_[c];
             const int mc = static_cast<int>(cr.size());
+            std::vector<int> &rl = sc.rloc;
+            rl.resize(static_cast<std::size_t>(mc));
+            for (int a = 0; a < mc; ++a) rl[a] = locr[cr[a]];
+            const int *rlv = rl.data();
             for (int b = 0; b < mc; ++b)
             {
                 T *Fcol = &F[static_cast<std::size_t>(locc[ccol[b]]) * m];
                 const T *Cb = &C[static_cast<std::size_t>(b) * mc];
-                for (int a = 0; a < mc; ++a) Fcol[locr[cr[a]]] += Cb[a];
+                for (int a = 0; a < mc; ++a) Fcol[rlv[a]] += Cb[a];
             }
             std::vector<T>().swap(cb_[c]);
             std::vector<int>().swap(cb_r_[c]); std::vector<int>().swap(cb_c_[c]);
@@ -293,25 +490,25 @@ private:
                 const T utj = Fj[t];
                 if (utj == T(0)) continue;
                 const T *Lt = &F[static_cast<std::size_t>(t) * m];
-                for (int i = k0; i < m; ++i) col[i] -= Lt[i] * utj;
+                T *cv = col.data();
+                for (int i = k0; i < m; ++i) msub(cv[i], Lt[i], utj);
             }
         };
-        auto trailing_update = [&](int k0, int ps0) {        // F(i, j) -= sum_t L(i, t) U(t, j), i, j >= k0, t in [ps0, k0)
+        // F(i, j) -= sum_t L(i, t) U(t, j), i, j >= k0, t in [ps0, k0); the panel's rows of U in the
+        // columns beyond the fully summed ones (j >= p) are solved here, in parallel over the columns
+        auto trailing_update = [&](int k0, int ps0) {
             if (k0 == ps0 || k0 >= m) return;
             const int nt = k0 - ps0, rows = m - k0;
             const bool big = par && static_cast<long>(rows) * rows * nt > 4 * FEMD_OMP_THRESHOLD;
             (void)big;
+            // blocks of kernel::NC columns from k0, each the same arithmetic whatever thread does it
+            const int ng = (rows + kernel::NC - 1) / kernel::NC;
+            T *F0 = F.data();
             FEMD_OMP_FOR_IF(big)
-            for (int j = k0; j < m; ++j)
+            for (int g = 0; g < ng; ++g)
             {
-                T *Fj = &F[static_cast<std::size_t>(j) * m];
-                for (int t = ps0; t < k0; ++t)
-                {
-                    const T utj = Fj[t];
-                    if (utj == T(0)) continue;
-                    const T *Lt = &F[static_cast<std::size_t>(t) * m];
-                    for (int i = k0; i < m; ++i) Fj[i] -= Lt[i] * utj;
-                }
+                const int j0 = k0 + g * kernel::NC;
+                kernel::update(F0, m, k0, ps0, j0, std::min(m, j0 + kernel::NC), p);
             }
         };
         auto swap_rows = [&](int a, int b) {
@@ -333,19 +530,21 @@ private:
             for (int j = k; j < p; ++j)
             {
                 candidate(j, k, ps);
+                // squared magnitudes: |x| >= u |y| as |x|^2 >= u^2 |y|^2
                 double cmax = 0.0;
-                for (int i = k; i < m; ++i) cmax = std::max(cmax, std::abs(col[i]));
+                for (int i = k; i < m; ++i) cmax = std::max(cmax, absq(col[i]));
                 if (cmax <= 0.0) continue;
                 int id = -1, imax = -1;
                 double amax = -1.0;
                 for (int i = k; i < p; ++i)
                 {
-                    const double a = std::abs(col[i]);
+                    const double a = absq(col[i]);
                     if (ridx[i] == cidx[j]) id = i;
                     if (a > amax) { amax = a; imax = i; }
                 }
-                if (id >= 0 && std::abs(col[id]) >= u * cmax) { pj = j; pi = id; break; }
-                if (amax >= u * cmax) { pj = j; pi = imax; break; }
+                const double lim = u * u * cmax;
+                if (id >= 0 && absq(col[id]) >= lim) { pj = j; pi = id; break; }
+                if (amax >= lim) { pj = j; pi = imax; break; }
                 if (amax > best) { best = amax; bj = j; bi = imax; }
             }
             if (pj < 0)
@@ -364,12 +563,20 @@ private:
             st.minpiv = std::min(st.minpiv, ap);
             st.maxpiv = std::max(st.maxpiv, ap);
             Fk[k] = pivot;
-            for (int i = k + 1; i < m; ++i) Fk[i] = col[i] / pivot;                      // the column of L
-            for (int t = ps; t < k; ++t)                                                 // the row of U: the panel's pivots applied
+            const T rp = inverse(pivot);
+            for (int i = k + 1; i < m; ++i) Fk[i] = mul(col[i], rp);                      // the column of L
+            if (k > ps)                     // the row of U in the fully summed columns (the pivot candidates): the panel's pivots applied
             {
-                const T lkt = F[static_cast<std::size_t>(t) * m + k];
-                if (lkt == T(0)) continue;
-                for (int j = k + 1; j < m; ++j) F[static_cast<std::size_t>(j) * m + k] -= lkt * F[static_cast<std::size_t>(j) * m + t];
+                T lk[FEMD_LU_PANEL];
+                const int w = k - ps;
+                for (int t = 0; t < w; ++t) lk[t] = F[static_cast<std::size_t>(ps + t) * m + k];
+                for (int j = k + 1; j < p; ++j)
+                {
+                    T *Fj = &F[static_cast<std::size_t>(j) * m];
+                    T v = Fj[k];
+                    for (int t = 0; t < w; ++t) msub(v, lk[t], Fj[ps + t]);
+                    Fj[k] = v;
+                }
             }
             ++k;
             if (k - ps == FEMD_LU_PANEL || k == p) { trailing_update(k, ps); ps = k; }
@@ -381,9 +588,13 @@ private:
         st.delayed += p - k;
         // store L (m x ne) and U^T (ne x m), hand the rest of the front to the parent
         fr.L.assign(F.begin(), F.begin() + static_cast<std::size_t>(k) * m);
-        fr.Ut.assign(static_cast<std::size_t>(k) * m, T(0));
-        for (int c = 0; c < k; ++c)
-            for (int j = c + 1; j < m; ++j) fr.Ut[static_cast<std::size_t>(c) * m + j] = F[static_cast<std::size_t>(j) * m + c];
+        fr.U.resize(static_cast<std::size_t>(k) * m);
+        for (int j = 0; j < m; ++j)
+        {
+            const T *Fj = &F[static_cast<std::size_t>(j) * m];
+            T *Uj = &fr.U[static_cast<std::size_t>(j) * k];
+            for (int c = 0; c < k; ++c) Uj[c] = c < j ? Fj[c] : T(0);
+        }
         const int mc = m - k;
         if (mc > 0 && !root)
         {
@@ -397,74 +608,101 @@ private:
     }
 
 public:
-    /// The factors as lu.hpp keeps them: L and U by columns in the pivoted numbering (step k eliminates
-    /// row pinv_out[row] = k and column q_out[k]), explicit zeros dropped, the rows of L sorted.
-    void export_csc(std::vector<int> &q_out, std::vector<int> &pinv_out, std::vector<int> &Lp, std::vector<int> &Li, std::vector<T> &Lx,
-                    std::vector<int> &Up, std::vector<int> &Ui, std::vector<T> &Ux) const
+    /// The factors as lu.hpp keeps them, in the pivoted numbering (step k eliminates row pinv_out[row] = k
+    /// and column q_out[k]): L by columns (the unit diagonal first, the other rows increasing) and U by
+    /// rows (the pivot first, the other columns increasing), explicit zeros dropped; and the tree of the
+    /// fronts on the steps, parent_out: the steps of a front form a chain, and its last step's parent is
+    /// the first step that eliminates one of the variables the front passed on (its rows or columns
+    /// beyond the eliminated ones).  Every entry of L(i, j) or U(j, i) has i an ancestor of j in it.
+    /// The fronts own their columns of L and rows of U, so everything runs in parallel over them.
+    void export_factors(std::vector<int> &q_out, std::vector<int> &pinv_out, std::vector<int> &Lp, std::vector<int> &Li, std::vector<T> &Lx,
+                        std::vector<int> &Up, std::vector<int> &Ui, std::vector<T> &Ux, std::vector<int> &parent_out) const
     {
+        const int nf = static_cast<int>(fronts.size());
+        std::vector<int> fstart(static_cast<std::size_t>(nf) + 1, 0);       // the first step of each front
+        for (int f = 0; f < nf; ++f) fstart[f + 1] = fstart[f] + fronts[f].ne;
+        if (fstart[nf] != n) throw std::runtime_error("LU: the frontal factorization eliminated " + std::to_string(fstart[nf]) + " of " + std::to_string(n) + " variables");
+        const bool par = n > 2 * FEMD_OMP_THRESHOLD;
+        (void)par;
         // the step of each variable as a row and as a column
         std::vector<int> rstep(static_cast<std::size_t>(n), -1), cstep(static_cast<std::size_t>(n), -1);
-        int step = 0;
-        for (const Front &fr : fronts)
-            for (int c = 0; c < fr.ne; ++c) { rstep[fr.ridx[c]] = step; cstep[fr.cidx[c]] = step; ++step; }
-        if (step != n) throw std::runtime_error("LU: the frontal factorization eliminated " + std::to_string(step) + " of " + std::to_string(n) + " variables");
-        q_out.resize(static_cast<std::size_t>(n)); pinv_out.resize(static_cast<std::size_t>(n));
-        for (int v = 0; v < n; ++v) { q_out[cstep[v]] = perm[v]; pinv_out[perm[v]] = rstep[v]; }
-        // counts
-        Lp.assign(static_cast<std::size_t>(n) + 1, 0); Up.assign(static_cast<std::size_t>(n) + 1, 0);
-        for (const Front &fr : fronts)
+        FEMD_OMP(parallel for schedule(dynamic, 64) if (par))
+        for (int f = 0; f < nf; ++f)
         {
-            const int m = fr.m;
-            for (int c = 0; c < fr.ne; ++c)
+            const Front &fr = fronts[f];
+            for (int c = 0; c < fr.ne; ++c) { rstep[fr.ridx[c]] = fstart[f] + c; cstep[fr.cidx[c]] = fstart[f] + c; }
+        }
+        q_out.resize(static_cast<std::size_t>(n)); pinv_out.resize(static_cast<std::size_t>(n)); parent_out.assign(static_cast<std::size_t>(n), -1);
+        for (int v = 0; v < n; ++v) { q_out[cstep[v]] = perm[v]; pinv_out[perm[v]] = rstep[v]; }
+        // counts: column k of L and row k of U, both of the front that takes step k
+        Lp.assign(static_cast<std::size_t>(n) + 1, 0); Up.assign(static_cast<std::size_t>(n) + 1, 0);
+        FEMD_OMP(parallel for schedule(dynamic, 64) if (par))
+        for (int f = 0; f < nf; ++f)
+        {
+            const Front &fr = fronts[f];
+            const int m = fr.m, ne = fr.ne;
+            for (int c = 0; c < ne; ++c)
             {
-                const int k = cstep[fr.cidx[c]];
+                const int k = fstart[f] + c;
                 int nl = 1, nu = 1;                                            // the unit diagonal of L, the pivot of U
                 const T *Lc = &fr.L[static_cast<std::size_t>(c) * m];
-                for (int i = c + 1; i < m; ++i) if (Lc[i] != T(0)) ++nl;
-                const T *Uc = &fr.Ut[static_cast<std::size_t>(c) * m];
-                for (int j = c + 1; j < m; ++j) if (Uc[j] != T(0)) ++Up[cstep[fr.cidx[j]] + 1];   // U(c, j) lies in column j
-                Lp[k + 1] += nl; Up[k + 1] += nu;
+                for (int i = c + 1; i < m; ++i) nl += Lc[i] != T(0);
+                const T *Uc = &fr.U[c];
+                for (int j = c + 1; j < m; ++j) nu += Uc[static_cast<std::size_t>(j) * ne] != T(0);
+                Lp[k + 1] = nl; Up[k + 1] = nu;
+            }
+            // the tree: a chain through the front, then the first step of what the front passed on
+            if (ne > 0)
+            {
+                for (int c = 0; c + 1 < ne; ++c) parent_out[fstart[f] + c] = fstart[f] + c + 1;
+                int pa = n;
+                for (int i = ne; i < m; ++i) pa = std::min(pa, std::min(rstep[fr.ridx[i]], cstep[fr.cidx[i]]));
+                parent_out[fstart[f] + ne - 1] = pa < n ? pa : -1;
             }
         }
         for (int k = 0; k < n; ++k) { Lp[k + 1] += Lp[k]; Up[k + 1] += Up[k]; }
         Li.resize(static_cast<std::size_t>(Lp[n])); Lx.resize(Li.size());
         Ui.resize(static_cast<std::size_t>(Up[n])); Ux.resize(Ui.size());
-        std::vector<int> lpos(Lp.begin(), Lp.end() - 1), upos(Up.begin(), Up.end() - 1);
-        for (const Front &fr : fronts)
+        // fill, then sort each column of L and row of U after its diagonal
+        FEMD_OMP(parallel if (par))
         {
-            const int m = fr.m;
-            for (int c = 0; c < fr.ne; ++c)
+            std::vector<std::pair<int, T>> tmp;
+            FEMD_OMP(for schedule(dynamic, 64))
+            for (int f = 0; f < nf; ++f)
             {
-                const int k = cstep[fr.cidx[c]];
-                const T *Lc = &fr.L[static_cast<std::size_t>(c) * m], *Uc = &fr.Ut[static_cast<std::size_t>(c) * m];
-                Li[lpos[k]] = k; Lx[lpos[k]++] = T(1);
-                for (int i = c + 1; i < m; ++i) if (Lc[i] != T(0)) { Li[lpos[k]] = rstep[fr.ridx[i]]; Lx[lpos[k]++] = Lc[i]; }
-                for (int j = c + 1; j < m; ++j) if (Uc[j] != T(0)) { const int kj = cstep[fr.cidx[j]]; Ui[upos[kj]] = k; Ux[upos[kj]++] = Uc[j]; }
+                const Front &fr = fronts[f];
+                const int m = fr.m, ne = fr.ne;
+                for (int c = 0; c < ne; ++c)
+                {
+                    const int k = fstart[f] + c;
+                    const T *Lc = &fr.L[static_cast<std::size_t>(c) * m], *Uc = &fr.U[c];
+                    int pl = Lp[k], pu = Up[k];
+                    Li[pl] = k; Lx[pl++] = T(1);
+                    for (int i = c + 1; i < m; ++i) if (Lc[i] != T(0)) { Li[pl] = rstep[fr.ridx[i]]; Lx[pl++] = Lc[i]; }
+                    Ui[pu] = k; Ux[pu++] = Lc[c];                                   // the pivot
+                    for (int j = c + 1; j < m; ++j)
+                    {
+                        const T v = Uc[static_cast<std::size_t>(j) * ne];
+                        if (v != T(0)) { Ui[pu] = cstep[fr.cidx[j]]; Ux[pu++] = v; }
+                    }
+                    sort_tail(Li, Lx, Lp[k] + 1, Lp[k + 1], tmp);
+                    sort_tail(Ui, Ux, Up[k] + 1, Up[k + 1], tmp);
+                }
             }
         }
-        // the pivots last in their columns of U (the rows k of column kj above were all < kj, in front order)
-        for (const Front &fr : fronts)
-            for (int c = 0; c < fr.ne; ++c)
-            {
-                const int k = cstep[fr.cidx[c]];
-                Ui[upos[k]] = k; Ux[upos[k]++] = fr.L[static_cast<std::size_t>(c) * fr.m + c];
-            }
-        // sort the rows of each column of L after the unit diagonal
-        std::vector<int> order; std::vector<int> ti; std::vector<T> tx;
-        for (int k = 0; k < n; ++k)
-        {
-            const int p0 = Lp[k] + 1, len = Lp[k + 1] - p0;
-            if (len < 2) continue;
-            bool sorted = true;
-            for (int p = p0 + 1; p < p0 + len && sorted; ++p) sorted = Li[p - 1] < Li[p];
-            if (sorted) continue;
-            order.resize(static_cast<std::size_t>(len));
-            for (int t = 0; t < len; ++t) order[t] = p0 + t;
-            std::sort(order.begin(), order.end(), [&](int a, int b) { return Li[a] < Li[b]; });
-            ti.resize(static_cast<std::size_t>(len)); tx.resize(static_cast<std::size_t>(len));
-            for (int t = 0; t < len; ++t) { ti[t] = Li[order[t]]; tx[t] = Lx[order[t]]; }
-            for (int t = 0; t < len; ++t) { Li[p0 + t] = ti[t]; Lx[p0 + t] = tx[t]; }
-        }
+    }
+
+private:
+    // the entries [a, b) of a column or row in increasing index order (usually nearly sorted already)
+    static void sort_tail(std::vector<int> &I, std::vector<T> &X, int a, int b, std::vector<std::pair<int, T>> &tmp)
+    {
+        bool sorted = true;
+        for (int p = a + 1; p < b && sorted; ++p) sorted = I[p - 1] < I[p];
+        if (sorted) return;
+        tmp.resize(static_cast<std::size_t>(b - a));
+        for (int p = a; p < b; ++p) tmp[p - a] = {I[p], X[p]};
+        std::sort(tmp.begin(), tmp.end(), [](const std::pair<int, T> &x, const std::pair<int, T> &y) { return x.first < y.first; });
+        for (int p = a; p < b; ++p) { I[p] = tmp[p - a].first; X[p] = tmp[p - a].second; }
     }
 };
 

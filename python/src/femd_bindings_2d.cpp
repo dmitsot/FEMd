@@ -305,6 +305,8 @@ void bind_2d(nb::module_ &m)
         .def_prop_ro("delayed_pivots", &SparseLU<double>::delayed_pivots, "Frontal method: pivots delayed to a parent front.")
         .def_prop_ro("max_front", &SparseLU<double>::max_front, "Frontal method: the order of the largest front.")
         .def_prop_ro("fronts", &SparseLU<double>::fronts, "Frontal method: the number of fronts (supernodes).")
+        .def_prop_ro("timings", [](const SparseLU<double> &F) { const auto &t = F.timings(); nb::dict d; d["ordering"] = t.ordering; d["symbolic"] = t.symbolic; d["numeric"] = t.numeric; d["export"] = t.export_; d["partition"] = t.partition; return d; },
+                     "Seconds in the phases of the last factorization or refactor: ordering, symbolic, numeric, export, partition.")
         .def("column_order", [](const SparseLU<double> &F) { return np1(F.column_order()); })
         .def("row_pivots", [](const SparseLU<double> &F) { return np1(F.row_pivots()); });
     // ---- limiters (fe/limiters.hpp) --------------------------------------------------------
@@ -379,7 +381,8 @@ void bind_2d(nb::module_ &m)
         .def_prop_ro("method", &CLU::method_name)
         .def_prop_ro("delayed_pivots", &CLU::delayed_pivots)
         .def_prop_ro("max_front", &CLU::max_front)
-        .def_prop_ro("fronts", &CLU::fronts);
+        .def_prop_ro("fronts", &CLU::fronts)
+        .def_prop_ro("timings", [](const CLU &F) { const auto &t = F.timings(); nb::dict d; d["ordering"] = t.ordering; d["symbolic"] = t.symbolic; d["numeric"] = t.numeric; d["export"] = t.export_; d["partition"] = t.partition; return d; });
     // ---- the stage systems of an implicit Runge-Kutta step (timestep/stage_solver.hpp) --------
     nb::class_<StageSystemSolver>(m, "StageSystemSolver",
             "I (x) M - dt A (x) J solved through the eigenvalues of the Butcher matrix A: one real or complex sparse "
@@ -396,6 +399,11 @@ void bind_2d(nb::module_ &m)
                 std::vector<double> d(static_cast<std::size_t>(S.size()));
                 { GilRelease g; S.solve(r.data(), d.data()); }
                 return np1(d); }, "r"_a, "d = (I (x) M - dt A (x) J)^{-1} r, the stages stacked.")
+        .def("refactor", [](StageSystemSolver &S, const CSRMatrix &M, nb::handle J, double dt) {
+                const CSRMatrix *Jp = J.is_none() ? nullptr : nb::cast<const CSRMatrix *>(J);
+                GilRelease g;
+                return S.refactor(M, Jp, dt); }, "M"_a, "J"_a.none(), "dt"_a,
+             "New values on the same patterns: only the numeric phases run.  False (nothing changed) when a pattern differs.")
         .def_prop_ro("factorizations", &StageSystemSolver::factorizations)
         .def_prop_ro("kinds", &StageSystemSolver::kinds)
         .def_prop_ro("stages", &StageSystemSolver::stages)

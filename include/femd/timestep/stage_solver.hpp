@@ -13,6 +13,8 @@
 //
 //      StageSystemSolver S(M, &J, A, s, dt);       // factor
 //      S.solve(r, d);                              // d = (I (x) M - dt A (x) J)^{-1} r, stages stacked
+//      S.refactor(M, &J2, dt);                     // new values on the same patterns: the orderings and
+//                                                  // symbolic analyses are kept, only the numeric phases run
 //
 #ifndef FEMD_TIMESTEP_STAGE_SOLVER_HPP
 #define FEMD_TIMESTEP_STAGE_SOLVER_HPP
@@ -42,7 +44,7 @@ public:
      */
     StageSystemSolver(const CSRMatrix &M, const CSRMatrix *J, const std::vector<double> &A, int s, double dt,
                       const std::string &backend = "auto")
-        : s_(s), n_(M.nrows()), E_(SmallEigen::of(A, s))
+        : s_(s), n_(M.nrows()), E_(SmallEigen::of(A, s)), has_J_(J != nullptr), backend_(backend)
     {
         if (M.nrows() != M.ncols()) throw std::invalid_argument("stage solver: M must be square");
         if (J && (J->nrows() != n_ || J->ncols() != n_)) throw std::invalid_argument("stage solver: J must have the size of M");
@@ -57,6 +59,7 @@ public:
             {
                 CSRMatrix B = J ? combine(M, *J, 1.0, -dt * lam.real()) : scaled(M, 1.0);
                 factor_real(S, B, backend);
+                S.pattern = B.pattern;
             }
             else
             {
@@ -68,9 +71,56 @@ public:
                 for (std::size_t p = 0; p < z.size(); ++p) z[p] = cd(re.data[p], im.data[p]);
                 S.clu = std::make_unique<SparseLU<cd>>(n_, re.indptr(), re.indices(), z.data());
                 S.kind = "lu (complex)";
+                S.pattern = re.pattern;
             }
             ++factorizations_;
         }
+    }
+
+    /**
+     * @brief New M, J and dt on the patterns of the factorization: each system keeps its ordering and
+     *        symbolic analysis and runs only its numeric phase (a Cholesky that fails falls back to LDL^T).
+     * @return false, with nothing changed, when a pattern differs (or J is given where it was not, or the
+     *         other way round): build a new solver then.
+     */
+    bool refactor(const CSRMatrix &M, const CSRMatrix *J, double dt)
+    {
+        if (M.nrows() != n_ || M.ncols() != n_ || (J != nullptr) != has_J_) return false;
+        if (J && (J->nrows() != n_ || J->ncols() != n_)) return false;
+        auto same = [](const SparsityPattern &a, const SparsityPattern &b) {
+            return &a == &b || (a.indptr == b.indptr && a.indices == b.indices);
+        };
+        // form every system first, so that a pattern that differs changes nothing
+        std::vector<CSRMatrix> re(static_cast<std::size_t>(s_)), im(static_cast<std::size_t>(s_));
+        for (int k = 0; k < s_; ++k)
+        {
+            if (E_.partner[k] >= 0) continue;
+            const cd lam = E_.values[k];
+            re[k] = J ? combine(M, *J, 1.0, -dt * lam.real()) : scaled(M, 1.0);
+            if (!sys_[k].pattern || !same(*re[k].pattern, *sys_[k].pattern)) return false;
+            if (lam.imag() != 0.0) im[k] = J ? combine(M, *J, 0.0, -dt * lam.imag()) : scaled(M, 0.0);
+            if (lam.imag() != 0.0 && !same(*im[k].pattern, *re[k].pattern)) return false;
+        }
+        for (int k = 0; k < s_; ++k)
+        {
+            if (E_.partner[k] >= 0) continue;
+            Sys &S = sys_[k];
+            if (S.clu)
+            {
+                std::vector<cd> z(re[k].data.size());
+                for (std::size_t p = 0; p < z.size(); ++p) z[p] = cd(re[k].data[p], im[k].data[p]);
+                S.clu->refactor(z.data());
+            }
+            else if (S.lu) S.lu->refactor(re[k].data.data());
+            else if (S.ldlt) S.ldlt->refactor(re[k]);
+            else
+            {
+                try { S.chol->refactor(re[k]); }
+                catch (const std::runtime_error &) { Sys T; factor_real(T, re[k], "ldlt"); T.pattern = S.pattern; S = std::move(T); }
+            }
+            ++factorizations_;
+        }
+        return true;
     }
 
     StageSystemSolver(const StageSystemSolver &) = delete;
@@ -151,6 +201,7 @@ private:
         std::unique_ptr<SparseLU<double>> lu;
         std::unique_ptr<SparseLU<cd>> clu;
         std::string kind;
+        std::shared_ptr<const SparsityPattern> pattern;   // of the system's matrix, for refactor()
         void apply(const double *b, double *x) const
         {
             if (chol) chol->apply(b, x);
@@ -162,6 +213,8 @@ private:
     SmallEigen E_;
     std::vector<Sys> sys_;
     int factorizations_ = 0;
+    bool has_J_ = false;
+    std::string backend_;
     mutable std::vector<cd> Z_, W_;
     mutable std::vector<double> re_, im_, xr_, xi_;
 
