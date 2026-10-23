@@ -1,6 +1,6 @@
 # FEMd
 
-![FEMd](docs/mascot/femd_logo.jpg)
+![FEMd](docs/mascot/femd_logo.svg)
 
 **Version 0.6** · [License: GPL v3 or later](LICENSE)
 
