@@ -155,9 +155,8 @@ public:
                 cd *zk = Z.data() + static_cast<std::size_t>(k) * n;
                 for (int i = 0; i < n; ++i) zk[i] += t * rj[i];
             }
-        std::vector<double> &re = re_, &im = im_, &xr = xr_, &xi = xi_;
-        re.resize(static_cast<std::size_t>(n)); im.resize(static_cast<std::size_t>(n));
-        xr.resize(static_cast<std::size_t>(n)); xi.resize(static_cast<std::size_t>(n));
+        std::vector<double> &re = re_, &xr = xr_;
+        re.resize(static_cast<std::size_t>(n)); xr.resize(static_cast<std::size_t>(n));
         for (int k = 0; k < s; ++k)
         {
             if (E_.partner[k] >= 0) continue;
@@ -167,10 +166,12 @@ public:
             if (S.clu) S.clu->solve(zk, wk);
             else
             {
-                for (int i = 0; i < n; ++i) { re[i] = zk[i].real(); im[i] = zk[i].imag(); }
+                // a real eigenvalue: its eigenvector is real and the pairs are conjugate, so conj(T) = T P
+                // with P the permutation swapping each pair, conj(T^{-1}) = P T^{-1}, and row k of T^{-1}
+                // is real.  Z_k is real up to round-off: one real solve, not one each for Re and Im.
+                for (int i = 0; i < n; ++i) re[i] = zk[i].real();
                 S.apply(re.data(), xr.data());
-                S.apply(im.data(), xi.data());
-                for (int i = 0; i < n; ++i) wk[i] = cd(xr[i], xi[i]);
+                for (int i = 0; i < n; ++i) wk[i] = cd(xr[i], 0.0);
             }
         }
         for (int k = 0; k < s; ++k)
@@ -216,7 +217,7 @@ private:
     bool has_J_ = false;
     std::string backend_;
     mutable std::vector<cd> Z_, W_;
-    mutable std::vector<double> re_, im_, xr_, xi_;
+    mutable std::vector<double> re_, xr_;
 
     static void factor_real(Sys &S, const CSRMatrix &B, const std::string &backend)
     {
