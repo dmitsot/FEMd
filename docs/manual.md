@@ -1,4 +1,4 @@
-# FEMd 0.6 manual
+# FEMd 0.7 manual
 
 FEMd is a Finite Element Library for problems in one and two space dimensions designed to run simulations efficiently on modern personal computers. Its core is header-only C++17 and is used from Python through bindings. The user provides a domain, a polynomial degree and boundary conditions, writes the equations in weak form using inner products, and FEMd does the rest. The design follows the FEniCS project, so users familiar with FEniCS will find the form language and the workflow familiar.
 
@@ -56,6 +56,7 @@ OpenMP speeds up both 1D and 2D computations.
 | GMRES and LGMRES | unknowns > 4096 | |
 | the vector updates and inner products of CG | unknowns > $2^{20}$, about $10^6$ | the matrix-vector product of CG goes parallel from 4096 rows |
 | the solves with the sparse Cholesky factor | unknowns > 8192 | the mass solve of each explicit Runge-Kutta stage |
+| the sparse Cholesky factorization | unknowns > 8192 | the factorization of a mass matrix |
 
 `fd.set_num_threads(k)` sets how many threads a parallel loop uses. It does not change the threshold, which is fixed when the library is built. To change it, rebuild with the new value, for example 2048:
 
@@ -73,7 +74,7 @@ The solves with a sparse Cholesky factor, $L y = b$ and $L^T x = y$, are sequent
 
 The solves with the sparse LU factors run in parallel the same way. They use the elimination tree of the pattern of $L + U$, which holds the dependencies of both sweeps whatever pivots were taken. The top of the tree is swept by rows in blocks, and the rows of a block gather their entries in parallel.
 
-The multifrontal LU factorization also runs in parallel. Independent subtrees of its supernodal tree are factored concurrently, and the dense updates of the top fronts are shared between the threads. The factors are the same for any number of threads. The Cholesky and $LDL^T$ factorizations are still sequential.
+The multifrontal LU factorization also runs in parallel. Independent subtrees of its supernodal tree are factored concurrently, and the dense updates of the top fronts are shared between the threads. The factors are the same for any number of threads. The sparse Cholesky factorization runs in parallel the same way, with the same factor for any number of threads. The $LDL^T$ factorization is still sequential.
 
 Two things to know.
 
@@ -1224,7 +1225,7 @@ The preconditioners `"jacobi"`, `"ssor"` (with `omega`) and `"ilu0"` are built i
 
 On the unit square with $P_2$ and $h = 1/150$ (89 401 unknowns), CG with ILU(0) needs 207 iterations, against 353 in the natural numbering. The sparse Cholesky solves this system faster than SuperLU and than CG.
 
-**The sparse Cholesky.** `sparse/cholesky.hpp` factors $P A P^T = L D L^T$ with $L$ unit lower triangular, in three phases. The ordering $P$ is an approximate minimum degree ordering (`sparse/amd.hpp`, after Amestoy, Davis and Duff), with supervariables, mass elimination, aggressive absorption, dense rows held back, and a post-order of the assembly tree. The symbolic phase finds the elimination tree and the column counts of $L$. The numeric phase is up-looking, one row of $L$ per sparse triangular solve. No square roots are taken and no pivoting is done, which a symmetric positive definite matrix never needs. `S.factor` of `S = A.solver()` holds the factorization, with `nnz_L`, `flops`, `min_pivot`, `permutation()` and `refactor(K)` for new values on the same pattern. It is a `SparsePreconditioner`, so `fd.cg(A, b, M=S)`, and `fd.ERK` on a `SparseMatrix`, apply it in C++ without a Python round trip.
+**The sparse Cholesky.** `sparse/cholesky.hpp` factors $P A P^T = L D L^T$ with $L$ unit lower triangular, in three phases. The ordering $P$ is an approximate minimum degree ordering (`sparse/amd.hpp`, after Amestoy, Davis and Duff), with supervariables, mass elimination, aggressive absorption, dense rows held back, and a post-order of the assembly tree. The symbolic phase finds the elimination tree and the column counts of $L$. The numeric phase is multifrontal. The columns are grouped into supernodes, runs of columns with nested structure, and a supernode absorbs the child just before it when the merged front keeps few explicit zeros (CHOLMOD's rule, as in the sparse LU). The front of a supernode is the dense lower triangle on its columns and the rows below them. It is assembled from $A$ and the contribution blocks of its children, its columns are eliminated in panels of 32 with dense updates, and what is left on the rows below is the contribution block for its parent. The supernodal tree is cut into subtrees that are factored concurrently, and the large fronts above them share their work between the threads ([Section 1.1](#11-openmp)). The factor has the same bits for any number of threads. `S.factor.supernodes`, `max_front` and `factor_subtrees` report the fronts and the cut. No square roots are taken and no pivoting is done, which a symmetric positive definite matrix never needs. `S.factor` of `S = A.solver()` holds the factorization, with `nnz_L`, `flops`, `min_pivot`, `permutation()` and `refactor(K)` for new values on the same pattern. It is a `SparsePreconditioner`, so `fd.cg(A, b, M=S)`, and `fd.ERK` on a `SparseMatrix`, apply it in C++ without a Python round trip.
 
 **Exact zeros in the pattern.** The sparse Cholesky, the pivoting $LDL^T$ and the sparse LU leave the stored entries that are exactly zero out of the ordering and the factor. A form on a `ProductSpace` stores every pair of fields, also the pairs that no term couples, such as the $\eta$-$u$ blocks of a Boussinesq left side or the pressure block of Stokes. Counted as couplings, these zeros would join independent fields and fill the factor with entries that come out zero. `S.factor.dropped_zeros` gives the number of entries left out. A `refactor(K)` with values that are nonzero where zeros were left out orders and analyses the matrix again.
 

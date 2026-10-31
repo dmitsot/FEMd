@@ -12,9 +12,9 @@
 #define FEMD_VERSION_HPP
 
 #define FEMD_VERSION_MAJOR 0
-#define FEMD_VERSION_MINOR 6
+#define FEMD_VERSION_MINOR 7
 #define FEMD_VERSION_PATCH 0
-#define FEMD_VERSION "0.6"
+#define FEMD_VERSION "0.7"
 
 namespace femd {
 inline constexpr const char* version = FEMD_VERSION;

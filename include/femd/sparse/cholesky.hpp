@@ -13,10 +13,21 @@
 //    symbolic   the elimination tree of P A P^T and the column counts of L, from
 //               the row subtrees (each row k of L is the set of nodes reached by
 //               walking up the tree from the entries of row k of A);
-//    numeric    an up-looking factorization: row k of L is found by a sparse
-//               triangular solve with the rows above, whose pattern is that row
-//               subtree, and the entries are appended to the columns of L.
-//  L is unit lower triangular, stored by columns, D is diagonal.  No square roots
+//    numeric    multifrontal, by supernodes (runs of columns with nested structure,
+//               merged with a child when few explicit zeros result, CHOLMOD's rule).
+//               A supernode's front is the dense lower triangle on its columns and
+//               the rows below them, assembled from A and its children's contribution
+//               blocks; its columns are eliminated in panels of 32, the trailing
+//               update F22 -= L21 D1 L21^T by the register-blocked kernel of the
+//               frontal LU (lu_frontal.hpp), and what is left on the rows below is
+//               the contribution block for the parent.  The supernodal tree is cut
+//               into subtrees factored concurrently; the fronts above them (the
+//               separators, the largest) are factored one by one with their panels,
+//               updates, assembly and copies shared between the threads.  Each entry
+//               is formed by the same operations whatever thread does it, so the
+//               factor has the same bits for any number of threads.
+//  L is unit lower triangular, stored by columns at the rows of its symbolic
+//  pattern (the explicit zeros of a merged front are left out), D is diagonal.  No square roots
 //  are taken, and no pivoting is done: a symmetric positive definite matrix never
 //  needs it.  With positive_definite = true a pivot d_k <= 0 raises (the matrix is
 //  not SPD).  With false only a zero pivot raises, which admits symmetric
@@ -53,6 +64,7 @@
 
 #include "femd/sparse/amd.hpp"
 #include "femd/sparse/csr.hpp"
+#include "femd/sparse/lu_frontal.hpp"
 #include "femd/sparse/precond.hpp"
 #include "femd/sparse/prune.hpp"
 #include "femd/util/omp.hpp"
@@ -75,6 +87,22 @@
 // triangle done by one thread stays small and the rest of the supernode is updated in parallel
 #ifndef FEMD_CHOL_SNCHUNK
 #define FEMD_CHOL_SNCHUNK 32
+#endif
+// the factorization: the supernodal tree is cut into subtrees of at most 1/FEMD_CHOL_FPARTS of the
+// work, factored concurrently; the panel's rows below its diagonal block are solved in blocks of
+// FEMD_CHOL_ROWBLOCK rows; a front of the top with at least FEMD_CHOL_PARFRONT rows is assembled and
+// copied out in parallel; FEMD_CHOL_RELAX = 0 turns the relaxed amalgamation off
+#ifndef FEMD_CHOL_FPARTS
+#define FEMD_CHOL_FPARTS 32.0
+#endif
+#ifndef FEMD_CHOL_ROWBLOCK
+#define FEMD_CHOL_ROWBLOCK 64
+#endif
+#ifndef FEMD_CHOL_PARFRONT
+#define FEMD_CHOL_PARFRONT 256
+#endif
+#ifndef FEMD_CHOL_RELAX
+#define FEMD_CHOL_RELAX 1
 #endif
 
 namespace femd {
@@ -296,6 +324,12 @@ public:
         for (int q = 0; q < ntop_; ++q) t += Lp_[top_[q] + 1] - Lp_[top_[q]];
         return (t + static_cast<double>(toprow_j_.size())) / static_cast<double>(nnz_L());
     }
+    /// @brief Supernodes of the factorization (fronts), after the relaxed amalgamation.
+    int supernodes() const { return static_cast<int>(sn_ptr_.size()) - 1; }
+    /// @brief Order of the largest front (columns plus rows below them).
+    int max_front() const { return max_front_; }
+    /// @brief Independent subtrees of the supernodal tree that the factorization runs concurrently.
+    int factor_subtrees() const { return fparts_; }
     std::string ordering_name() const { return ordering_ == Ordering::AMD ? "amd" : "natural"; }
     bool positive_definite() const { return spd_; }
     /// @brief Stored entries of A that are exactly zero and were left out of the ordering and the factor.
@@ -325,6 +359,16 @@ private:
     std::vector<int> toprow_ptr_, toprow_j_, toprow_p_;   // for top node q: the entries L(t, j) with j in a subtree, (j, index into Lx)
     std::vector<int> topsn_ptr_;             // the top as fundamental supernodes: top_[topsn_ptr_[u] .. topsn_ptr_[u+1]) are consecutive columns with nested structure
     mutable std::vector<double> work2_;
+    // the multifrontal numeric phase (symbolic(), numeric(), front())
+    bool relax_ = FEMD_CHOL_RELAX != 0;
+    std::vector<int> colp_, coli_, colq_;    // the lower triangle of P A P^T by columns: rows coli_ (increasing), positions colq_ in A's data
+    std::vector<int> sn_ptr_;                // supernode s has the columns sn_ptr_[s] .. sn_ptr_[s+1]-1
+    std::vector<int> sn_parent_;             // its parent supernode, -1 at a root
+    std::vector<int> sn_cptr_, sn_child_;    // its children, increasing
+    std::vector<int> sn_rptr_, sn_row_;      // its rows below the last column, increasing
+    int fparts_ = 0, max_front_ = 0;
+    std::vector<int> fpart_ptr_, fpart_node_, ftop_;   // the cut of the supernodal tree: the supernodes of each subtree, increasing, and the top
+    std::vector<std::vector<double>> cb_;    // the contribution blocks during numeric(), packed lower triangles on the rows of the supernode
 
     /// Order, analyse and factor: on A without its exact zeros when some were found.
     void analyse(const CSRMatrix &A)
@@ -428,7 +472,12 @@ private:
         }
     }
 
-    // entries of column k of the upper triangle of P A P^T: row perm[k] of A, columns i = pinv[j] <= k
+    // ---- symbolic phase -----------------------------------------------------------------
+    // The elimination tree and the column counts of L from the row subtrees of P A P^T (row k
+    // of its lower triangle: row perm[k] of A at the columns i = pinv[j] < k); the lower
+    // triangle by columns (what each front assembles); the fundamental supernodes, their rows
+    // and the row indices of L; then the supernodes of the fronts (relaxed amalgamation) and
+    // the cut of their tree for the parallel factorization.
     void symbolic(const CSRMatrix &A)
     {
         const int n = n_;
@@ -463,61 +512,365 @@ private:
         Li_.assign(static_cast<std::size_t>(total), 0);
         Lx_.assign(static_cast<std::size_t>(total), 0.0);
         D_.assign(static_cast<std::size_t>(n), 0.0);
+
+        // the lower triangle of P A P^T by columns, rows increasing: the entry (i, j), i >= j, is
+        // A(perm[i], perm[j]), at position colq_ of A's data (read from row perm[i])
+        colp_.assign(static_cast<std::size_t>(n) + 1, 0);
+        for (int i = 0; i < n; ++i)
+            for (int q = Ap[perm_[i]]; q < Ap[perm_[i] + 1]; ++q)
+                if (pinv_[Ai[q]] <= i) ++colp_[pinv_[Ai[q]] + 1];
+        for (int j = 0; j < n; ++j) colp_[j + 1] += colp_[j];
+        coli_.resize(static_cast<std::size_t>(colp_[n]));
+        colq_.resize(coli_.size());
+        {
+            std::vector<int> pos(colp_.begin(), colp_.end() - 1);
+            for (int i = 0; i < n; ++i)
+                for (int q = Ap[perm_[i]]; q < Ap[perm_[i] + 1]; ++q)
+                {
+                    const int j = pinv_[Ai[q]];
+                    if (j <= i) { const int k = pos[j]++; coli_[k] = i; colq_[k] = q; }
+                }
+        }
+
+        // fundamental supernodes: j joins j-1 when j-1's parent is j, its only child, and the
+        // column of j-1 is that of j plus the row j
+        std::vector<int> nchild(static_cast<std::size_t>(n), 0), ff;
+        for (int j = 0; j < n; ++j) if (parent_[j] >= 0) ++nchild[parent_[j]];
+        for (int j = 0; j < n; ++j)
+            if (!(j > 0 && parent_[j - 1] == j && nchild[j] == 1 && lnz[j - 1] == lnz[j] + 1)) ff.push_back(j);
+        const int nf = static_cast<int>(ff.size());
+        ff.push_back(n);
+        std::vector<int> fof(static_cast<std::size_t>(n));
+        for (int t = 0; t < nf; ++t) for (int j = ff[t]; j < ff[t + 1]; ++j) fof[j] = t;
+        std::vector<std::vector<int>> fchild(static_cast<std::size_t>(nf)), frows(static_cast<std::size_t>(nf));
+        for (int t = 0; t < nf; ++t)
+            if (parent_[ff[t + 1] - 1] >= 0) fchild[fof[parent_[ff[t + 1] - 1]]].push_back(t);
+        // the rows below a supernode's last column: those of its columns of A and of its children
+        {
+            std::vector<int> mark(static_cast<std::size_t>(n), -1);
+            for (int t = 0; t < nf; ++t)
+            {
+                const int f = ff[t], l = ff[t + 1] - 1;
+                std::vector<int> &rows = frows[t];
+                auto take = [&](int i) { if (i > l && mark[i] != t) { mark[i] = t; rows.push_back(i); } };
+                for (int j = f; j <= l; ++j) for (int q = colp_[j]; q < colp_[j + 1]; ++q) take(coli_[q]);
+                for (int c : fchild[t]) for (int i : frows[c]) take(i);
+                std::sort(rows.begin(), rows.end());
+                if (static_cast<int>(rows.size()) != lnz[l])
+                    throw std::logic_error("Cholesky: the supernodal structure disagrees with the column counts");
+            }
+        }
+        // the row indices of L: column j has the rows j+1 .. l of its supernode, then the supernode's rows
+        FEMD_OMP(parallel for schedule(dynamic, 64) if (n > 2 * FEMD_OMP_THRESHOLD))
+        for (int t = 0; t < nf; ++t)
+        {
+            const int f = ff[t], l = ff[t + 1] - 1;
+            for (int j = f; j <= l; ++j)
+            {
+                int p = Lp_[j];
+                for (int i = j + 1; i <= l; ++i) Li_[p++] = i;
+                for (int i : frows[t]) Li_[p++] = i;
+            }
+        }
+
+        // relaxed amalgamation (CHOLMOD's rule, as in lu_frontal.hpp): a supernode absorbs the one
+        // that ends just before it when that one is its child and the merged front keeps few
+        // explicit zeros.  The merged node has the rows of the parent: the child's rows are its
+        // columns or its rows.  Fewer, larger fronts: less assembly per entry, longer panels.
+        std::vector<int> first(ff.begin(), ff.end() - 1);
+        std::vector<char> keep(static_cast<std::size_t>(nf), 1);
+        if (relax_)
+        {
+            std::vector<double> zeros(static_cast<std::size_t>(nf), 0.0);
+            auto entries = [](double nc, double r) { return nc * (nc - 1.0) / 2.0 + nc * r; };
+            for (int t = 1; t < nf; ++t)
+            {
+                const int c = t - 1, lc = ff[t] - 1, lt = ff[t + 1] - 1;
+                if (parent_[lc] < 0 || fof[parent_[lc]] != t) continue;
+                const double nc = lc - first[c] + 1, nt = lt - first[t] + 1;
+                const double rc = lnz[lc], rt = lnz[lt], ncol = nc + nt;
+                const double all = entries(ncol, rt);
+                const double z = zeros[c] + zeros[t] + all - entries(nc, rc) - entries(nt, rt);
+                const double frac = all > 0.0 ? z / all : 0.0;
+                if (!(ncol <= 4 || (ncol <= 16 && frac < 0.8) || (ncol <= 48 && frac < 0.1) || frac < 0.05)) continue;
+                keep[c] = 0;
+                first[t] = first[c];
+                zeros[t] = z;
+            }
+        }
+        sn_ptr_.clear(); sn_rptr_.assign(1, 0); sn_row_.clear();
+        for (int t = 0; t < nf; ++t)
+        {
+            if (!keep[t]) continue;
+            sn_ptr_.push_back(first[t]);
+            sn_row_.insert(sn_row_.end(), frows[t].begin(), frows[t].end());
+            sn_rptr_.push_back(static_cast<int>(sn_row_.size()));
+        }
+        const int ns = static_cast<int>(sn_ptr_.size());
+        sn_ptr_.push_back(n);
+        std::vector<int> sof(static_cast<std::size_t>(n));
+        for (int s = 0; s < ns; ++s) for (int j = sn_ptr_[s]; j < sn_ptr_[s + 1]; ++j) sof[j] = s;
+        sn_parent_.assign(static_cast<std::size_t>(ns), -1);
+        sn_cptr_.assign(static_cast<std::size_t>(ns) + 1, 0);
+        for (int s = 0; s < ns; ++s)
+        {
+            const int pa = parent_[sn_ptr_[s + 1] - 1];
+            if (pa >= 0) { sn_parent_[s] = sof[pa]; ++sn_cptr_[sn_parent_[s] + 1]; }
+        }
+        for (int s = 0; s < ns; ++s) sn_cptr_[s + 1] += sn_cptr_[s];
+        sn_child_.resize(static_cast<std::size_t>(sn_cptr_[ns]));
+        {
+            std::vector<int> pos(sn_cptr_.begin(), sn_cptr_.end() - 1);
+            for (int s = 0; s < ns; ++s) if (sn_parent_[s] >= 0) sn_child_[pos[sn_parent_[s]]++] = s;
+        }
+
+        // the cut of the supernodal tree: subtrees of at most 1/FEMD_CHOL_FPARTS of the estimated
+        // work (m^2 p per front, m rows and p columns), the biggest first; the rest is the top
+        std::vector<double> W(static_cast<std::size_t>(ns));
+        max_front_ = 0;
+        for (int s = 0; s < ns; ++s)
+        {
+            const double p = sn_ptr_[s + 1] - sn_ptr_[s], m = p + (sn_rptr_[s + 1] - sn_rptr_[s]);
+            max_front_ = std::max(max_front_, static_cast<int>(m));
+            W[s] = m * m * p + m * m;
+        }
+        for (int s = 0; s < ns; ++s) if (sn_parent_[s] >= 0) W[sn_parent_[s]] += W[s];
+        double work = 0.0;
+        for (int s = 0; s < ns; ++s) if (sn_parent_[s] < 0) work += W[s];
+        const double limit = n > 2 * FEMD_OMP_THRESHOLD ? work / FEMD_CHOL_FPARTS : -1.0;
+        std::vector<int> part(static_cast<std::size_t>(ns), -1), roots;
+        for (int s = ns - 1; s >= 0; --s)
+        {
+            const int pa = sn_parent_[s];
+            if (pa >= 0 && part[pa] >= 0) { part[s] = part[pa]; continue; }
+            if (W[s] <= limit) { part[s] = static_cast<int>(roots.size()); roots.push_back(s); }
+        }
+        fparts_ = static_cast<int>(roots.size());
+        std::vector<int> order(static_cast<std::size_t>(fparts_)), newid(static_cast<std::size_t>(fparts_));
+        for (int k = 0; k < fparts_; ++k) order[k] = k;
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return W[roots[a]] > W[roots[b]]; });
+        for (int k = 0; k < fparts_; ++k) newid[order[k]] = k;
+        fpart_ptr_.assign(static_cast<std::size_t>(fparts_) + 1, 0);
+        for (int s = 0; s < ns; ++s) if (part[s] >= 0) ++fpart_ptr_[newid[part[s]] + 1];
+        for (int k = 0; k < fparts_; ++k) fpart_ptr_[k + 1] += fpart_ptr_[k];
+        fpart_node_.resize(static_cast<std::size_t>(fpart_ptr_[fparts_]));
+        ftop_.clear();
+        {
+            std::vector<int> pos(fpart_ptr_.begin(), fpart_ptr_.end() - 1);
+            for (int s = 0; s < ns; ++s)
+            {
+                if (part[s] >= 0) fpart_node_[pos[newid[part[s]]]++] = s;
+                else ftop_.push_back(s);
+            }
+        }
     }
 
+    // ---- numeric phase: multifrontal --------------------------------------------------------
+    struct Scratch {
+        std::vector<int> loc, rl;
+        std::vector<double> F;
+    };
+    struct Failure {
+        int step = std::numeric_limits<int>::max();
+        double d = 0.0;
+    };
+
+    // offset of column b of a packed lower triangle of order mc (column b holds mc - b entries)
+    static std::size_t packed(int b, int mc)
+    {
+        return static_cast<std::size_t>(b) * static_cast<std::size_t>(mc) - static_cast<std::size_t>(b) * static_cast<std::size_t>(b - 1) / 2;
+    }
+
+    // Run body(g) for g < count: in parallel when par (a new team, dynamic schedule), else in order.
+    // The arithmetic of each g does not depend on the thread that does it.
+    template <class Body>
+    static void loop(bool par, int count, Body &&body)
+    {
+        if (par)
+        {
+            FEMD_OMP(parallel for schedule(dynamic, 1))
+            for (int g = 0; g < count; ++g) body(g);
+        }
+        else
+            for (int g = 0; g < count; ++g) body(g);
+    }
+
+    /// The supernodes children first: the subtrees of the cut concurrently (one front at a time
+    /// per thread, each thread with its own scratch), then the top in order, its fronts shared
+    /// between the threads.  A front's arithmetic is the same whoever does it, so the factor has
+    /// the same bits for any number of threads.
     void numeric(const CSRMatrix &A)
     {
-        const int n = n_;
-        const int *Ap = A.indptr(), *Ai = A.indices();
         const double *Ax = A.data.data();
-        std::vector<double> Y(static_cast<std::size_t>(n), 0.0);
-        std::vector<int> pattern(static_cast<std::size_t>(n)), flag(static_cast<std::size_t>(n), -1),
-            lnz(static_cast<std::size_t>(n), 0);
-        int *Li = Li_.data();
-        double *Lx = Lx_.data();
-        const int *Lp = Lp_.data();
-        for (int k = 0; k < n; ++k)
+        const int ns = static_cast<int>(sn_ptr_.size()) - 1;
+        cb_.assign(static_cast<std::size_t>(std::max(ns, 0)), {});
+        Failure fail;
+        const bool par = fparts_ > 1;
+        (void)par;
+        FEMD_OMP_PARALLEL_IF(par)
         {
-            // scatter column k of the upper triangle into Y, and find the row subtree of k
-            int top = n;
-            flag[k] = k;
-            const int row = perm_[k];
-            for (int p = Ap[row]; p < Ap[row + 1]; ++p)
+            Scratch sc;
+            sc.loc.assign(static_cast<std::size_t>(n_), -1);
+            Failure mine;
+            FEMD_OMP(for schedule(dynamic, 1))
+            for (int k = 0; k < fparts_; ++k)
+                for (int q = fpart_ptr_[k]; q < fpart_ptr_[k + 1]; ++q)
+                    if (!front(fpart_node_[q], Ax, sc, false, mine)) break;
+            FEMD_OMP(critical)
             {
-                int i = pinv_[Ai[p]];
-                if (i > k) continue;
-                Y[i] += Ax[p];
-                int len = 0;
-                for (; flag[i] != k; i = parent_[i])
-                {
-                    pattern[len++] = i;
-                    flag[i] = k;
-                }
-                while (len > 0) pattern[--top] = pattern[--len];
+                if (mine.step < fail.step) fail = mine;
             }
-            // row k of L by a sparse triangular solve, and the pivot d_k
-            double d = Y[k];
-            Y[k] = 0.0;
-            for (; top < n; ++top)
-            {
-                const int i = pattern[top];
-                const double yi = Y[i];
-                Y[i] = 0.0;
-                const int p2 = Lp[i] + lnz[i];
-                for (int p = Lp[i]; p < p2; ++p) Y[Li[p]] -= Lx[p] * yi;
-                const double lki = yi / D_[i];
-                d -= lki * yi;
-                Li[p2] = k;
-                Lx[p2] = lki;
-                ++lnz[i];
-            }
-            if (!(d > 0.0) && (spd_ || d == 0.0 || !std::isfinite(d)))
-                throw std::runtime_error(std::string("Cholesky: ") +
-                                         (spd_ ? "the matrix is not positive definite" : "zero pivot") +
-                                         " (pivot " + std::to_string(d) + " at step " + std::to_string(k) +
-                                         ", original row " + std::to_string(row) + ")");
-            D_[k] = d;
         }
+        if (fail.step == std::numeric_limits<int>::max())
+        {
+            Scratch sc;
+            sc.loc.assign(static_cast<std::size_t>(n_), -1);
+            for (int s : ftop_) if (!front(s, Ax, sc, true, fail)) break;
+        }
+        std::vector<std::vector<double>>().swap(cb_);
+        if (fail.step != std::numeric_limits<int>::max())
+            throw std::runtime_error(std::string("Cholesky: ") +
+                                     (spd_ ? "the matrix is not positive definite" : "zero pivot") +
+                                     " (pivot " + std::to_string(fail.d) + " at step " + std::to_string(fail.step) +
+                                     ", original row " + std::to_string(perm_[fail.step]) + ")");
+    }
+
+    /// One front: the dense lower triangle on the supernode's columns f..l and its rows R (an m x m
+    /// column-major array, local index of a variable in loc), assembled from the lower triangle of
+    /// P A P^T in the columns f..l and from the children's contribution blocks; its p = l-f+1
+    /// columns eliminated in panels of NB = FEMD_LU_PANEL:
+    ///   1. the panel's diagonal block, column by column, with the panel's earlier columns;
+    ///   2. the rows below it, L21 = A21 L11^{-T} D1^{-1}, in fixed blocks of FEMD_CHOL_ROWBLOCK rows;
+    ///   3. the trailing lower triangle, F22 -= L21 D1 L21^T, in groups of 4 columns: D1 L21^T is
+    ///      written above the diagonal of the panel's rows, so the update is the register-blocked
+    ///      kernel of the frontal LU (lu_frontal.hpp) from each group's diagonal down.
+    /// Every entry is formed by the same operations in the same order whatever the blocks are run
+    /// on.  Then column j of L and D(j) are copied out at the rows of the symbolic pattern (the
+    /// other rows of a relaxed front hold exact zeros), and the trailing triangle on R is packed as
+    /// the contribution block for the parent.  Returns false at a pivot that fails the test.
+    bool front(int s, const double *Ax, Scratch &sc, bool par, Failure &fail)
+    {
+        int *loc = sc.loc.data();
+        const int f = sn_ptr_[s], p = sn_ptr_[s + 1] - f;
+        const int *R = sn_row_.data() + sn_rptr_[s];
+        const int nr = sn_rptr_[s + 1] - sn_rptr_[s], m = p + nr;
+        const std::size_t M = static_cast<std::size_t>(m);
+        for (int c = 0; c < p; ++c) loc[f + c] = c;
+        for (int a = 0; a < nr; ++a) loc[R[a]] = p + a;
+        if (sc.F.size() < M * M) sc.F.resize(M * M);
+        double *F = sc.F.data();
+        const bool big = par && m >= FEMD_CHOL_PARFRONT;
+        // zero the lower triangle, and add the entries of A in the columns of the supernode
+        loop(big, m, [&](int c) {
+            double *Fc = F + static_cast<std::size_t>(c) * M;
+            std::fill(Fc + c, Fc + m, 0.0);
+            if (c < p)
+                for (int q = colp_[f + c]; q < colp_[f + c + 1]; ++q) Fc[loc[coli_[q]]] += Ax[colq_[q]];
+        });
+        // the children's contribution blocks, in order (a child's columns go to distinct columns)
+        for (int k = sn_cptr_[s]; k < sn_cptr_[s + 1]; ++k)
+        {
+            const int c = sn_child_[k];
+            std::vector<double> &C = cb_[c];
+            const int mc = sn_rptr_[c + 1] - sn_rptr_[c];
+            if (C.empty() || mc == 0) continue;
+            const int *cr = sn_row_.data() + sn_rptr_[c];
+            sc.rl.resize(static_cast<std::size_t>(mc));
+            int *rl = sc.rl.data();
+            for (int a = 0; a < mc; ++a) rl[a] = loc[cr[a]];
+            const double *Cv = C.data();
+            loop(big && mc >= FEMD_CHOL_PARFRONT, mc, [&](int b) {
+                const double *Cb = Cv + packed(b, mc);
+                double *Fc = F + static_cast<std::size_t>(rl[b]) * M;
+                for (int a = b; a < mc; ++a) Fc[rl[a]] += Cb[a - b];
+            });
+            std::vector<double>().swap(C);
+        }
+        // eliminate the p columns in panels
+        constexpr int NB = FEMD_LU_PANEL, RB = FEMD_CHOL_ROWBLOCK;
+        double W[NB][NB], rd[NB];
+        using kernel = frontal::Kernel<double>;
+        for (int ps = 0; ps < p; ps += NB)
+        {
+            const int pe = std::min(p, ps + NB), nb = pe - ps;
+            for (int k = ps; k < pe; ++k)                                   // 1. the diagonal block
+            {
+                double *Fk = F + static_cast<std::size_t>(k) * M;
+                for (int t = ps; t < k; ++t)
+                {
+                    const double *Ft = F + static_cast<std::size_t>(t) * M;
+                    const double w = Ft[k] * Ft[t];                          // D(t) L(k, t)
+                    W[t - ps][k - ps] = w;
+                    for (int i = k; i < pe; ++i) Fk[i] -= Ft[i] * w;
+                }
+                const double d = Fk[k];
+                if (!(d > 0.0) && (spd_ || d == 0.0 || !std::isfinite(d)))
+                {
+                    if (f + k < fail.step) { fail.step = f + k; fail.d = d; }
+                    for (int c = 0; c < p; ++c) loc[f + c] = -1;
+                    for (int a = 0; a < nr; ++a) loc[R[a]] = -1;
+                    return false;
+                }
+                rd[k - ps] = 1.0 / d;
+                for (int i = k + 1; i < pe; ++i) Fk[i] *= rd[k - ps];
+            }
+            const int below = m - pe;
+            if (below == 0) continue;
+            const int nblk = (below + RB - 1) / RB;                          // 2. the rows below it
+            loop(par && static_cast<long>(below) * nb * nb > 8L * FEMD_OMP_THRESHOLD, nblk, [&](int g) {
+                const int i0 = pe + g * RB, i1 = std::min(m, i0 + RB);
+                for (int k = ps; k < pe; ++k)
+                {
+                    double *Fk = F + static_cast<std::size_t>(k) * M;
+                    for (int t = ps; t < k; ++t)
+                    {
+                        const double *Ft = F + static_cast<std::size_t>(t) * M;
+                        const double w = W[t - ps][k - ps];
+                        for (int i = i0; i < i1; ++i) Fk[i] -= Ft[i] * w;
+                    }
+                    const double r = rd[k - ps];
+                    for (int i = i0; i < i1; ++i) Fk[i] *= r;
+                }
+            });
+            const int ng = (below + kernel::NC - 1) / kernel::NC;           // 3. the trailing triangle
+            loop(par && static_cast<long>(below) * below * nb > 8L * FEMD_OMP_THRESHOLD, ng, [&](int g) {
+                const int j0 = pe + g * kernel::NC, j1 = std::min(m, j0 + kernel::NC);
+                for (int j = j0; j < j1; ++j)
+                {
+                    double *Fj = F + static_cast<std::size_t>(j) * M;
+                    for (int t = ps; t < pe; ++t) Fj[t] = F[static_cast<std::size_t>(t) * M + j] * F[static_cast<std::size_t>(t) * M + t];
+                }
+                switch (j1 - j0)
+                {
+                    case 4: kernel::cols<4>(F, m, pe, ps, j0, j0); break;
+                    case 3: kernel::cols<3>(F, m, pe, ps, j0, j0); break;
+                    case 2: kernel::cols<2>(F, m, pe, ps, j0, j0); break;
+                    case 1: kernel::cols<1>(F, m, pe, ps, j0, j0); break;
+                    default: break;
+                }
+            });
+        }
+        // D and the columns of L at the rows of the symbolic pattern
+        loop(big, p, [&](int c) {
+            const int j = f + c;
+            const double *Fc = F + static_cast<std::size_t>(c) * M;
+            D_[j] = Fc[c];
+            for (int q = Lp_[j]; q < Lp_[j + 1]; ++q) Lx_[q] = Fc[loc[Li_[q]]];
+        });
+        // the contribution block: the trailing lower triangle on the rows R, packed by columns
+        if (nr > 0 && sn_parent_[s] >= 0)
+        {
+            std::vector<double> &C = cb_[s];
+            C.resize(packed(nr, nr));
+            double *Cv = C.data();
+            loop(big, nr, [&](int b) {
+                const double *Fc = F + static_cast<std::size_t>(p + b) * M + (p + b);
+                std::copy(Fc, Fc + (nr - b), Cv + packed(b, nr));
+            });
+        }
+        for (int c = 0; c < p; ++c) loc[f + c] = -1;
+        for (int a = 0; a < nr; ++a) loc[R[a]] = -1;
+        return true;
     }
 };
 

@@ -355,7 +355,7 @@ for an `M` that is not a matrix of a known space.
 | `rate(t, u)` | time, state | array | $M^{-1} f(t, u)$. |
 | `t`, `dt` | attribute | float | Current time and step size. |
 | `method`, `order`, `stages` | attribute | str, int, int | The tableau (`order` is 0 for a user tableau). |
-| `solver` | attribute | `SparseSolver`, `LinearSolver` or `None` | The factored solver of $M$ (`None` for $M = I$). On a 2D space `rk.solver.backend` is `"cholesky"` or `"superlu"`, and `rk.solver.factor` holds the Cholesky's `nnz_L`, `min_pivot`, `max_pivot`, `ordering`. With a Krylov backend a `KrylovMassSolver`: `backend`, `iterations` (per solve), `info` (the last `KrylovInfo`), `precond`, `tol`, `reset()` (drop the warm start). |
+| `solver` | attribute | `SparseSolver`, `LinearSolver` or `None` | The factored solver of $M$ (`None` for $M = I$). On a 2D space `rk.solver.backend` is `"cholesky"`, `"ldlt"` or `"lu"` with `backend="Auto"`, and `rk.solver.factor` holds the Cholesky's `nnz_L`, `min_pivot`, `max_pivot`, `ordering`. With a Krylov backend a `KrylovMassSolver`: `backend`, `iterations` (per solve), `info` (the last `KrylovInfo`), `precond`, `tol`, `reset()` (drop the warm start). |
 
 The C++ class is `femd::ExplicitRK` in `timestep/explicit_rk.hpp`, with
 `ExplicitTableau::named(name)`. Its `step(u, t, dt, rate)` takes any callable

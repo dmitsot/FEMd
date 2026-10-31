@@ -90,15 +90,16 @@ inline void panel_solve(T *F, int m, int k0, int ps0, int j)
 template <>
 struct Kernel<double> {
     static constexpr int NC = 4, MR = 4;
+    // i0 > k0: only the rows from i0 on (the lower triangle of a symmetric front, cholesky.hpp)
     template <int C>
-    static void cols(double *F, int m, int k0, int ps0, int j0)
+    static void cols(double *F, int m, int k0, int ps0, int j0, int i0 = -1)
     {
         const int nt = k0 - ps0;
         double b[C][FEMD_LU_PANEL];
         double *Cc[C];
         for (int c = 0; c < C; ++c) { Cc[c] = F + static_cast<std::size_t>(j0 + c) * m; for (int t = 0; t < nt; ++t) b[c][t] = Cc[c][ps0 + t]; }
         const double *A0 = F + static_cast<std::size_t>(ps0) * m;
-        int i = k0;
+        int i = i0 < 0 ? k0 : i0;
         for (; i + MR <= m; i += MR)
         {
             double acc[C][MR] = {};
