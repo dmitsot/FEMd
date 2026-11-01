@@ -208,6 +208,8 @@ void bind_2d(nb::module_ &m)
                 return np1(x); }, "b"_a, "x = K^{-1} b.")
         .def_prop_ro("nnz_L", &SparseCholesky::nnz_L)
         .def_prop_ro("dropped_zeros", &SparseCholesky::dropped_zeros, "Stored entries that are exactly zero, left out of the ordering and the factor.")
+        .def_prop_ro("analysis_reused", &SparseCholesky::analysis_reused,
+                     "The ordering and analysis came from a factor of a matrix with the same pattern and exact zeros (only the numeric phase was done).")
         .def_prop_ro("timings", [](const SparseCholesky &C) { const auto &t = C.timings(); nb::dict d; d["prune"] = t.prune; d["ordering"] = t.ordering; d["symbolic"] = t.symbolic; d["numeric"] = t.numeric; d["partition"] = t.partition; return d; },
                      "Seconds spent in each phase of the last factorization (a refactor times the numeric phase only).")
         .def_prop_ro("flops", &SparseCholesky::flops)
@@ -251,6 +253,9 @@ void bind_2d(nb::module_ &m)
         .def_prop_ro("two_by_two", &SparseLDLT::two_by_two)
         .def_prop_ro("supernodes", &SparseLDLT::supernodes)
         .def_prop_ro("max_front", &SparseLDLT::max_front)
+        .def_prop_ro("factor_subtrees", &SparseLDLT::factor_subtrees, "Independent subtrees of the supernodal tree factored and solved concurrently.")
+        .def_prop_ro("timings", [](const SparseLDLT &F) { const auto &t = F.timings(); nb::dict d; d["prune"] = t.prune; d["ordering"] = t.ordering; d["symbolic"] = t.symbolic; d["numeric"] = t.numeric; d["partition"] = t.partition; return d; },
+                     "Seconds spent in each phase of the last factorization (a refactor: numeric and partition).")
         .def_prop_ro("threshold", &SparseLDLT::threshold)
         .def_prop_ro("min_pivot", &SparseLDLT::min_pivot)
         .def_prop_ro("ordering", &SparseLDLT::ordering_name)

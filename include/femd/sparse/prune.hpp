@@ -37,7 +37,8 @@ struct ZeroPruning {
     std::vector<int> Bp, Bi;        // the kept pattern (CSR), when active
     std::vector<int> src;           // kept entry q is entry src[q] of the input
     std::vector<int> dropped;       // the positions of the dropped entries in the input
-    std::vector<int> Ap0, Ai0;      // the input pattern, kept when active (for a new analysis)
+    std::vector<int> Ap0, Ai0;      // the input pattern, kept when active and keep_input (for a new analysis)
+    bool keep_input = true;         // false: the caller keeps the input pattern itself (no copy)
     std::vector<char> keep;         // by input position, when active
 
     /// Decide which entries to keep.  grow: also keep those kept by the previous build.
@@ -81,8 +82,11 @@ struct ZeroPruning {
             return;
         }
         keep.swap(k);
-        Ap0.assign(Ap, Ap + n + 1);
-        Ai0.assign(Ai, Ai + nnz);
+        if (keep_input)
+        {
+            Ap0.assign(Ap, Ap + n + 1);
+            Ai0.assign(Ai, Ai + nnz);
+        }
         Bp.swap(cnt);
         Bi.resize(static_cast<std::size_t>(nkeep));
         src.resize(static_cast<std::size_t>(nkeep));
@@ -95,6 +99,34 @@ struct ZeroPruning {
                 if (keep[p]) { Bi[q] = Ai[p]; src[q++] = p; }
                 else dropped[d++] = p;
         }
+    }
+
+    /// Would build(n, Ap, Ai, Ax, symmetric) keep exactly the entries the last build kept (on the
+    /// same input pattern)?  Then the analysis made for that build serves Ax as well, with the
+    /// same result as a new one.  In parallel over the rows.
+    bool same(const int *Ap, const int *Ai, const T *Ax, bool symmetric) const
+    {
+        const int nnz = Ap[n];
+        if (active && static_cast<int>(keep.size()) != nnz) return false;
+        int differ = 0;
+        FEMD_OMP(parallel for schedule(dynamic, 1024) reduction(| : differ) if (nnz > 16 * FEMD_OMP_THRESHOLD))
+        for (int i = 0; i < n; ++i)
+        {
+            if (differ) continue;
+            for (int p = Ap[i]; p < Ap[i + 1]; ++p)
+            {
+                const int j = Ai[p];
+                bool on = j == i || Ax[p] != T(0);
+                if (!on && symmetric)
+                {
+                    const int *b = Ai + Ap[j], *e = Ai + Ap[j + 1];
+                    const int *m = std::lower_bound(b, e, i);
+                    if (m != e && *m == i) on = Ax[m - Ai] != T(0);
+                }
+                if (on != (active ? keep[p] != 0 : true)) { differ = 1; break; }
+            }
+        }
+        return !differ;
     }
 
     /// Every dropped entry of Ax (on the input pattern) is still exactly zero.
