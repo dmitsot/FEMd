@@ -10,9 +10,9 @@
 //
 //  The three phases are the classical ones.
 //    ordering   a fill-reducing permutation P (amd.hpp), or the natural order;
-//    symbolic   the elimination tree of P A P^T and the column counts of L, from
-//               the row subtrees (each row k of L is the set of nodes reached by
-//               walking up the tree from the entries of row k of A);
+//    symbolic   the elimination tree of P A P^T (Liu, with path compression) and the
+//               column counts of L (Gilbert, Ng and Peyton), in time about linear in
+//               the entries of A, then the supernodes and the rows of L;
 //    numeric    multifrontal, by supernodes (runs of columns with nested structure,
 //               merged with a child when few explicit zeros result, CHOLMOD's rule).
 //               A supernode's front is the dense lower triangle on its columns and
@@ -33,6 +33,12 @@
 //  not SPD).  With false only a zero pivot raises, which admits symmetric
 //  quasi-definite matrices, but an indefinite matrix may then be factored
 //  inaccurately: use a pivoting LU for those.
+//
+//  Everything before the numeric phase runs in parallel too where it can (the pruning
+//  of zeros, the graph of AMD, the lower triangle, the rows of the supernodes, the cut
+//  for the solves), with results that do not depend on the number of threads; the
+//  minimum degree elimination, the tree and the counts are serial.  timings() gives the
+//  seconds of each phase.
 //
 //  The class is a SparsePreconditioner (an exact one), so it drops into CG,
 //  GMRES and the explicit Runge-Kutta stage loop wherever z = M^{-1} r is taken.
@@ -69,10 +75,14 @@
 #include "femd/sparse/prune.hpp"
 #include "femd/util/omp.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 // the cut of the elimination tree: subtrees of at most 1/FEMD_CHOL_PARTS of the work of the
@@ -107,6 +117,21 @@
 
 namespace femd {
 
+namespace detail {
+/// An allocator whose construction without a value leaves the element uninitialized, so that
+/// resize() of a vector of int or double does not write zeros over memory written next anyway
+/// (the row indices and values of L: 240 MB for 20 million entries).
+template <class T>
+struct uninit_allocator : std::allocator<T> {
+    template <class U> struct rebind { using other = uninit_allocator<U>; };
+    uninit_allocator() = default;
+    template <class U> uninit_allocator(const uninit_allocator<U> &) noexcept {}
+    template <class U> void construct(U *p) noexcept { ::new (static_cast<void *>(p)) U; }
+    template <class U, class... Args> void construct(U *p, Args &&...args) { ::new (static_cast<void *>(p)) U(std::forward<Args>(args)...); }
+};
+template <class T> using uvector = std::vector<T, uninit_allocator<T>>;
+} // namespace detail
+
 class SparseCholesky : public SparsePreconditioner {
 public:
     enum class Ordering { AMD, Natural };
@@ -121,9 +146,12 @@ public:
         : spd_(positive_definite), ordering_(ordering)
     {
         check_square(A, "Cholesky");
+        tm_ = Timings();
+        const double t0 = now();
         n_ = A.nrows();
         pattern_ = A.pattern;
         prune_.build(n_, A.indptr(), A.indices(), A.data.data(), true);
+        tm_.prune = now() - t0;
         analyse(A);
     }
 
@@ -138,12 +166,17 @@ public:
         if (!prune_.fits(A.data.data()))
         {
             // nonzero where the analysis dropped exact zeros: order and analyse again
+            tm_ = Timings();
+            const double t0 = now();
             prune_.build(n_, A.indptr(), A.indices(), A.data.data(), true, true);
+            tm_.prune = now() - t0;
             analyse(A);
             return;
         }
+        const double t0 = now();
         if (prune_.active) { prune_.gather(A.data.data(), B_.data); numeric(B_); }
         else numeric(A);
+        tm_.numeric = now() - t0;
     }
 
     /// @brief z = A^{-1} r.
@@ -334,21 +367,28 @@ public:
     bool positive_definite() const { return spd_; }
     /// @brief Stored entries of A that are exactly zero and were left out of the ordering and the factor.
     long long dropped_zeros() const { return prune_.ndropped(); }
+    /// @brief Seconds spent in each phase of the last factorization (a refactor sets numeric only).
+    struct Timings { double prune = 0, ordering = 0, symbolic = 0, numeric = 0, partition = 0; };
+    const Timings &timings() const { return tm_; }
 
     /// @brief L (unit diagonal not stored) by columns, and D, in the permuted order.
     const std::vector<int> &Lp() const { return Lp_; }
-    const std::vector<int> &Li() const { return Li_; }
-    const std::vector<double> &Lx() const { return Lx_; }
+    const detail::uvector<int> &Li() const { return Li_; }
+    const detail::uvector<double> &Lx() const { return Lx_; }
     const std::vector<double> &D() const { return D_; }
 
 private:
     bool spd_;
     Ordering ordering_;
+    Timings tm_;
+    static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     std::shared_ptr<const SparsityPattern> pattern_;
     ZeroPruning<double> prune_;              // the exact zeros of A left out (prune.hpp)
     CSRMatrix B_;                            // A without them, when prune_.active
-    std::vector<int> perm_, pinv_, parent_, Lp_, Li_;
-    std::vector<double> Lx_, D_;
+    std::vector<int> perm_, pinv_, parent_, Lp_;
+    detail::uvector<int> Li_;                // written in symbolic() and numeric() before any read
+    detail::uvector<double> Lx_;
+    std::vector<double> D_;
     mutable std::vector<double> work_;
     // the cut of the elimination tree for the parallel solves (partition())
     int nparts_ = 0, ntop_ = 0;
@@ -373,6 +413,7 @@ private:
     /// Order, analyse and factor: on A without its exact zeros when some were found.
     void analyse(const CSRMatrix &A)
     {
+        double t = now();
         if (prune_.active)
         {
             auto P = std::make_shared<SparsityPattern>();
@@ -384,13 +425,18 @@ private:
         }
         else B_ = CSRMatrix();
         const CSRMatrix &M = prune_.active ? B_ : A;
+        tm_.prune += now() - t; t = now();
         perm_ = (ordering_ == Ordering::AMD) ? ordering::amd_order(n_, M.indptr(), M.indices())
                                              : ordering::natural_order(n_);
         pinv_.assign(static_cast<std::size_t>(n_), 0);
         for (int k = 0; k < n_; ++k) pinv_[perm_[k]] = k;
+        tm_.ordering = now() - t; t = now();
         symbolic(M);
+        tm_.symbolic = now() - t; t = now();
         numeric(M);
+        tm_.numeric = now() - t; t = now();
         partition();
+        tm_.partition = now() - t;
     }
 
     /// Cut the elimination tree into subtrees of at most 1/64 of the work of the factor each,
@@ -449,58 +495,226 @@ private:
                                Lp_[t + 1] - Lp_[t] == Lp_[t + 2] - Lp_[t + 1] + 1;
             if (!chain || q + 1 - topsn_ptr_.back() >= FEMD_CHOL_SNCHUNK) topsn_ptr_.push_back(q + 1);
         }
-        // the entries L(t, j) with t in the top and j in a part, grouped by t, j increasing within t
+        // the entries L(t, j) with t in the top and j in a part, grouped by t, j increasing within t:
+        // a counting sort over chunks of columns, the chunks in parallel and laid out in order (the
+        // rows of a column are increasing, so those above the root of its subtree are at its end)
         std::vector<int> toppos(static_cast<std::size_t>(n), -1);
         for (int q = 0; q < ntop_; ++q) toppos[top_[q]] = q;
-        toprow_ptr_.assign(static_cast<std::size_t>(ntop_) + 1, 0);
-        for (int j = 0; j < n; ++j)
+        const int nch = ordering::detail::sort_chunks(n > 2 * FEMD_OMP_THRESHOLD), chunk = (n + nch - 1) / nch;
+        const std::size_t NT = static_cast<std::size_t>(ntop_);
+        std::vector<int> cnt(static_cast<std::size_t>(nch) * NT, 0);
+        FEMD_OMP(parallel for schedule(static, 1) if (nch > 1))
+        for (int c = 0; c < nch; ++c)
         {
-            if (part_[j] < 0) continue;
-            const int rs = root_[part_[j]];
-            for (int p = Lp_[j]; p < Lp_[j + 1]; ++p) if (Li_[p] > rs) ++toprow_ptr_[toppos[Li_[p]] + 1];
+            int *cc = cnt.data() + static_cast<std::size_t>(c) * NT;
+            for (int j = c * chunk; j < std::min(n, (c + 1) * chunk); ++j)
+            {
+                if (part_[j] < 0) continue;
+                const int rs = root_[part_[j]];
+                for (int p = Lp_[j + 1] - 1; p >= Lp_[j] && Li_[p] > rs; --p) ++cc[toppos[Li_[p]]];
+            }
         }
-        for (int q = 0; q < ntop_; ++q) toprow_ptr_[q + 1] += toprow_ptr_[q];
+        toprow_ptr_.assign(NT + 1, 0);
+        for (int q = 0; q < ntop_; ++q)
+        {
+            int off = toprow_ptr_[q];
+            for (int c = 0; c < nch; ++c)
+            {
+                int &x = cnt[static_cast<std::size_t>(c) * NT + q];
+                const int t = x;
+                x = off;
+                off += t;
+            }
+            toprow_ptr_[q + 1] = off;
+        }
         toprow_j_.resize(static_cast<std::size_t>(toprow_ptr_[ntop_]));
         toprow_p_.resize(toprow_j_.size());
-        std::vector<int> pos(toprow_ptr_.begin(), toprow_ptr_.end() - 1);
-        for (int j = 0; j < n; ++j)
+        FEMD_OMP(parallel for schedule(static, 1) if (nch > 1))
+        for (int c = 0; c < nch; ++c)
         {
-            if (part_[j] < 0) continue;
-            const int rs = root_[part_[j]];
-            for (int p = Lp_[j]; p < Lp_[j + 1]; ++p)
-                if (Li_[p] > rs) { const int k = pos[toppos[Li_[p]]]++; toprow_j_[k] = j; toprow_p_[k] = p; }
+            int *pos = cnt.data() + static_cast<std::size_t>(c) * NT;
+            for (int j = c * chunk; j < std::min(n, (c + 1) * chunk); ++j)
+            {
+                if (part_[j] < 0) continue;
+                const int rs = root_[part_[j]];
+                for (int p = Lp_[j + 1] - 1; p >= Lp_[j] && Li_[p] > rs; --p)
+                {
+                    const int k = pos[toppos[Li_[p]]]++;
+                    toprow_j_[k] = j;
+                    toprow_p_[k] = p;
+                }
+            }
         }
     }
 
     // ---- symbolic phase -----------------------------------------------------------------
-    // The elimination tree and the column counts of L from the row subtrees of P A P^T (row k
-    // of its lower triangle: row perm[k] of A at the columns i = pinv[j] < k); the lower
-    // triangle by columns (what each front assembles); the fundamental supernodes, their rows
-    // and the row indices of L; then the supernodes of the fronts (relaxed amalgamation) and
-    // the cut of their tree for the parallel factorization.
+    // The elimination tree of P A P^T (Liu's algorithm with path compression), its lower
+    // triangle by columns (what each front assembles), the column counts of L (Gilbert, Ng and
+    // Peyton: from the skeleton of the matrix and the least common ancestors of consecutive
+    // leaves of the row subtrees, in time about linear in the entries of A), the fundamental
+    // supernodes, their rows and the row indices of L; then the supernodes of the fronts
+    // (relaxed amalgamation) and the cut of their tree for the parallel factorization.
     void symbolic(const CSRMatrix &A)
     {
         const int n = n_;
+        const std::size_t N = static_cast<std::size_t>(n);
         const int *Ap = A.indptr(), *Ai = A.indices();
-        parent_.assign(static_cast<std::size_t>(n), -1);
-        std::vector<int> flag(static_cast<std::size_t>(n), -1), lnz(static_cast<std::size_t>(n), 0);
-        for (int k = 0; k < n; ++k)
+        const int *perm = perm_.data(), *pinv = pinv_.data();
+        const bool par = n > 2 * FEMD_OMP_THRESHOLD;
+        (void)par;
+
+        // the lower triangle of P A P^T by columns, rows increasing: the entry (i, j), i >= j, is
+        // A(perm[i], perm[j]), at position colq_ of A's data (read from row perm[i]).  A counting
+        // sort by columns over chunks of rows, the chunks in parallel and laid out in order, so
+        // the rows of a column come out increasing whatever the number of chunks.  The same pass
+        // keeps the rows of the strict lower triangle (rowp, rowj), for the elimination tree.
+        std::vector<int> rowp(N + 1, 0), rowj;
         {
-            flag[k] = k;
-            const int row = perm_[k];
-            for (int p = Ap[row]; p < Ap[row + 1]; ++p)
+            const int nch = ordering::detail::sort_chunks(par);
+            std::vector<int> cnt(static_cast<std::size_t>(nch) * N, 0);
+            const int chunk = (n + nch - 1) / nch;
+            FEMD_OMP(parallel for schedule(static, 1) if (nch > 1))
+            for (int c = 0; c < nch; ++c)
             {
-                int i = pinv_[Ai[p]];
-                if (i >= k) continue;
-                for (; flag[i] != k; i = parent_[i])
+                int *cc = cnt.data() + static_cast<std::size_t>(c) * N;
+                const int i1 = std::min(n, (c + 1) * chunk);
+                for (int i = c * chunk; i < i1; ++i)
                 {
-                    if (parent_[i] == -1) parent_[i] = k;
-                    ++lnz[i];
-                    flag[i] = k;
+                    int below = 0;
+                    for (int q = Ap[perm[i]]; q < Ap[perm[i] + 1]; ++q)
+                    {
+                        const int j = pinv[Ai[q]];
+                        if (j <= i) { ++cc[j]; below += j < i; }
+                    }
+                    rowp[i + 1] = below;
+                }
+            }
+            for (int i = 0; i < n; ++i) rowp[i + 1] += rowp[i];
+            rowj.resize(static_cast<std::size_t>(rowp[n]));
+            colp_.assign(N + 1, 0);
+            FEMD_OMP(parallel for schedule(static) if (nch > 1))
+            for (int j = 0; j < n; ++j)
+            {
+                int t = 0;
+                for (int c = 0; c < nch; ++c) t += cnt[static_cast<std::size_t>(c) * N + j];
+                colp_[j + 1] = t;
+            }
+            for (int j = 0; j < n; ++j) colp_[j + 1] += colp_[j];
+            FEMD_OMP(parallel for schedule(static) if (nch > 1))
+            for (int j = 0; j < n; ++j)
+            {
+                int off = colp_[j];
+                for (int c = 0; c < nch; ++c)
+                {
+                    int &x = cnt[static_cast<std::size_t>(c) * N + j];
+                    const int t = x;
+                    x = off;
+                    off += t;
+                }
+            }
+            coli_.resize(static_cast<std::size_t>(colp_[n]));
+            colq_.resize(coli_.size());
+            int *ci = coli_.data(), *cq = colq_.data();
+            FEMD_OMP(parallel for schedule(static, 1) if (nch > 1))
+            for (int c = 0; c < nch; ++c)
+            {
+                int *pos = cnt.data() + static_cast<std::size_t>(c) * N;
+                const int i1 = std::min(n, (c + 1) * chunk);
+                for (int i = c * chunk; i < i1; ++i)
+                {
+                    int r = rowp[i];
+                    for (int q = Ap[perm[i]]; q < Ap[perm[i] + 1]; ++q)
+                    {
+                        const int j = pinv[Ai[q]];
+                        if (j <= i)
+                        {
+                            const int k = pos[j]++;
+                            ci[k] = i;
+                            cq[k] = q;
+                            if (j < i) rowj[r++] = j;
+                        }
+                    }
                 }
             }
         }
-        Lp_.assign(static_cast<std::size_t>(n) + 1, 0);
+        // the elimination tree (Liu): from each entry (k, i), i < k, of row k of the lower triangle,
+        // up the tree as far as it is built, with path compression
+        parent_.assign(N, -1);
+        {
+            std::vector<int> anc(N, -1);
+            int *pa = parent_.data(), *an = anc.data();
+            const int *rp = rowp.data(), *rj = rowj.data();
+            for (int k = 0; k < n; ++k)
+                for (int p = rp[k]; p < rp[k + 1]; ++p)
+                    for (int i = rj[p]; i != -1 && i < k;)
+                    {
+                        const int next = an[i];
+                        an[i] = k;
+                        if (next == -1) { pa[i] = k; break; }
+                        i = next;
+                    }
+        }
+        std::vector<int>().swap(rowj);
+
+        // the column counts (Gilbert, Ng and Peyton 1994).  In a post-order of the tree, column j
+        // of L has the entry (i, j) exactly when j is a leaf of the row subtree of i; an entry
+        // (i, j) of the lower triangle starts a new leaf when no earlier column of the post-order
+        // inside the subtree of j had row i.  Each leaf adds one to its column and the least
+        // common ancestor of it and the previous leaf of row i takes one off; the sums over the
+        // subtrees are then the counts.
+        std::vector<int> lnz(N);
+        {
+            std::vector<int> head(N, -1), next(N, -1), post(N), stack(N);
+            const int *pa = parent_.data();
+            for (int j = n - 1; j >= 0; --j)
+                if (pa[j] != -1) { next[j] = head[pa[j]]; head[pa[j]] = j; }
+            int k = 0;
+            for (int r = 0; r < n; ++r)
+            {
+                if (pa[r] != -1) continue;
+                int top = 0;
+                stack[0] = r;
+                while (top >= 0)
+                {
+                    const int v = stack[top], c = head[v];
+                    if (c == -1) { --top; post[k++] = v; }
+                    else { head[v] = next[c]; stack[++top] = c; }
+                }
+            }
+            std::vector<int> first(N, -1), maxfirst(N, -1), prevleaf(N, -1), anc(N);
+            int *cc = lnz.data();
+            for (k = 0; k < n; ++k)
+            {
+                int j = post[k];
+                cc[j] = first[j] == -1 ? 1 : 0;                              // 1 at a leaf of the tree
+                for (; j != -1 && first[j] == -1; j = pa[j]) first[j] = k;
+            }
+            for (int i = 0; i < n; ++i) anc[i] = i;
+            const int *cp = colp_.data(), *ci = coli_.data();
+            for (k = 0; k < n; ++k)
+            {
+                const int j = post[k], fj = first[j];
+                if (pa[j] != -1) --cc[pa[j]];
+                for (int q = cp[j]; q < cp[j + 1]; ++q)
+                {
+                    const int i = ci[q];
+                    if (i <= j || fj <= maxfirst[i]) continue;                // not a new leaf of row i
+                    maxfirst[i] = fj;
+                    const int jprev = prevleaf[i];
+                    prevleaf[i] = j;
+                    ++cc[j];
+                    if (jprev == -1) continue;
+                    int a = jprev;                                           // the least common ancestor
+                    while (a != anc[a]) a = anc[a];
+                    for (int v = jprev; v != a;) { const int w = anc[v]; anc[v] = a; v = w; }
+                    --cc[a];
+                }
+                if (pa[j] != -1) anc[j] = pa[j];
+            }
+            for (int j = 0; j < n; ++j) if (pa[j] != -1) cc[pa[j]] += cc[j];
+            for (int j = 0; j < n; ++j) --cc[j];                             // without the diagonal
+        }
+        Lp_.assign(N + 1, 0);
         long long total = 0;
         for (int j = 0; j < n; ++j)
         {
@@ -509,59 +723,110 @@ private:
                 throw std::length_error("Cholesky: the factor has more than 2^31 entries");
             Lp_[j + 1] = static_cast<int>(total);
         }
-        Li_.assign(static_cast<std::size_t>(total), 0);
-        Lx_.assign(static_cast<std::size_t>(total), 0.0);
-        D_.assign(static_cast<std::size_t>(n), 0.0);
-
-        // the lower triangle of P A P^T by columns, rows increasing: the entry (i, j), i >= j, is
-        // A(perm[i], perm[j]), at position colq_ of A's data (read from row perm[i])
-        colp_.assign(static_cast<std::size_t>(n) + 1, 0);
-        for (int i = 0; i < n; ++i)
-            for (int q = Ap[perm_[i]]; q < Ap[perm_[i] + 1]; ++q)
-                if (pinv_[Ai[q]] <= i) ++colp_[pinv_[Ai[q]] + 1];
-        for (int j = 0; j < n; ++j) colp_[j + 1] += colp_[j];
-        coli_.resize(static_cast<std::size_t>(colp_[n]));
-        colq_.resize(coli_.size());
-        {
-            std::vector<int> pos(colp_.begin(), colp_.end() - 1);
-            for (int i = 0; i < n; ++i)
-                for (int q = Ap[perm_[i]]; q < Ap[perm_[i] + 1]; ++q)
-                {
-                    const int j = pinv_[Ai[q]];
-                    if (j <= i) { const int k = pos[j]++; coli_[k] = i; colq_[k] = q; }
-                }
-        }
+        // every entry of Li_ and Lx_ is written below and in numeric(): no zero filling
+        Li_.clear(); Li_.resize(static_cast<std::size_t>(total));
+        Lx_.clear(); Lx_.resize(static_cast<std::size_t>(total));
+        D_.assign(N, 0.0);
 
         // fundamental supernodes: j joins j-1 when j-1's parent is j, its only child, and the
         // column of j-1 is that of j plus the row j
-        std::vector<int> nchild(static_cast<std::size_t>(n), 0), ff;
+        std::vector<int> nchild(N, 0), ff;
         for (int j = 0; j < n; ++j) if (parent_[j] >= 0) ++nchild[parent_[j]];
         for (int j = 0; j < n; ++j)
             if (!(j > 0 && parent_[j - 1] == j && nchild[j] == 1 && lnz[j - 1] == lnz[j] + 1)) ff.push_back(j);
         const int nf = static_cast<int>(ff.size());
         ff.push_back(n);
-        std::vector<int> fof(static_cast<std::size_t>(n));
+        std::vector<int> fof(N);
         for (int t = 0; t < nf; ++t) for (int j = ff[t]; j < ff[t + 1]; ++j) fof[j] = t;
-        std::vector<std::vector<int>> fchild(static_cast<std::size_t>(nf)), frows(static_cast<std::size_t>(nf));
+        // the children of each, increasing (CSR), and its rows below the last column (CSR, frp/fr)
+        std::vector<int> fcp(static_cast<std::size_t>(nf) + 1, 0), fch, frp(static_cast<std::size_t>(nf) + 1, 0);
         for (int t = 0; t < nf; ++t)
-            if (parent_[ff[t + 1] - 1] >= 0) fchild[fof[parent_[ff[t + 1] - 1]]].push_back(t);
-        // the rows below a supernode's last column: those of its columns of A and of its children
         {
-            std::vector<int> mark(static_cast<std::size_t>(n), -1);
+            const int pa = parent_[ff[t + 1] - 1];
+            if (pa >= 0) ++fcp[fof[pa] + 1];
+            frp[t + 1] = frp[t] + lnz[ff[t + 1] - 1];
+        }
+        for (int t = 0; t < nf; ++t) fcp[t + 1] += fcp[t];
+        fch.resize(static_cast<std::size_t>(fcp[nf]));
+        {
+            std::vector<int> pos(fcp.begin(), fcp.end() - 1);
             for (int t = 0; t < nf; ++t)
             {
-                const int f = ff[t], l = ff[t + 1] - 1;
-                std::vector<int> &rows = frows[t];
-                auto take = [&](int i) { if (i > l && mark[i] != t) { mark[i] = t; rows.push_back(i); } };
-                for (int j = f; j <= l; ++j) for (int q = colp_[j]; q < colp_[j + 1]; ++q) take(coli_[q]);
-                for (int c : fchild[t]) for (int i : frows[c]) take(i);
-                std::sort(rows.begin(), rows.end());
-                if (static_cast<int>(rows.size()) != lnz[l])
-                    throw std::logic_error("Cholesky: the supernodal structure disagrees with the column counts");
+                const int pa = parent_[ff[t + 1] - 1];
+                if (pa >= 0) fch[pos[fof[pa]]++] = t;
             }
         }
+        std::vector<int> fr(static_cast<std::size_t>(frp[nf]));
+        // the rows below a supernode's last column: those of its columns of A and of its children.
+        // The tree is cut into subtrees of at most 1/64 of the work, done concurrently (each thread
+        // with its own marks), then the supernodes above them in order.
+        {
+            std::vector<int> fpar(static_cast<std::size_t>(nf), -1), part(static_cast<std::size_t>(nf), -1), order;
+            std::vector<double> W(static_cast<std::size_t>(nf));
+            const int *cp = colp_.data();
+            double work = 0.0;
+            for (int t = 0; t < nf; ++t)
+            {
+                const int pa = parent_[ff[t + 1] - 1];
+                if (pa >= 0) fpar[t] = fof[pa];
+                W[t] = (frp[t + 1] - frp[t]) + (cp[ff[t + 1]] - cp[ff[t]]) + 1.0;
+            }
+            for (int t = 0; t < nf; ++t) { if (fpar[t] >= 0) W[fpar[t]] += W[t]; else work += W[t]; }
+            const double limit = par ? work / 64.0 : -1.0;
+            int nparts = 0;
+            for (int t = nf - 1; t >= 0; --t)
+            {
+                if (fpar[t] >= 0 && part[fpar[t]] >= 0) part[t] = part[fpar[t]];
+                else if (W[t] <= limit) part[t] = nparts++;
+            }
+            // the supernodes of each part increasing, then the rest increasing
+            std::vector<int> pptr(static_cast<std::size_t>(nparts) + 2, 0);
+            for (int t = 0; t < nf; ++t) ++pptr[(part[t] >= 0 ? part[t] : nparts) + 1];
+            for (int k = 0; k <= nparts; ++k) pptr[k + 1] += pptr[k];
+            order.resize(static_cast<std::size_t>(nf));
+            {
+                std::vector<int> pos(pptr.begin(), pptr.end() - 1);
+                for (int t = 0; t < nf; ++t) order[pos[part[t] >= 0 ? part[t] : nparts]++] = t;
+            }
+            const int *ci = coli_.data();
+            int bad = 0;
+            auto rows_of = [&](int t, int *mark) {
+                const int f = ff[t], l = ff[t + 1] - 1, b = frp[t], e = frp[t + 1];
+                int w = b;
+                bool over = false;
+                auto take = [&](int i) {
+                    if (i > l && mark[i] != t)
+                    {
+                        mark[i] = t;
+                        if (w < e) fr[w++] = i; else over = true;
+                    }
+                };
+                for (int j = f; j <= l; ++j) for (int q = cp[j]; q < cp[j + 1]; ++q) take(ci[q]);
+                for (int u = fcp[t]; u < fcp[t + 1]; ++u)
+                {
+                    const int c = fch[u];
+                    for (int q = frp[c]; q < frp[c + 1]; ++q) take(fr[q]);
+                }
+                std::sort(fr.begin() + b, fr.begin() + w);
+                return !over && w == e;
+            };
+            FEMD_OMP(parallel if (nparts > 1))
+            {
+                std::vector<int> mark(N, -1);
+                FEMD_OMP(for schedule(dynamic, 1) reduction(| : bad))
+                for (int k = 0; k < nparts; ++k)
+                    for (int q = pptr[k]; q < pptr[k + 1]; ++q)
+                        if (!rows_of(order[q], mark.data())) bad |= 1;
+            }
+            {
+                std::vector<int> mark(N, -1);
+                for (int q = pptr[nparts]; q < pptr[nparts + 1]; ++q)
+                    if (!rows_of(order[q], mark.data())) bad |= 1;
+            }
+            if (bad) throw std::logic_error("Cholesky: the supernodal structure disagrees with the column counts");
+        }
         // the row indices of L: column j has the rows j+1 .. l of its supernode, then the supernode's rows
-        FEMD_OMP(parallel for schedule(dynamic, 64) if (n > 2 * FEMD_OMP_THRESHOLD))
+        FEMD_OMP(parallel for schedule(dynamic, 64) if (par))
         for (int t = 0; t < nf; ++t)
         {
             const int f = ff[t], l = ff[t + 1] - 1;
@@ -569,7 +834,7 @@ private:
             {
                 int p = Lp_[j];
                 for (int i = j + 1; i <= l; ++i) Li_[p++] = i;
-                for (int i : frows[t]) Li_[p++] = i;
+                for (int q = frp[t]; q < frp[t + 1]; ++q) Li_[p++] = fr[q];
             }
         }
 
@@ -603,7 +868,7 @@ private:
         {
             if (!keep[t]) continue;
             sn_ptr_.push_back(first[t]);
-            sn_row_.insert(sn_row_.end(), frows[t].begin(), frows[t].end());
+            sn_row_.insert(sn_row_.end(), fr.begin() + frp[t], fr.begin() + frp[t + 1]);
             sn_rptr_.push_back(static_cast<int>(sn_row_.size()));
         }
         const int ns = static_cast<int>(sn_ptr_.size());

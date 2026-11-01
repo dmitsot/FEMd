@@ -23,6 +23,7 @@
 #ifndef FEMD_SPARSE_PRUNE_HPP
 #define FEMD_SPARSE_PRUNE_HPP
 
+#include "femd/util/omp.hpp"
 #include <algorithm>
 #include <cstddef>
 #include <vector>
@@ -40,14 +41,20 @@ struct ZeroPruning {
     std::vector<char> keep;         // by input position, when active
 
     /// Decide which entries to keep.  grow: also keep those kept by the previous build.
+    /// The rows are done in parallel; the result does not depend on the number of threads.
     void build(int n_, const int *Ap, const int *Ai, const T *Ax, bool symmetric, bool grow = false)
     {
         n = n_;
         const int nnz = Ap[n];
         const bool had = grow && active && static_cast<int>(keep.size()) == nnz;
-        std::vector<char> k(static_cast<std::size_t>(nnz), 0);
-        int nkeep = 0;
+        const bool par = nnz > 16 * FEMD_OMP_THRESHOLD;
+        (void)par;
+        std::vector<char> k(static_cast<std::size_t>(nnz));
+        std::vector<int> cnt(static_cast<std::size_t>(n) + 1, 0);      // kept entries of row i at cnt[i + 1]
+        FEMD_OMP(parallel for schedule(dynamic, 1024) if (par))
         for (int i = 0; i < n; ++i)
+        {
+            int c = 0;
             for (int p = Ap[i]; p < Ap[i + 1]; ++p)
             {
                 const int j = Ai[p];
@@ -59,8 +66,12 @@ struct ZeroPruning {
                     if (m != e && *m == i) on = Ax[m - Ai] != T(0) || (had && keep[m - Ai]);
                 }
                 k[p] = on ? 1 : 0;
-                nkeep += on;
+                c += on;
             }
+            cnt[i + 1] = c;
+        }
+        for (int i = 0; i < n; ++i) cnt[i + 1] += cnt[i];
+        const int nkeep = cnt[n];
         active = nkeep < nnz;
         dropped.clear(); src.clear(); Bp.clear(); Bi.clear();
         if (!active)
@@ -72,16 +83,17 @@ struct ZeroPruning {
         keep.swap(k);
         Ap0.assign(Ap, Ap + n + 1);
         Ai0.assign(Ai, Ai + nnz);
-        Bp.assign(static_cast<std::size_t>(n) + 1, 0);
-        Bi.reserve(static_cast<std::size_t>(nkeep));
-        src.reserve(static_cast<std::size_t>(nkeep));
-        dropped.reserve(static_cast<std::size_t>(nnz - nkeep));
+        Bp.swap(cnt);
+        Bi.resize(static_cast<std::size_t>(nkeep));
+        src.resize(static_cast<std::size_t>(nkeep));
+        dropped.resize(static_cast<std::size_t>(nnz - nkeep));
+        FEMD_OMP(parallel for schedule(dynamic, 1024) if (par))
         for (int i = 0; i < n; ++i)
         {
+            int q = Bp[i], d = Ap[i] - Bp[i];                            // dropped before row i: Ap[i] - Bp[i]
             for (int p = Ap[i]; p < Ap[i + 1]; ++p)
-                if (keep[p]) { Bi.push_back(Ai[p]); src.push_back(p); }
-                else dropped.push_back(p);
-            Bp[i + 1] = static_cast<int>(Bi.size());
+                if (keep[p]) { Bi[q] = Ai[p]; src[q++] = p; }
+                else dropped[d++] = p;
         }
     }
 
@@ -95,8 +107,12 @@ struct ZeroPruning {
     /// The kept values of Ax, in the order of Bp, Bi.
     void gather(const T *Ax, std::vector<T> &Bx) const
     {
+        const long m = static_cast<long>(src.size());
         Bx.resize(src.size());
-        for (std::size_t q = 0; q < src.size(); ++q) Bx[q] = Ax[src[q]];
+        T *b = Bx.data();
+        const int *sv = src.data();
+        FEMD_OMP_FOR_IF(m > 16 * FEMD_OMP_THRESHOLD)
+        for (long q = 0; q < m; ++q) b[q] = Ax[sv[q]];
     }
 
     /// Entries dropped from the input.

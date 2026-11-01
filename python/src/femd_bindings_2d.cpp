@@ -38,8 +38,8 @@ using GilRelease = nb::gil_scoped_release;
 std::vector<double> vec(const DArr &a) { return std::vector<double>(a.data(), a.data() + a.shape(0)); }
 std::vector<int> ivec(const IArr &a) { return std::vector<int>(a.data(), a.data() + a.shape(0)); }
 
-template <class T>
-nb::ndarray<T, nb::numpy, nb::shape<-1>, nb::c_contig> np1(const std::vector<T> &v)
+template <class T, class Alloc>
+nb::ndarray<T, nb::numpy, nb::shape<-1>, nb::c_contig> np1(const std::vector<T, Alloc> &v)
 {
     T *p = new T[v.size()];
     std::copy(v.begin(), v.end(), p);
@@ -208,6 +208,8 @@ void bind_2d(nb::module_ &m)
                 return np1(x); }, "b"_a, "x = K^{-1} b.")
         .def_prop_ro("nnz_L", &SparseCholesky::nnz_L)
         .def_prop_ro("dropped_zeros", &SparseCholesky::dropped_zeros, "Stored entries that are exactly zero, left out of the ordering and the factor.")
+        .def_prop_ro("timings", [](const SparseCholesky &C) { const auto &t = C.timings(); nb::dict d; d["prune"] = t.prune; d["ordering"] = t.ordering; d["symbolic"] = t.symbolic; d["numeric"] = t.numeric; d["partition"] = t.partition; return d; },
+                     "Seconds spent in each phase of the last factorization (a refactor times the numeric phase only).")
         .def_prop_ro("flops", &SparseCholesky::flops)
         .def_prop_ro("min_pivot", &SparseCholesky::min_pivot)
         .def_prop_ro("max_pivot", &SparseCholesky::max_pivot)

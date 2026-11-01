@@ -19,8 +19,10 @@
 #ifndef FEMD_SPARSE_AMD_HPP
 #define FEMD_SPARSE_AMD_HPP
 
+#include "femd/util/omp.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <stdexcept>
 #include <vector>
 
@@ -43,42 +45,104 @@ inline int wclear(int mark, int lemax, std::vector<int> &w, int n)
     return mark;
 }
 
-/// @brief Symmetric adjacency (A + A^T) without the diagonal, as CSR arrays.
+/// @brief The number of chunks of a parallel counting sort: one per thread (at most 16), one when not par.
+inline int sort_chunks(bool par)
+{
+    int nch = 1;
+#ifdef _OPENMP
+    if (par) nch = std::max(1, std::min(omp_get_max_threads(), 16));
+#else
+    (void)par;
+#endif
+    return nch;
+}
+
+/// @brief Symmetric adjacency (A + A^T) without the diagonal, as CSR arrays, rows increasing.
+/// Row i is the union of row i of A and row i of A^T: the transpose by a counting sort (over
+/// chunks of rows, the chunks in parallel and laid out in order, so its rows come out increasing),
+/// then the two sorted rows merged.  The result does not depend on the number of threads.
 inline void symmetric_graph(int n, const int *Ap, const int *Ai, std::vector<int> &Cp, std::vector<int> &Ci)
 {
-    std::vector<int> cnt(static_cast<std::size_t>(n), 0);
-    for (int i = 0; i < n; ++i)
-        for (int p = Ap[i]; p < Ap[i + 1]; ++p)
-        {
-            const int j = Ai[p];
-            if (j < 0 || j >= n) throw std::invalid_argument("amd: column index out of range");
-            if (j != i) { ++cnt[i]; ++cnt[j]; }
-        }
-    Cp.assign(static_cast<std::size_t>(n) + 1, 0);
-    for (int i = 0; i < n; ++i) Cp[i + 1] = Cp[i] + cnt[i];
-    std::vector<int> fill(Cp.begin(), Cp.end() - 1);
-    Ci.assign(static_cast<std::size_t>(Cp[n]), 0);
-    for (int i = 0; i < n; ++i)
-        for (int p = Ap[i]; p < Ap[i + 1]; ++p)
-        {
-            const int j = Ai[p];
-            if (j != i) { Ci[fill[i]++] = j; Ci[fill[j]++] = i; }
-        }
-    // sort and remove duplicates row by row (a structurally symmetric input lists each edge twice)
-    int q = 0;
-    std::vector<int> start(Cp);
-    for (int i = 0; i < n; ++i)
+    const std::size_t N = static_cast<std::size_t>(n);
+    const int nnz = Ap[n];
+    const bool par = nnz > 16 * FEMD_OMP_THRESHOLD;
+    (void)par;
+    const int nch = sort_chunks(par), chunk = (n + nch - 1) / nch;
+    // the transpose of the pattern (Tp, Ti), and whether each row of A is increasing
+    std::vector<int> cnt(static_cast<std::size_t>(nch) * N, 0), Tp(N + 1, 0), Ti(static_cast<std::size_t>(nnz));
+    std::vector<char> sorted(N, 1);
+    int bad = 0;
+    FEMD_OMP(parallel for schedule(static, 1) reduction(| : bad) if (nch > 1))
+    for (int c = 0; c < nch; ++c)
     {
-        auto b = Ci.begin() + start[i], e = Ci.begin() + start[i + 1];
-        std::sort(b, e);
-        auto u = std::unique(b, e);
-        const int keep = static_cast<int>(u - b);
-        std::copy(b, u, Ci.begin() + q);
-        Cp[i] = q;
-        q += keep;
+        int *cc = cnt.data() + static_cast<std::size_t>(c) * N;
+        for (int i = c * chunk; i < std::min(n, (c + 1) * chunk); ++i)
+            for (int p = Ap[i]; p < Ap[i + 1]; ++p)
+            {
+                const int j = Ai[p];
+                if (j < 0 || j >= n) { bad |= 1; continue; }
+                ++cc[j];
+                if (p > Ap[i] && Ai[p - 1] >= j) sorted[i] = 0;
+            }
     }
-    Cp[n] = q;
-    Ci.resize(static_cast<std::size_t>(q));
+    if (bad) throw std::invalid_argument("amd: column index out of range");
+    for (int j = 0; j < n; ++j)
+    {
+        int off = Tp[j];
+        for (int c = 0; c < nch; ++c)
+        {
+            int &x = cnt[static_cast<std::size_t>(c) * N + j];
+            const int t = x;
+            x = off;
+            off += t;
+        }
+        Tp[j + 1] = off;
+    }
+    FEMD_OMP(parallel for schedule(static, 1) if (nch > 1))
+    for (int c = 0; c < nch; ++c)
+    {
+        int *pos = cnt.data() + static_cast<std::size_t>(c) * N;
+        for (int i = c * chunk; i < std::min(n, (c + 1) * chunk); ++i)
+            for (int p = Ap[i]; p < Ap[i + 1]; ++p) Ti[pos[Ai[p]]++] = i;
+    }
+    std::vector<int>().swap(cnt);
+    // merge row i of A (sorted first if it is not) and row i of A^T, without the diagonal and
+    // without repeats, into a buffer of room |A_i| + |A^T_i| per row; then pack
+    std::vector<int> room(N + 1, 0), len(N + 1, 0);
+    for (int i = 0; i < n; ++i) room[i + 1] = room[i] + (Ap[i + 1] - Ap[i]) + (Tp[i + 1] - Tp[i]);
+    std::vector<int> buf(static_cast<std::size_t>(room[n]));
+    FEMD_OMP(parallel if (par))
+    {
+        std::vector<int> tmp;
+        FEMD_OMP(for schedule(dynamic, 1024))
+        for (int i = 0; i < n; ++i)
+        {
+            const int *a = Ai + Ap[i], *ae = Ai + Ap[i + 1];
+            if (!sorted[i])
+            {
+                tmp.assign(a, ae);
+                std::sort(tmp.begin(), tmp.end());
+                a = tmp.data(); ae = a + tmp.size();
+            }
+            const int *t = Ti.data() + Tp[i], *te = Ti.data() + Tp[i + 1];
+            int *o = buf.data() + room[i], *o0 = o;
+            int last = -1;
+            while (a != ae || t != te)
+            {
+                int v;
+                if (t == te || (a != ae && *a <= *t)) v = *a++;
+                else v = *t++;
+                if (v != i && v != last) *o++ = v;
+                last = v;
+            }
+            len[i + 1] = static_cast<int>(o - o0);
+        }
+    }
+    Cp.assign(N + 1, 0);
+    for (int i = 0; i < n; ++i) Cp[i + 1] = Cp[i] + len[i + 1];
+    Ci.resize(static_cast<std::size_t>(Cp[n]));
+    FEMD_OMP(parallel for schedule(static) if (par))
+    for (int i = 0; i < n; ++i) std::copy(buf.data() + room[i], buf.data() + room[i] + len[i + 1], Ci.data() + Cp[i]);
 }
 
 } // namespace detail
