@@ -891,22 +891,21 @@ private:
                     }
             }
         }
+        // where each row of L of a top node enters its block (the rows are increasing: a binary search)
         lrow_blk_.assign(static_cast<std::size_t>(ntop_), 0);
+        const bool parq = ntop_ > FEMD_OMP_THRESHOLD / 4;
+        (void)parq;
+        FEMD_OMP(parallel for schedule(static) if (parq))
         for (int q = 0; q < ntop_; ++q)
-        {
-            int p = lrow_ptr_[q];
-            while (p < lrow_ptr_[q + 1] && lrow_j_[p] < blk0[q]) ++p;
-            lrow_blk_[q] = p;
-        }
+            lrow_blk_[q] = static_cast<int>(std::lower_bound(lrow_j_.begin() + lrow_ptr_[q], lrow_j_.begin() + lrow_ptr_[q + 1], blk0[q]) - lrow_j_.begin());
         // the rows of U of the top nodes (their columns are top nodes, increasing), split where the
         // columns leave the block of the row
         urow_blk_.assign(static_cast<std::size_t>(ntop_), 0);
+        FEMD_OMP(parallel for schedule(static) if (parq))
         for (int q = 0; q < ntop_; ++q)
         {
             const int i = top_[q];
-            int p = Up_[i] + 1;
-            while (p < Up_[i + 1] && Ui_[p] <= blk1[q]) ++p;
-            urow_blk_[q] = p;
+            urow_blk_[q] = static_cast<int>(std::upper_bound(Ui_.begin() + (Up_[i] + 1), Ui_.begin() + Up_[i + 1], blk1[q]) - Ui_.begin());
         }
     }
 };

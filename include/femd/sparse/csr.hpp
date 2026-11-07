@@ -16,6 +16,7 @@
 
 #include "femd/util/omp.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iterator>
 #include <memory>
@@ -32,6 +33,39 @@ struct SparsityPattern {
     std::vector<int> indices;     // nnz, sorted and unique within each row
 
     int nnz() const { return indptr.empty() ? 0 : indptr.back(); }
+
+    /**
+     * @brief For every stored entry (i, j) of a square pattern, the position of (j, i), or -1 when
+     *        that is not stored.  Built on the first call (in parallel over the rows) and kept with
+     *        the pattern, which is not changed once it is shared; a copy of the pattern starts
+     *        without it.  Safe to call from several threads.
+     */
+    std::shared_ptr<const std::vector<int>> mirror() const
+    {
+        std::shared_ptr<const std::vector<int>> m = std::atomic_load(&mirror_.p);
+        if (m) return m;
+        auto b = std::make_shared<std::vector<int>>(static_cast<std::size_t>(nnz()), -1);
+        if (nrows == ncols)
+        {
+            int *mv = b->data();
+            FEMD_OMP_FOR_IF(nrows > FEMD_OMP_THRESHOLD)
+            for (int i = 0; i < nrows; ++i)
+                for (int p = indptr[i]; p < indptr[i + 1]; ++p) mv[p] = find(indices[p], i);
+        }
+        std::shared_ptr<const std::vector<int>> expected;
+        std::shared_ptr<const std::vector<int>> built = b;
+        if (std::atomic_compare_exchange_strong(&mirror_.p, &expected, built)) return built;
+        return expected;                                  // another thread stored it first
+    }
+
+    /// The cache of mirror(): not copied with the pattern.
+    struct MirrorCache {
+        std::shared_ptr<const std::vector<int>> p;
+        MirrorCache() = default;
+        MirrorCache(const MirrorCache &) {}
+        MirrorCache &operator=(const MirrorCache &) { p.reset(); return *this; }
+    };
+    mutable MirrorCache mirror_;
 
     /// @brief Position of (i, j) in the value array, or -1 when it is not in the pattern.
     int find(int i, int j) const
@@ -598,13 +632,14 @@ inline double asymmetry(const CSRMatrix &A)
 {
     if (A.nrows() != A.ncols()) return 1.0;
     double big = 0.0, d = 0.0;             // maxima: exact, so any order gives the same bits
-    const int n = A.nrows();
-    FEMD_OMP_FOR_REDUCE_IF(max, big, A.nnz() > FEMD_OMP_THRESHOLD)
-    for (int p = 0; p < A.nnz(); ++p) big = std::max(big, std::abs(A.data[p]));
-    FEMD_OMP_FOR_REDUCE_IF(max, d, n > FEMD_OMP_THRESHOLD)
-    for (int i = 0; i < n; ++i)
-        for (int p = A.indptr()[i]; p < A.indptr()[i + 1]; ++p)
-            d = std::max(d, std::abs(A.data[p] - A.at(A.indices()[p], i)));
+    const int nnz = A.nnz();
+    const std::shared_ptr<const std::vector<int>> mir = A.pattern->mirror();   // the position of (j, i), kept with the pattern
+    const int *mp = mir->data();
+    const double *v = A.data.data();
+    FEMD_OMP_FOR_REDUCE_IF(max, big, nnz > FEMD_OMP_THRESHOLD)
+    for (int p = 0; p < nnz; ++p) big = std::max(big, std::abs(v[p]));
+    FEMD_OMP_FOR_REDUCE_IF(max, d, nnz > FEMD_OMP_THRESHOLD)
+    for (int p = 0; p < nnz; ++p) d = std::max(d, std::abs(v[p] - (mp[p] >= 0 ? v[mp[p]] : 0.0)));
     return big > 0.0 ? d / big : 0.0;
 }
 

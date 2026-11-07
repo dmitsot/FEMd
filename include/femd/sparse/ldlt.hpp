@@ -995,8 +995,8 @@ private:
         for (int s : ftop_) std::vector<int>().swap(fronts_[s].slot);
     }
 
-    /// Forward with one front: the triangle of its pivots column by column, then the rows below them
-    /// one dot product each (in parallel when par and large).  buf: the gather buffer of its subtree.
+    /// Forward with one front: the triangle of its pivots column by column, then the rows below them in
+    /// blocks of 64 (in parallel over the blocks when par and large).  buf: the gather buffer of its subtree.
     static void forward(const Front &f, double *y, double *buf, bool par)
     {
         const int m = f.m, ne = f.ne;
@@ -1011,24 +1011,33 @@ private:
             const double *Lc = L + static_cast<std::size_t>(c) * M;
             for (int i = c + 1; i < ne; ++i) y[ix[i]] -= Lc[i] * yc;
         }
-        const int below = m - ne;
-        auto row = [&](int i) {
-            double v = 0.0;
-            for (int c = 0; c < ne; ++c) v += L[static_cast<std::size_t>(c) * M + i] * y[ix[c]];
-            return v;
-        };
-        if (buf)
-        {
-            const int *slot = f.slot.data();
-            for (int a = 0; a < below; ++a)
+        // the rows below the pivots in blocks of RB: each pivot column is read down its block (contiguous)
+        // and added into RB running sums, so every row still sums its terms in the pivot order
+        constexpr int RB = 64;
+        const int below = m - ne, nblk = (below + RB - 1) / RB;
+        auto block = [&](int g) {
+            const int a0 = g * RB, nb = std::min(RB, below - a0);
+            double acc[RB];
+            for (int r = 0; r < nb; ++r) acc[r] = 0.0;
+            for (int c = 0; c < ne; ++c)
             {
-                const double v = row(ne + a);
-                if (slot[a] < 0) y[ix[ne + a]] -= v;
-                else buf[slot[a]] += v;
+                const double yc = y[ix[c]];
+                const double *Lc = L + static_cast<std::size_t>(c) * M + ne + a0;
+                for (int r = 0; r < nb; ++r) acc[r] += Lc[r] * yc;
             }
-        }
-        else loop(par && static_cast<long>(below) * ne > 8L * FEMD_OMP_THRESHOLD, below,
-                  [&](int a) { y[ix[ne + a]] -= row(ne + a); });
+            if (buf)
+            {
+                const int *slot = f.slot.data() + a0;
+                for (int r = 0; r < nb; ++r)
+                {
+                    if (slot[r] < 0) y[ix[ne + a0 + r]] -= acc[r];
+                    else buf[slot[r]] += acc[r];
+                }
+            }
+            else
+                for (int r = 0; r < nb; ++r) y[ix[ne + a0 + r]] -= acc[r];
+        };
+        loop(!buf && par && static_cast<long>(below) * ne > 8L * FEMD_OMP_THRESHOLD, nblk, block);
     }
 
     /// Backward with one front: each pivot column's dot product with the rows below the pivots (in

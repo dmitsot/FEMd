@@ -26,6 +26,7 @@
 #include "femd/forms/facet_assembly_2d.hpp"
 #include "femd/forms/integrand.hpp"
 #include "femd/sparse/csr.hpp"
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
@@ -255,7 +256,11 @@ public:
             const std::size_t nt = G.terms.size();
             std::vector<int> a(nt), b(nt), sa(nt), sb(nt);
             for (std::size_t t = 0; t < nt; ++t) { a[t] = G.terms[t].a; b[t] = G.terms[t].b; sa[t] = G.terms[t].sa; sb[t] = G.terms[t].sb; }
-            if (G.QT) assemble_matrix_2d(*G.QT, *G.QS, a, b, cs, K, G.toff, G.roff);
+            if (G.QT)
+            {
+                const std::shared_ptr<const ScatterMap> map = scatter_map(G, K);
+                assemble_matrix_2d(*G.QT, *G.QS, a, b, cs, K, G.toff, G.roff, map->pos.data());
+            }
             else assemble_facet_matrix_2d(*G.FT, *G.FS, sa, sb, a, b, cs, K, G.toff, G.roff);
         }
     }
@@ -273,13 +278,37 @@ private:
         std::vector<int> inputs, consts;
         int a = 0, b = 0, sa = 0, sb = 0;
     };
+    // the position in the matrix data of every element entry of a cell group, for the pattern it was
+    // built on (scatter_map_2d), kept with the group and rebuilt only when the pattern changes
+    struct ScatterMap {
+        std::shared_ptr<const SparsityPattern> pattern;
+        std::vector<int> pos;
+    };
     struct Group {
         const Cache2D *QT = nullptr, *QS = nullptr;
         const InteriorFacetCache2D *FT = nullptr, *FS = nullptr;
         int toff = 0, roff = 0;
         std::size_t npts = 0;
         std::vector<Term> terms;
+        mutable std::shared_ptr<const ScatterMap> map;
     };
+
+    /// The scatter map of cell group G for K's pattern: the kept one when it was built on that pattern
+    /// (the same object, or equal arrays), else a new one, kept for the next call.  Safe to call from
+    /// several threads (each builds its own when they race; the last one is kept).
+    static std::shared_ptr<const ScatterMap> scatter_map(const Group &G, const CSRMatrix &K)
+    {
+        std::shared_ptr<const ScatterMap> m = std::atomic_load(&G.map);
+        if (m && (m->pattern == K.pattern ||
+                  (m->pattern->indptr == K.pattern->indptr && m->pattern->indices == K.pattern->indices)))
+            return m;
+        auto b = std::make_shared<ScatterMap>();
+        b->pattern = K.pattern;
+        b->pos = scatter_map_2d(*G.QT, *G.QS, *K.pattern, G.toff, G.roff);
+        std::shared_ptr<const ScatterMap> built = b;
+        std::atomic_store(&G.map, built);
+        return built;
+    }
     struct Values {
         std::vector<std::vector<double>> buf;      // one buffer per field, its codes one after the other
         std::vector<const double *> at;            // value array i -> npts doubles

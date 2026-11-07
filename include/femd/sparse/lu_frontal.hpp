@@ -72,6 +72,11 @@ inline std::complex<double> mul(const std::complex<double> &a, const std::comple
 // multiplied by components (no NaN recovery of the library product, which keeps the loop vectorizable).
 template <class T> struct Kernel;
 
+// a front of the top with at least this many rows is zeroed, assembled and stored in parallel
+#ifndef FEMD_LU_PARFRONT
+#define FEMD_LU_PARFRONT 128
+#endif
+
 // The rows ps0 .. k0-1 of column j of U from those of F: the forward substitution with the panel's unit
 // lower triangle L(t2, t) = F(t2, t), t < t2 < k0 (column j of F is m long, column-major).
 template <class T>
@@ -422,6 +427,19 @@ struct Factor {
     }
 
 private:
+    // Run body(g) for g < count: in parallel when par (a new team, dynamic schedule), else in order.
+    template <class Body>
+    static void loop(bool par, int count, Body &&body)
+    {
+        if (par)
+        {
+            FEMD_OMP(parallel for schedule(dynamic, 8))
+            for (int g = 0; g < count; ++g) body(g);
+        }
+        else
+            for (int g = 0; g < count; ++g) body(g);
+    }
+
     std::vector<std::vector<int>> cb_r_, cb_c_, delay_r_, delay_c_;   // contribution blocks and delayed variables, per supernode
     std::vector<std::vector<T>> cb_;
 
@@ -442,24 +460,32 @@ private:
         fr.m = m; fr.p = p;
         st.max_front = std::max(st.max_front, m);
         for (int t = 0; t < m; ++t) { locr[ridx[t]] = t; locc[cidx[t]] = t; }
-        F.assign(static_cast<std::size_t>(m) * m, T(0));
+        const std::size_t M = static_cast<std::size_t>(m);
+        // a large front of the top is zeroed, assembled and stored in parallel (over columns, or over
+        // the supernode's variables: every entry still gets the same contributions in the same order)
+        const bool big = par && m >= FEMD_LU_PARFRONT;
+        if (F.size() < M * M) F.resize(M * M);
+        loop(big, m, [&](int c) { std::fill(F.begin() + static_cast<std::ptrdiff_t>(c * M), F.begin() + static_cast<std::ptrdiff_t>((c + 1) * M), T(0)); });
         // the entries of A, each in the front of the earlier of its two variables: from the rows
-        // of the supernode's variables the entries at variables of the supernode or beyond, from
-        // their columns the entries at rows beyond the supernode
-        for (int j = f; j <= l; ++j)
-        {
-            const int r = perm[j];
+        // of the supernode's variables the entries at variables of the supernode or beyond (row
+        // locr[j] of the front: distinct for each j), from their columns the entries at rows beyond
+        // the supernode (column locc[j])
+        loop(big, l - f + 1, [&](int g) {
+            const int j = f + g, r = perm[j];
             for (int q = Ap[r]; q < Ap[r + 1]; ++q)
             {
                 const int i = pinv[Ai[q]];
-                if (i >= f) F[static_cast<std::size_t>(locc[i]) * m + locr[j]] += Ax[q];
+                if (i >= f) F[static_cast<std::size_t>(locc[i]) * M + locr[j]] += Ax[q];
             }
+        });
+        loop(big, l - f + 1, [&](int g) {
+            const int j = f + g, r = perm[j];
             for (int q = Cp[r]; q < Cp[r + 1]; ++q)
             {
                 const int i = pinv[Ci[q]];
-                if (i > l) F[static_cast<std::size_t>(locc[j]) * m + locr[i]] += Cx[q];
+                if (i > l) F[static_cast<std::size_t>(locc[j]) * M + locr[i]] += Cx[q];
             }
-        }
+        });
         // the children's contribution blocks
         for (int c : sn_children[s])
         {
@@ -470,12 +496,11 @@ private:
             rl.resize(static_cast<std::size_t>(mc));
             for (int a = 0; a < mc; ++a) rl[a] = locr[cr[a]];
             const int *rlv = rl.data();
-            for (int b = 0; b < mc; ++b)
-            {
-                T *Fcol = &F[static_cast<std::size_t>(locc[ccol[b]]) * m];
+            loop(big && mc >= FEMD_LU_PARFRONT, mc, [&](int b) {           // distinct columns of the front
+                T *Fcol = &F[static_cast<std::size_t>(locc[ccol[b]]) * M];
                 const T *Cb = &C[static_cast<std::size_t>(b) * mc];
                 for (int a = 0; a < mc; ++a) Fcol[rlv[a]] += Cb[a];
-            }
+            });
             std::vector<T>().swap(cb_[c]);
             std::vector<int>().swap(cb_r_[c]); std::vector<int>().swap(cb_c_[c]);
         }
@@ -588,22 +613,25 @@ private:
         delay_c_[s].assign(cidx.begin() + k, cidx.begin() + p);
         st.delayed += p - k;
         // store L (m x ne) and U^T (ne x m), hand the rest of the front to the parent
-        fr.L.assign(F.begin(), F.begin() + static_cast<std::size_t>(k) * m);
-        fr.U.resize(static_cast<std::size_t>(k) * m);
-        for (int j = 0; j < m; ++j)
-        {
-            const T *Fj = &F[static_cast<std::size_t>(j) * m];
+        fr.L.resize(static_cast<std::size_t>(k) * M);
+        fr.U.resize(static_cast<std::size_t>(k) * M);
+        loop(big, m, [&](int j) {
+            const T *Fj = &F[static_cast<std::size_t>(j) * M];
+            if (j < k) std::copy(Fj, Fj + m, fr.L.begin() + static_cast<std::ptrdiff_t>(j * M));
             T *Uj = &fr.U[static_cast<std::size_t>(j) * k];
             for (int c = 0; c < k; ++c) Uj[c] = c < j ? Fj[c] : T(0);
-        }
+        });
         const int mc = m - k;
         if (mc > 0 && !root)
         {
             cb_r_[s].assign(ridx.begin() + k, ridx.end());
             cb_c_[s].assign(cidx.begin() + k, cidx.end());
             cb_[s].resize(static_cast<std::size_t>(mc) * mc);
-            for (int b = 0; b < mc; ++b)
-                for (int a = 0; a < mc; ++a) cb_[s][static_cast<std::size_t>(b) * mc + a] = F[static_cast<std::size_t>(k + b) * m + (k + a)];
+            T *Cv = cb_[s].data();
+            loop(big, mc, [&](int b) {
+                const T *Fb = &F[static_cast<std::size_t>(k + b) * M + k];
+                std::copy(Fb, Fb + mc, Cv + static_cast<std::size_t>(b) * mc);
+            });
         }
         for (int t = 0; t < m; ++t) { locr[ridx[t]] = -1; locc[cidx[t]] = -1; }
     }

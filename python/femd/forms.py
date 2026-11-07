@@ -1915,7 +1915,9 @@ class _Compiled2D:
     (the NumPy path raises the proper error)."""
 
     def __init__(self, form_, terms):
-        self.form, self.terms, self.rank = form_, terms, terms[0].rank
+        # No reference back to the form: the form keeps this object in form._compiled, and a cycle
+        # would leave a discarded form (with its quadrature caches) to the cyclic garbage collector.
+        self.terms, self.rank = terms, terms[0].rank
         rank = self.rank
         T = form_.test_space if rank else next(iter(form_.spaces.values()))
         R = form_.trial_space if rank == 2 else None
@@ -2071,7 +2073,7 @@ class _Compiled1D:
 
     def __init__(self, form_, terms):
         f = form_
-        self.form, self.terms = f, terms
+        self.terms = terms                                       # no reference back to the form (see _Compiled2D)
         rank = self.rank = terms[0].rank
         T = f.test_space if rank else None
         is_prod = bool(rank) and hasattr(T, "fields") and not hasattr(T, "degree")
