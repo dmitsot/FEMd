@@ -12,6 +12,7 @@
 #ifndef FEMD_FE_CONSTRAINT_OPERATOR_HPP
 #define FEMD_FE_CONSTRAINT_OPERATOR_HPP
 
+#include <string>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -65,6 +66,9 @@ public:
     template <class Scalar>
     std::vector<Scalar> restrict_vector(const std::vector<Scalar> &x) const
     {
+        if (x.size() != static_cast<std::size_t>(n_raw_))
+            throw std::invalid_argument("restrict: the vector has " + std::to_string(x.size()) + " entries, the space has " +
+                                        std::to_string(n_raw_) + " raw functions");
         std::vector<Scalar> y(n_adapted(), Scalar(0));
         for (int j = 0; j < n_adapted(); ++j)
             for (const Entry &en : rows_[j]) y[j] += en.second * x[en.first];
@@ -75,6 +79,9 @@ public:
     template <class Scalar>
     std::vector<Scalar> prolongate(const std::vector<Scalar> &y) const
     {
+        if (y.size() != static_cast<std::size_t>(n_adapted()))
+            throw std::invalid_argument("prolongate: the vector has " + std::to_string(y.size()) + " entries, the space has dim " +
+                                        std::to_string(n_adapted()));
         std::vector<Scalar> x(n_raw_, Scalar(0));
         for (int j = 0; j < n_adapted(); ++j)
             for (const Entry &en : rows_[j]) x[en.first] += en.second * y[j];

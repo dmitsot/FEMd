@@ -102,6 +102,7 @@ inline double ordered_sum(std::size_t n, F &&f, std::size_t par_threshold = FEMD
     }
     const long nc = static_cast<long>((n + reduce_chunk - 1) / reduce_chunk);
     std::vector<double> part(static_cast<std::size_t>(nc));
+    (void)par_threshold;                             // unused without OpenMP
     FEMD_OMP_FOR_IF(n > par_threshold)
     for (long c = 0; c < nc; ++c)
     {

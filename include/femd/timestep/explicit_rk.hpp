@@ -115,6 +115,7 @@ public:
         const std::size_t n = u.size();
         const long nl = static_cast<long>(n);
         const bool par = n > detail::vector_par_threshold;
+        (void)par;                                       // unused without OpenMP
         const int s = T_.s;
         if (k_.size() != static_cast<std::size_t>(s)) k_.assign(static_cast<std::size_t>(s), std::vector<double>());
         U_.resize(n);
@@ -156,6 +157,7 @@ public:
         const std::size_t n = u.size();
         const long nl = static_cast<long>(n);
         const bool par = n > detail::vector_par_threshold;
+        (void)par;                                       // unused without OpenMP
         const int s = T_.s;
         relax_.begin(n, H, opt);
         if (k_.size() != static_cast<std::size_t>(s)) k_.assign(static_cast<std::size_t>(s), std::vector<double>());

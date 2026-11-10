@@ -46,3 +46,36 @@ def _coeff(c):
     if np.isscalar(c):
         return float(c)
     return _vec(c)
+
+
+def _check_solution(x, b, norm, who):
+    """Warn when a direct solve of A x = b gave an x that is not finite for a finite b, or one so
+    large that ||A||_1 ||x||_inf > 1e14 ||b||_inf: the matrix is then singular to working precision
+    (a pure Neumann problem, a missing boundary condition, an unpinned pressure) and x has no
+    correct digit.  The ratio is at most about the condition number, so a well-posed problem never
+    reaches it.  norm is ||A||_1, or None for no check."""
+    if norm is None or x.size == 0:
+        return
+    xm = max(float(x.max()), -float(x.min()))
+    bm = max(float(b.max()), -float(b.min()))
+    if not np.isfinite(bm):
+        return                                    # the right-hand side is already not finite
+    import warnings
+    if not np.isfinite(xm):
+        warnings.warn(f"{who}: the solution is not finite: the matrix is singular (a pure Neumann problem or a missing "
+                      "boundary condition leaves a constant undetermined)", RuntimeWarning, stacklevel=3)
+    elif bm > 0.0 and xm * norm > 1e14 * bm:
+        warnings.warn(f"{who}: the matrix is singular to working precision (||A|| ||x|| / ||b|| = {xm * norm / bm:.1e}), so "
+                      "the solution has no correct digits.  A pure Neumann problem, a missing boundary condition or an "
+                      "unpinned pressure leaves a constant undetermined: fix a value, or add a constraint",
+                      RuntimeWarning, stacklevel=3)
+
+
+def _quiet(S):
+    """A solver used inside an iteration that reports a singular matrix itself (Newton, the stage
+    systems, shift-invert): no conditioning warning from its solves."""
+    try:
+        S._check = False
+    except AttributeError:
+        pass
+    return S

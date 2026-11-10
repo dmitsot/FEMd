@@ -549,13 +549,17 @@ private:
     {
         const long np = static_cast<long>(x.size());
         std::vector<double> out(x.size());
+        // the elements on one thread: element_of throws for a point outside the mesh, and an
+        // exception must not leave an OpenMP region
+        std::vector<int> elem(x.size());
+        for (std::size_t i = 0; i < x.size(); ++i) elem[i] = V.mesh().element_of(x[i]);
         FEMD_OMP_PARALLEL_IF(np > FEMD_OMP_THRESHOLD)
         {
             std::vector<double> vals, raw;
             FEMD_OMP_FOR
             for (long i = 0; i < np; ++i)
             {
-                const int e = V.mesh().element_of(x[static_cast<std::size_t>(i)]);
+                const int e = elem[static_cast<std::size_t>(i)];
                 V.eval_on_element(e, x[static_cast<std::size_t>(i)], k, vals, raw);
                 const std::vector<int> &d = V.element_dofs(e);
                 const int na = static_cast<int>(d.size());

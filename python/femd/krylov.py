@@ -71,7 +71,7 @@ def _callable(f, n, what):
 
 def _operator(A, n):
     """(C++ operator or Python callable, space of the result)."""
-    from . import Matrix, RectMatrix, ProductSpace
+    from . import Matrix, RectMatrix
     from .sparse import SparseMatrix
     if isinstance(A, _C.CSRMatrix):
         if (A.nrows, A.ncols) != (n, n):

@@ -136,7 +136,7 @@ def eigs(a, m=None, k: int = 6, sigma: float = 0.0, symmetric=None, which: str =
         else:
             C = _shifted(A, shift)
         try:
-            S = C.solver(backend) if backend != "auto" else C.solver()
+            S = _quiet(C.solver(backend) if backend != "auto" else C.solver())    # shift-invert amplifies by design
         except Exception as e:
             raise ValueError(f"eigs(): the shifted matrix A - {shift:g} M could not be factored ({e}); sigma may be "
                              "an eigenvalue (a curl-curl or pure Neumann operator has 0 in its spectrum): move it") from None
@@ -193,6 +193,9 @@ def _norm1(A):
         return float(K.norm1())
     from .timestep import _as_sparse
     return float(_as_sparse(A)._K.norm1())
+
+
+from ._util import _quiet  # noqa: E402
 
 
 def _solve(S, b):

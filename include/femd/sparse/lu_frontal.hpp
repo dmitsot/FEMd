@@ -618,7 +618,7 @@ private:
         loop(big, m, [&](int j) {
             const T *Fj = &F[static_cast<std::size_t>(j) * M];
             if (j < k) std::copy(Fj, Fj + m, fr.L.begin() + static_cast<std::ptrdiff_t>(j * M));
-            T *Uj = &fr.U[static_cast<std::size_t>(j) * k];
+            T *Uj = fr.U.data() + static_cast<std::size_t>(j) * k;      // k may be 0 and U empty: no operator[] here
             for (int c = 0; c < k; ++c) Uj[c] = c < j ? Fj[c] : T(0);
         });
         const int mc = m - k;
@@ -688,6 +688,12 @@ public:
                 for (int i = ne; i < m; ++i) pa = std::min(pa, std::min(rstep[fr.ridx[i]], cstep[fr.cidx[i]]));
                 parent_out[fstart[f] + ne - 1] = pa < n ? pa : -1;
             }
+        }
+        {
+            long long tl = 0, tu = 0;                                          // the factors are indexed by int
+            for (int k = 0; k < n; ++k) { tl += Lp[k + 1]; tu += Up[k + 1]; }
+            if (tl > std::numeric_limits<int>::max() || tu > std::numeric_limits<int>::max())
+                throw std::length_error("LU: a factor has more than 2^31 entries");
         }
         for (int k = 0; k < n; ++k) { Lp[k + 1] += Lp[k]; Up[k + 1] += Up[k]; }
         Li.resize(static_cast<std::size_t>(Lp[n])); Lx.resize(Li.size());

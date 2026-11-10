@@ -25,6 +25,10 @@ from ._util import _vec, _coeff, _real_linear  # noqa: F401
 from .forms import Function, _Context
 from .transfer import Transfer
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:                                  # for the annotations only: linalg imports this module
+    from .linalg import Matrix
+
 
 def _point_values(f, pts, what: str = "interpolate") -> np.ndarray:
     """Values of f at the 1D points pts, one per point.
@@ -607,6 +611,9 @@ class DGSpace(_SpaceMixin, _C.DGSpace):
                 raise TypeError(f"{cls.__name__} is a 1D space; build the 2D space with fd.DGSpace(mesh, k)")
             from .elements2d import DGSpace2D
             return DGSpace2D(grid, *args, **kw)              # not an instance of cls: __init__ is skipped
+        if type(grid).__name__ == "QuadMesh":
+            raise TypeError("DGSpace: the 2D DG spaces are on triangles; a QuadMesh has none yet "
+                            "(use a triangular Mesh2D, or fd.LagrangeSpace on the QuadMesh)")
         return super().__new__(cls)
 
     def __init__(self, grid, degree: int, bc="free", basis: str = "legendre"):

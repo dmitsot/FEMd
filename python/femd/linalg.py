@@ -12,7 +12,7 @@ import scipy.sparse as sp
 
 from . import _femd as _C
 from ._femd import QuadratureCache, Solver, has_fftw
-from ._util import _vec, _coeff, _by_columns
+from ._util import _coeff, _by_columns, _check_solution
 from .spaces import ProductSpace, LagrangeSpace, SplineSpace, _space_of
 from .forms import Function, ProductFunction, Form, form
 
@@ -21,8 +21,9 @@ class LinearSolver:
     """A factored operator.  solve(b) returns a Function in the operator's space when that
     space is known (a matrix from a form or from V.cache()), otherwise an ndarray.
     solve(b, into=u) writes into an existing Function.  .vector on the result gives the array."""
-    def __init__(self, impl: "_C.LinearSolver", space=None):
+    def __init__(self, impl: "_C.LinearSolver", space=None, norm=None):
         self._impl, self.space = impl, space
+        self._norm, self._check = norm, True      # ||A||_1 for the conditioning warning of solve()
 
     @property
     def backend(self): return self._impl.backend
@@ -43,7 +44,10 @@ class LinearSolver:
                 raise TypeError("solve(): a complex right-hand side gives a complex array; into= and lift= need a real one")
             bc = bc.reshape(-1)       # the factorization is real: solve the two parts
             return (self._impl.solve(np.ascontiguousarray(bc.real)) + 1j * self._impl.solve(np.ascontiguousarray(bc.imag)))
-        x = self._impl.solve(np.ascontiguousarray(np.asarray(bc, dtype=np.float64).reshape(-1)))
+        bv = np.ascontiguousarray(np.asarray(bc, dtype=np.float64).reshape(-1))
+        x = self._impl.solve(bv)
+        if self._check:
+            _check_solution(x, bv, self._norm, "solve()")
         if lift is not None:
             return self._with_lift(x, into, lift)
         if into is not None:
@@ -211,7 +215,7 @@ class Matrix:
             if backend == Solver.Circulant and "not circulant" in str(e):
                 raise ValueError(self._why_not_circulant()) from None
             raise
-        return LinearSolver(impl, self.space)
+        return LinearSolver(impl, self.space, float(self._K.norm1()))
 
     def _why_not_circulant(self) -> str:
         """The FFT backend refused this matrix, which it does by measurement.  Name the cause."""

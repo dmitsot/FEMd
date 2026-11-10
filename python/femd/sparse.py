@@ -13,11 +13,9 @@ fd.lgmres, reads the store directly.
 """
 from __future__ import annotations
 
-import warnings
-
 import numpy as np
 
-from ._util import _by_columns
+from ._util import _by_columns, _check_solution
 import scipy.sparse as sp
 
 from . import _femd as _C
@@ -469,7 +467,12 @@ class SparseSolver:
             if into is not None or lift is not None:
                 raise TypeError("solve(): a complex right-hand side gives a complex array; into= and lift= need a real one")
             return self._solve_array(np.ascontiguousarray(bc.real)) + 1j * self._solve_array(np.ascontiguousarray(bc.imag))
-        x = np.asarray(self._solve_array(np.ascontiguousarray(bc, dtype=np.float64).reshape(-1)), dtype=np.float64)
+        bv = np.ascontiguousarray(bc, dtype=np.float64).reshape(-1)
+        x = np.asarray(self._solve_array(bv), dtype=np.float64)
+        if getattr(self, "_check", True) and self.backend in ("cholesky", "ldlt", "lu", "superlu", "dense"):
+            if getattr(self, "_norm", None) is None:
+                self._norm = float(self.A._K.norm1())                # once, at the first solve
+            _check_solution(x, bv, self._norm, "solve()")
         if lift is not None:
             return _with_lift(self.space, x, into, lift)
         if into is not None:

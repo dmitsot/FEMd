@@ -70,6 +70,7 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -523,6 +524,9 @@ private:
             const double ap = std::abs(pivot);
             minpiv_ = k == 0 ? ap : std::min(minpiv_, ap);
             maxpiv_ = std::max(maxpiv_, ap);
+            if (static_cast<long long>(lnz) + nl > std::numeric_limits<int>::max() ||
+                static_cast<long long>(unz) + nu + 1 > std::numeric_limits<int>::max())
+                throw std::length_error("LU: a factor has more than 2^31 entries");
             grow(Li_, Lx_, static_cast<std::size_t>(lnz + nl));
             grow(Ui_, Ux_, static_cast<std::size_t>(unz + nu + 1));
             // U(:, k): the pivoted rows, then the pivot last on the diagonal

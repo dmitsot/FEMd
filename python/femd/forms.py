@@ -20,8 +20,6 @@ Rank = number of unresolved argument slots: TestFunction -> row, TrialFunction
 """
 from __future__ import annotations
 
-import itertools
-import math
 import warnings
 
 import numpy as np
@@ -794,6 +792,17 @@ def TrialFunction(V):
     return _vector_argument("trial", V) if _is_system_2d(V) else Argument("trial", V)
 
 
+def _checked_vector(a, n, what):
+    """A coefficient vector assigned to .vector: one-dimensional, of the space's dimension.  An
+    ndarray is kept as it is (no copy), so u.vector = a still shares memory with a."""
+    if not isinstance(a, np.ndarray):
+        a = np.asarray(a, dtype=np.float64)
+    if a.ndim != 1 or a.shape[0] != n:
+        raise ValueError(f"{what}.vector: expected a one-dimensional array of length {n} (the dimension of the "
+                         f"space), got shape {a.shape}")
+    return a
+
+
 class Function(Argument):
     """A known field in a space: an Argument that CARRIES its coefficient vector.
 
@@ -832,11 +841,12 @@ class Function(Argument):
                           "pass name=... if you have more than one Function", stacklevel=2)
             name = "w"
         super().__init__("func", V, name=name, owner=self)
-        if vector is None: self.vector = np.zeros(V.dim)
-        elif isinstance(vector, Expr): self.vector = np.array(_as_vector(vector, V), dtype=np.float64)
-        else: self.vector = np.array(vector, dtype=np.float64).reshape(-1)
-        if self.vector.shape != (V.dim,):
-            raise ValueError(f"Function: vector length {self.vector.size} != V.dim = {V.dim}")
+        if vector is None: vec = np.zeros(V.dim)
+        elif isinstance(vector, Expr): vec = np.array(_as_vector(vector, V), dtype=np.float64)
+        else: vec = np.array(vector, dtype=np.float64).reshape(-1)
+        if vec.shape != (V.dim,):
+            raise ValueError(f"Function: vector length {vec.size} != V.dim = {V.dim}")
+        self._vector = vec
 
     # A Function supplies its own values, so its owner is itself.  Stored as an attribute
     # that would be a reference cycle, which refcounting never frees: every A @ x and
@@ -851,6 +861,14 @@ class Function(Argument):
         if value is not None and value is not self:
             raise AttributeError("a Function is its own owner")
 
+    @property
+    def vector(self):
+        return self._vector
+
+    @vector.setter
+    def vector(self, a):
+        self._vector = _checked_vector(a, self.space.dim, "Function")
+
     @classmethod
     def _adopt(cls, V, name, vector):
         """Wrap a fresh float64 array of length V.dim that the caller hands over: no copy,
@@ -859,7 +877,7 @@ class Function(Argument):
             return VectorElementFunction(V, name, vector, _copy=False)
         f = cls.__new__(cls)
         Argument.__init__(f, "func", V, name=name, owner=f)
-        f.vector = vector
+        f._vector = vector                       # no checks: the library made it
         return f
 
     # ---- values --------------------------------------------------------------
@@ -992,9 +1010,17 @@ class ProductFunction:
 
     On a 2D mesh it unpacks by BLOCK: for W = ProductSpace(VectorFunctionSpace(m, 2), Q),
     u, p = w gives the velocity as a vector expression and the pressure as a scalar one."""
+    @property
+    def vector(self):
+        return self._vector
+
+    @vector.setter
+    def vector(self, a):
+        self._vector = _checked_vector(a, self.product.dim, type(self).__name__)
+
     def __init__(self, P, name="w", vector=None):
         self.product, self.name = P, name
-        self.vector = np.zeros(P.dim) if vector is None else np.array(vector, dtype=np.float64).reshape(-1)
+        self._vector = np.zeros(P.dim) if vector is None else np.array(vector, dtype=np.float64).reshape(-1)
         if self.vector.shape != (P.dim,):
             raise ValueError(f"ProductFunction: vector length {self.vector.size} != dim = {P.dim}")
         self.components = tuple(_element_vector("func", f, field=i, product=P, name=name, owner=self)
@@ -1144,14 +1170,22 @@ class VectorElementFunction(ListTensor):
         w.at(points)                    # (n, 2) values; w.at(points, what="div") the divergence
         w.vector                        # the coefficients (normal or tangential moments)"""
 
+    @property
+    def vector(self):
+        return self._vector
+
+    @vector.setter
+    def vector(self, a):
+        self._vector = _checked_vector(a, self.space.dim, "Function")
+
     def __init__(self, V, name="w", vector=None, _copy=True):
         self.space, self.name = V, name
         if vector is None:
-            self.vector = np.zeros(V.dim)
+            self._vector = np.zeros(V.dim)
         elif isinstance(vector, (Expr, ListTensor)):
-            self.vector = _element_combination(vector, V)
+            self._vector = _element_combination(vector, V)
         else:
-            self.vector = np.array(vector, dtype=np.float64).reshape(-1) if _copy else vector
+            self._vector = np.array(vector, dtype=np.float64).reshape(-1) if _copy else vector
         if self.vector.shape != (V.dim,):
             raise ValueError(f"Function: vector length {self.vector.size} != V.dim = {V.dim}")
         ListTensor.__init__(self, [Argument("func", V, name=name, owner=self, comp=c) for c in (0, 1)])
@@ -1249,6 +1283,9 @@ class Measure:
                 raise ValueError(f"dx: scheme must be 'gauss' or 'lobatto', got {scheme!r}")
             if quad_degree is not None and scheme == "lobatto" and int(quad_degree) < 2:
                 raise ValueError("dx(n, scheme='lobatto'): a Gauss-Lobatto rule needs at least 2 points")
+            if quad_degree is not None and int(quad_degree) < 1:
+                raise ValueError(f"dx(n): n must be at least 1 (Gauss points per element in 1D, the degree of "
+                                 f"exactness in 2D), got {quad_degree}; dx alone takes the default rule")
             return Measure("dx", None, quad_degree, scheme)
         if scheme is not None:
             raise TypeError("scheme= is a quadrature option of dx; ds is a point evaluation in 1D")
@@ -2331,7 +2368,6 @@ class Form:
                 codes2d.setdefault((k[0], a.field, a.side), set()).add(a.code())
         self._codes2d = codes2d
         self.functions = sorted({a.name for a in funcs.values()})
-        owners = [a.owner for a in funcs.values() if a.owner is not None]
         consts = []
         for t in self.terms:
             collect_constants(t.coeff, consts)
@@ -2475,6 +2511,14 @@ class Form:
                 Q = _C.InteriorFacetCache2D(space, self.interior_degree)
             else:
                 where = key[1]
+                if where != "both":
+                    marks = getattr(getattr(space, "mesh", None), "segment_markers", None)
+                    if marks is not None:
+                        present = set(np.asarray(marks).tolist())
+                        missing = [m for m in where if m not in present]
+                        if missing:
+                            raise ValueError(f"ds({', '.join(str(m) for m in where)}): no side of the mesh carries "
+                                             f"marker(s) {missing}; the markers present are {sorted(present)}")
                 Q = space.boundary_cache(self.facet_degree, None if where == "both" else list(where))
             self._caches[ck] = Q
         return Q
@@ -2722,10 +2766,12 @@ class Form:
         if missing:
             raise KeyError(f"missing values for Function(s) {missing}")
         if self.constant and self._constant_result is not None:
-            return self._constant_result
+            # a vector is handed out as a copy: the caller may change it in place (b -= A @ u)
+            r = self._constant_result
+            return r.copy() if isinstance(r, np.ndarray) else r
         result = self._assemble_terms(self.terms, values, Matrix)
         if self.constant:
-            self._constant_result = result
+            self._constant_result = result.copy() if isinstance(result, np.ndarray) else result
         return result
 
     def derivative(self, wrt, space=None, part="all"):

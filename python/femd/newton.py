@@ -243,7 +243,6 @@ def newton(R, u, left=None, right=None, *, dirichlet=None, tol=1e-10, rtol=0.0, 
         return np.array(R.assemble(), dtype=np.float64)
 
     # ---- the Jacobian-vector product for the Krylov modes
-    Jmat = [None]
     if jv == "exact":
         dv = (ProductFunction(V, "_newton_direction") if isinstance(V, ProductSpace) and getattr(V, "tdim", 1) == 1
               else Function(V, "_newton_direction", _infer=False))
@@ -277,7 +276,8 @@ def newton(R, u, left=None, right=None, *, dirichlet=None, tol=1e-10, rtol=0.0, 
     frozen = [None]
 
     def factor(M):
-        return M.solver(backend)
+        from ._util import _quiet
+        return _quiet(M.solver(backend))                 # Newton reports a singular Jacobian itself
 
     def preconditioner():
         if precond is None:

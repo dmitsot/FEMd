@@ -16,6 +16,8 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
+
+from ._util import _quiet
 import scipy.sparse as sp
 
 from ._util import _norm2
@@ -29,17 +31,17 @@ __all__ = ["newton_system", "IRK", "SSPRK", "ERK", "RelaxInfo", "butcher"]
 def _linear_solve(Jx, r, backend):
     from . import Matrix, RectMatrix, LinearSolver
     if isinstance(Jx, Matrix):
-        return np.asarray(Jx.solver(backend).solve(r), dtype=np.float64)
+        return np.asarray(_quiet(Jx.solver(backend)).solve(r), dtype=np.float64)
     if isinstance(Jx, RectMatrix):
         if Jx.shape[0] != Jx.shape[1]:
             raise ValueError(f"newton_system: J(x) is {Jx.shape[0]} x {Jx.shape[1]}, not square")
         from .sparse import SparseMatrix
         S = SparseMatrix(Jx._K.copy(), Jx.col_space, Jx.row_space)
-        return np.asarray(S.solver("lu").solve(r), dtype=np.float64)
+        return np.asarray(_quiet(S.solver("lu")).solve(r), dtype=np.float64)
     if isinstance(Jx, LinearSolver) or (hasattr(Jx, "solve") and not sp.issparse(Jx) and not isinstance(Jx, np.ndarray)):
         return np.asarray(Jx.solve(r), dtype=np.float64)
     if sp.issparse(Jx):                                       # a SciPy matrix: FEMd's sparse LU
-        return np.asarray(_as_sparse(Jx).solver("lu").solve(r), dtype=np.float64)
+        return np.asarray(_quiet(_as_sparse(Jx).solver("lu")).solve(r), dtype=np.float64)
     if isinstance(Jx, np.ndarray):                            # a dense array: FEMd's dense LU
         from . import _femd as _C
         return np.asarray(_C.DenseLU(np.ascontiguousarray(Jx, dtype=np.float64)).solve(np.ascontiguousarray(r, dtype=np.float64)))
@@ -196,28 +198,29 @@ class _Rhs:
     `time` is the Constant set to t before every evaluation.  With `lifted`, U is the full field
     in V.unconstrained and every Jacobian is taken with respect to the coefficients in V."""
 
-    def __init__(self, rhs, jacobian, unknown, V, time, lifted, need_jacobian=True):
+    def __init__(self, rhs, jacobian, unknown, V, time, lifted, need_jacobian=True, who="IRK"):
+        self.who = who
         from . import Form, ProductSpace
         from . import Matrix as _BandMatrix
         from .sparse import SparseMatrix
         from .forms import Constant, Function, ProductFunction
         Matrix = (_BandMatrix, SparseMatrix)
         if time is not None and not isinstance(time, Constant):
-            raise TypeError("IRK: time= must be an fd.Constant (the one the right-hand side's forms contain)")
+            raise TypeError(f"{who}: time= must be an fd.Constant (the one the right-hand side's forms contain)")
         self.time, self.lifted, self.V = time, lifted, V
         self.callable = callable(rhs) and not isinstance(rhs, (Matrix, Form, list, tuple))
         if self.callable:
             if lifted:
-                raise ValueError("IRK: boundary data need the right-hand side as Forms, so that it can act "
+                raise ValueError(f"{who}: boundary data need the right-hand side as Forms, so that it can act "
                                  "on the lifted field; a callable cannot")
             if jacobian is None and need_jacobian:
-                raise ValueError("IRK: a callable right-hand side needs jacobian=, a callable returning a Matrix")
+                raise ValueError(f"{who}: a callable right-hand side needs jacobian=, a callable returning a Matrix")
             self._f, self._J = rhs, jacobian
             self._ft = _arity(rhs) == 2          # f(t, U) rather than f(U)
             self._Jt = jacobian is not None and _arity(jacobian) == 2
             return
         if jacobian is not None:
-            raise ValueError("IRK: jacobian= goes with a callable right-hand side; for Matrices and Forms it is derived")
+            raise ValueError(f"{who}: jacobian= goes with a callable right-hand side; for Matrices and Forms it is derived")
         terms = rhs if isinstance(rhs, list) else [rhs]
         self.linear, self.forms, self.bilinear = None, [], []
         U = V.unconstrained
@@ -227,41 +230,41 @@ class _Rhs:
                 T = T.assemble()
             if isinstance(T, Matrix):
                 if lifted:
-                    raise ValueError("IRK: with boundary data a linear term must be a rank-2 Form, so that it can act "
+                    raise ValueError(f"{who}: with boundary data a linear term must be a rank-2 Form, so that it can act "
                                      "on the lifted field; pass the form instead of the assembled Matrix")
                 if T.shape != (V.dim, V.dim):
-                    raise ValueError(f"IRK: a matrix term is {T.shape[0]} x {T.shape[1]}, the space has dim {V.dim}")
+                    raise ValueError(f"{who}: a matrix term is {T.shape[0]} x {T.shape[1]}, the space has dim {V.dim}")
                 self.linear = coef * T if self.linear is None else self.linear + coef * T
             elif isinstance(T, Form) and T.rank == 1:
-                self.forms.append((coef, T, self._unknown(T, unknown)))
+                self.forms.append((coef, T, self._unknown(T, unknown, who)))
             elif isinstance(T, Form) and T.rank == 2:
                 S = U if lifted else V
                 holder = ProductFunction(S, "_irk_state") if isinstance(S, ProductSpace) else \
                     Function(S, "_irk_state", _infer=False)
                 self.bilinear.append((coef, T, T.action(holder), holder))
             else:
-                raise TypeError(f"IRK: a right-hand-side term must be a Matrix, a SparseMatrix or a Form, got {type(T).__name__}")
+                raise TypeError(f"{who}: a right-hand-side term must be a Matrix, a SparseMatrix or a Form, got {type(T).__name__}")
         if lifted:
             for _, T, name in self.forms:
                 if name is None:
                     continue
                 a = next(a for a in T._funcs.values() if a.name == name)
                 if (a.product if a.product is not None else a.space) is not U:
-                    raise ValueError(f"IRK: with boundary data the unknown '{name}' must be a Function of "
+                    raise ValueError(f"{who}: with boundary data the unknown '{name}' must be a Function of "
                                      "V.unconstrained, so that it can carry the data")
 
     @staticmethod
-    def _unknown(T, unknown):
+    def _unknown(T, unknown, who="IRK"):
         from .forms import Function, ProductFunction
         if not T.functions:
             return None                          # a source term: it does not depend on the unknown
         if unknown is not None:
             name = unknown.name if isinstance(unknown, (Function, ProductFunction)) else str(unknown)
             if name not in T.functions:
-                raise ValueError(f"IRK: the form {T} does not contain the unknown '{name}'")
+                raise ValueError(f"{who}: the form {T} does not contain the unknown '{name}'")
             return name
         if len(T.functions) != 1:
-            raise ValueError(f"IRK: the form has Functions {T.functions}; say which is the unknown with unknown=")
+            raise ValueError(f"{who}: the form has Functions {T.functions}; say which is the unknown with unknown=")
         return T.functions[0]
 
     def _at(self, t):
@@ -637,13 +640,13 @@ class IRK:
         if self.newton == "exact":
             def solve(Ks, r):
                 self.factorizations += 1
-                S = self.jacobian(self.stages(cn, to_P(Ks))[1]).solver(self.backend)
+                S = _quiet(self.jacobian(self.stages(cn, to_P(Ks))[1]).solver(self.backend))
                 return to_stacked(np.asarray(S.solve(to_P(r)), dtype=np.float64))
             info = run(solve)
         else:
             def factor():                                   # the stage Jacobian at (t_n, u^n), factored
                 self.factorizations += 1
-                return (self.dt, self.jacobian([cn] * self.s, [self.t] * self.s).solver(self.backend))
+                return (self.dt, _quiet(self.jacobian([cn] * self.s, [self.t] * self.s).solver(self.backend)))
             on = lambda Ks, r: to_stacked(np.asarray(self._frozen[1].solve(to_P(r)), dtype=np.float64))  # noqa: E731
             fresh = self.newton == "simplified" or self._frozen is None or self._frozen[0] != self.dt
             if fresh:
@@ -822,7 +825,6 @@ class _StageSolver:
     a Jacobian given as a SciPy matrix or an array is first copied into the CSR store."""
 
     def __init__(self, M, J, A, dt, backend="auto"):
-        from .sparse import SparseMatrix
         from . import _femd as _C
         s = A.shape[0]
         self.s, self.n = s, M.shape[0]
@@ -964,7 +966,7 @@ class _IRK2D(IRK):
         return SparseMatrix(_C.block_csr(offs, offs, entries))                  # the s n x s n matrix in C++
 
     def _factor(self, B):
-        return B.solver(self.backend)
+        return _quiet(B.solver(self.backend))
 
     def stage_solver(self, cn):
         """The simplified-Newton solver, with f' frozen at (t_n, c^n): decoupled by the eigenvalues of A
@@ -1120,7 +1122,7 @@ class SSPRK:
         self.order, self.stages = order, stages
         self.method, self.cfl = _SSP[(stages, order)], _SSP_CFL[(stages, order)]
         self.limiter = limiter
-        self.rhs = _Rhs(rhs, None, unknown, self.V, time, False, need_jacobian=False)
+        self.rhs = _Rhs(rhs, None, unknown, self.V, time, False, need_jacobian=False, who="SSPRK")
         self._solver = M.solver(backend)
         self.time, self.t = time, float(t0)
         if time is not None:
@@ -1294,7 +1296,7 @@ class _Relax:
         elif isinstance(relax, Form):
             if relax.rank != 0:
                 raise TypeError(f"{who}: relax= as a Form must be a functional (rank 0) or a constant bilinear form (rank 2)")
-            name = _Rhs._unknown(relax, unknown)
+            name = _Rhs._unknown(relax, unknown, who)
             if name is None:
                 raise ValueError(f"{who}: the entropy functional does not contain the unknown")
             h = 1e-20
@@ -1442,7 +1444,7 @@ class ERK:
             if time is not None:
                 raise TypeError("ERK: time= sets a Constant in forms; a callable f(t, U) receives t itself")
         else:
-            self.rhs = _Rhs(rhs, None, unknown, self.V, time, False, need_jacobian=False)
+            self.rhs = _Rhs(rhs, None, unknown, self.V, time, False, need_jacobian=False, who="ERK")
             self._f = lambda t, U: np.ascontiguousarray(self.rhs.f(t, U), dtype=np.float64)
         self.time, self.t = time, float(t0)
         if time is not None:

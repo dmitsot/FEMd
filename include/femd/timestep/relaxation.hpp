@@ -312,6 +312,7 @@ public:
         if (U.size() != n_ || k.size() != n_) throw std::invalid_argument("relaxation: a stage has the wrong length");
         const long nl = static_cast<long>(n_);
         const bool par = n_ > detail::vector_par_threshold;
+        (void)par;                                       // unused without OpenMP
         const double *kk = k.data();
         double *dd = d_.data();
         FEMD_OMP_FOR_IF(par)
@@ -327,6 +328,7 @@ public:
         const std::size_t n = n_;
         const long nl = static_cast<long>(n);
         const bool par = n > detail::vector_par_threshold;
+        (void)par;
         const double e = e_;
         RelaxInfo I;
         I.production = dt * e;

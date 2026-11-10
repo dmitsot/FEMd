@@ -112,6 +112,9 @@ public:
     template <class Scalar>
     std::vector<std::vector<Scalar>> split(const std::vector<Scalar> &x) const
     {
+        if (x.size() != static_cast<std::size_t>(dim_))
+            throw std::invalid_argument("ProductSpace::split: the vector has " + std::to_string(x.size()) + " entries, the space has dim " +
+                                        std::to_string(dim_));
         std::vector<std::vector<Scalar>> parts(fields_.size());
         for (std::size_t f = 0; f < fields_.size(); ++f) parts[f].assign(fields_[f]->dim(), Scalar(0));
         for (int g = 0; g < dim_; ++g) parts[local_[g].first][local_[g].second] = x[g];
@@ -121,6 +124,14 @@ public:
     template <class Scalar>
     std::vector<Scalar> gather(const std::vector<std::vector<Scalar>> &parts) const
     {
+        if (parts.size() != fields_.size())
+            throw std::invalid_argument("ProductSpace::gather: " + std::to_string(parts.size()) + " vectors for " +
+                                        std::to_string(fields_.size()) + " fields");
+        for (std::size_t f = 0; f < fields_.size(); ++f)
+            if (parts[f].size() != static_cast<std::size_t>(fields_[f]->dim()))
+                throw std::invalid_argument("ProductSpace::gather: field " + std::to_string(f) + " has dim " +
+                                            std::to_string(fields_[f]->dim()) + ", its vector has " + std::to_string(parts[f].size()) +
+                                            " entries");
         std::vector<Scalar> x(dim_, Scalar(0));
         for (std::size_t f = 0; f < fields_.size(); ++f)
             for (int j = 0; j < fields_[f]->dim(); ++j) x[global_[f][j]] = parts[f][j];

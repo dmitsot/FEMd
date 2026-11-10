@@ -14,6 +14,7 @@
 #include "femd/fe/function_space.hpp"
 #include "femd/spline/knot_vector.hpp"
 #include "femd/spline/bspline_basis.hpp"
+#include <string>
 #include <map>
 #include <vector>
 
@@ -28,6 +29,12 @@ public:
           kv_(mesh, degree, bc.periodic ? KnotVector::Flavor::Periodic : KnotVector::Flavor::Open, continuity, continuity_at)
     {
         apply_boundary_conditions(bc);
+        // the periodic identification B_{j+M} = B_j, j < p, needs at least p functions per period;
+        // with fewer the space built is not periodic
+        if (bc.periodic && dim() < degree)
+            throw std::invalid_argument("SplineSpace: a periodic space of degree " + std::to_string(degree) + " needs at least " +
+                                        std::to_string(degree) + " functions per period, this mesh gives " + std::to_string(dim()) +
+                                        "; use more elements or a lower degree");
     }
 
     const KnotVector &knots() const { return kv_; }

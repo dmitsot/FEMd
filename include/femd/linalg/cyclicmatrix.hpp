@@ -102,36 +102,46 @@ cyclicmatrix<T>::cyclicmatrix(int rows, int upperband) : N(rows), uband(upperban
     bandm.N = N; bandm.M = N;
     bandm.uband = uband; bandm.lband = uband; bandm.band = band;
     bandm.sized = band * N;
+    delete[] bandm.pt;                     // the member's default allocation
     bandm.pt = new T[bandm.sized];
     for (int i = 0; i < bandm.sized; i++) bandm.pt[i] = T();
+    delete[] bandm.index;
     bandm.index = new int[N];
     for (int i = 0; i < N; i++) bandm.index[i] = i;
     bandm.factor = false;
 
     ublock.N = uband; ublock.M = uband;
+    delete[] ublock.pt;                     // the member's default allocation
     ublock.pt = new T[uband * uband];
     for (int i = 0; i < uband * uband; i++) ublock.pt[i] = T();
+    delete[] ublock.index;
     ublock.index = new int[uband];
     for (int i = 0; i < uband; i++) ublock.index[i] = i;
     ublock.symmetric = false; ublock.factor = false;
 
     lblock.N = uband; lblock.M = uband;
+    delete[] lblock.pt;                     // the member's default allocation
     lblock.pt = new T[uband * uband];
     for (int i = 0; i < uband * uband; i++) lblock.pt[i] = T();
+    delete[] lblock.index;
     lblock.index = new int[uband];
     for (int i = 0; i < uband; i++) lblock.index[i] = i;
     lblock.symmetric = false; lblock.factor = false;
 
     C.N = 2 * uband; C.M = 2 * uband;
+    delete[] C.pt;                     // the member's default allocation
     C.pt = new T[4 * uband * uband];
     for (int i = 0; i < 4 * uband * uband; i++) C.pt[i] = T();
+    delete[] C.index;
     C.index = new int[2 * uband];
     for (int i = 0; i < 2 * uband; i++) C.index[i] = i;
     C.symmetric = false; C.factor = false;
 
     EPS.N = 2 * uband; EPS.M = N;
+    delete[] EPS.pt;                     // the member's default allocation
     EPS.pt = new T[2 * uband * N];
     for (int i = 0; i < 2 * uband * N; i++) EPS.pt[i] = T();
+    delete[] EPS.index;
     EPS.index = new int[2 * uband];
     for (int i = 0; i < 2 * uband; i++) EPS.index[i] = i;
     EPS.symmetric = false; EPS.factor = false;

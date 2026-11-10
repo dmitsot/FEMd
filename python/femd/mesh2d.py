@@ -225,6 +225,8 @@ def _as_ring(pts):
         raise ValueError(f"a ring must be an (n, 2) array of points, got shape {a.shape}")
     if a.shape[0] < 3:
         raise ValueError("a ring needs at least 3 points")
+    if not np.all(np.isfinite(a)):
+        raise ValueError("a ring has a coordinate that is not finite (NaN or inf)")
     return a
 
 
@@ -331,7 +333,10 @@ def triangulate(boundary, holes=None, *, min_angle=20.0, max_area=None, max_edge
     for h, hm in zip(holes, hole_markers):
         d.hole(_as_ring(h), [], int(hm))
 
-    core, report = _C.triangulate(d, float(min_angle), float(max_edge or 0.0), float(max_area or 0.0),
+    if int(smooth) < 0:
+        raise ValueError(f"triangulate: smooth is a number of passes, got {smooth}")
+    core, report = _C.triangulate(d, float(min_angle), _positive(max_edge, "max_edge", "triangulate"),
+                                  _positive(max_area, "max_area", "triangulate"),
                                   int(smooth), int(max_points), bool(check), bool(interior_vertex))
     m = Mesh2D(core, report)
     if em is not None:
@@ -344,7 +349,7 @@ def _mark_outer_edges(m, ring, em, marker):
     S = np.array(m.segments)
     P = np.array(m.points)
     old = np.array(m.segment_markers).astype(np.int64)
-    A, B = ring, np.roll(ring, -1, axis=0)
+    A = ring
     mid = 0.5 * (P[S[:, 0]] + P[S[:, 1]])
     edge, dist = _C.nearest_segments(np.ascontiguousarray(mid, dtype=np.float64),
                                      np.ascontiguousarray(A, dtype=np.float64))      # mesh/point_match.hpp
@@ -368,6 +373,22 @@ def circle(cx, cy, r, n=32, clockwise=False):
 
 
 # --------------------------------------------------------------------- local refinement
+def _need_triangles(mesh, who):
+    if not isinstance(mesh, Mesh2D):
+        raise TypeError(f"{who}: needs a triangular Mesh2D, got {type(mesh).__name__}"
+                        + (" (quadrilateral meshes are not refined or smoothed)" if type(mesh).__name__ == "QuadMesh" else ""))
+
+
+def _positive(value, name, who):
+    """None, or a positive finite number: a size limit of the mesher."""
+    if value is None:
+        return 0.0
+    v = float(value)
+    if not (v > 0.0 and np.isfinite(v)):
+        raise ValueError(f"{who}: {name} must be a positive number or None, got {value!r}")
+    return v
+
+
 def _marked(mesh, triangles):
     a = np.atleast_1d(np.asarray(triangles))
     if a.dtype == bool:
@@ -424,6 +445,7 @@ def bisect_triangles(mesh, triangles, levels=1):
     The mesh it returns is conforming but NOT Delaunay; bisection and Delaunay
     are different triangulations of the same points.
     """
+    _need_triangles(mesh, "bisect_triangles")
     core, n = _C.bisect_triangles(mesh._m, _marked(mesh, triangles), int(levels))
     out = Mesh2D(core, dict(mesh.report))
     out.report["local_refine"] = ("rivara", n)
@@ -447,8 +469,10 @@ def refine_triangles(mesh, triangles, *, min_angle=20.0, max_area=None, max_edge
     hardest of the three, since each insertion can cascade through the quality
     loop, so check the triangle count before asking for several levels.
     """
+    _need_triangles(mesh, "refine_triangles")
     core, n = _C.refine_triangles(mesh._m, _marked(mesh, triangles), float(min_angle),
-                                  float(max_edge or 0.0), float(max_area or 0.0),
+                                  _positive(max_edge, "max_edge", "refine_triangles"),
+                                  _positive(max_area, "max_area", "refine_triangles"),
                                   int(max_points), 180.0)
     out = Mesh2D(core, dict(mesh.report))
     out.report["local_refine"] = ("circumcentre", n)
@@ -496,6 +520,7 @@ def remove_vertices(mesh, vertices, *, min_angle=0.0, max_edge=None, max_area=No
     Removing one vertex can make a neighbour removable, so the list is swept until a sweep
     removes nothing.
     """
+    _need_triangles(mesh, "remove_vertices")
     a = np.atleast_1d(np.asarray(vertices))
     if a.dtype == bool:
         if a.shape != (mesh.npoints,):
@@ -505,7 +530,8 @@ def remove_vertices(mesh, vertices, *, min_angle=0.0, max_edge=None, max_area=No
     if a.size and (a.min() < 0 or a.max() >= mesh.npoints):
         raise ValueError(f"vertex index out of range for a mesh of {mesh.npoints} vertices")
     core, n, pmap, kept, reasons, passes = _C.remove_vertices(
-        mesh._m, [int(i) for i in a], float(min_angle), float(max_edge or 0.0), float(max_area or 0.0), bool(boundary))
+        mesh._m, [int(i) for i in a], float(min_angle), _positive(max_edge, "max_edge", "remove_vertices"),
+        _positive(max_area, "max_area", "remove_vertices"), bool(boundary))
     out = Mesh2D(core, dict(mesh.report))
     out.report.update(removed=int(n), vertex_map=np.asarray(pmap, dtype=np.int64),
                       kept=np.asarray(kept, dtype=np.int64), kept_reasons=list(reasons))
@@ -557,6 +583,9 @@ def smooth(mesh, passes=1, *, restore_delaunay=True):
         stay valid. Vertex and triangle numbering are unchanged, since smoothing
         moves points rather than adding them.
     """
+    _need_triangles(mesh, "smooth")
+    if int(passes) < 0:
+        raise ValueError(f"smooth: passes must be >= 0, got {passes}")
     core, n = _C.smooth(mesh._m, int(passes), bool(restore_delaunay))
     out = Mesh2D(core, dict(mesh.report))
     out.report["smoothed"] = n

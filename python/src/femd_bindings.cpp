@@ -70,16 +70,24 @@ static Vec evaluate(const FunctionSpace &V, DArr coeffs, DArr x, int k)
 {
     const double *c = coeffs.data(), *xs = x.data();
     const long np_ = static_cast<long>(x.shape(0));
+    if (k < 0) throw std::invalid_argument("evaluate: the derivative order must be >= 0, got " + std::to_string(k));
+    if (coeffs.shape(0) != static_cast<std::size_t>(V.dim()))
+        throw std::invalid_argument("evaluate: " + std::to_string(coeffs.shape(0)) + " coefficients for a space of dim " +
+                                    std::to_string(V.dim()));
     std::vector<double> out(static_cast<std::size_t>(np_));
     {
         GilRelease release;
+        // the elements first, on one thread: a point outside the mesh throws, and an exception must
+        // not leave an OpenMP region (it would end the program)
+        std::vector<int> elem(static_cast<std::size_t>(np_));
+        for (long i = 0; i < np_; ++i) elem[static_cast<std::size_t>(i)] = V.mesh().element_of(xs[i]);
         FEMD_OMP_PARALLEL_IF(np_ > FEMD_OMP_THRESHOLD)
         {
             std::vector<double> vals, raw;
             FEMD_OMP_FOR
             for (long i = 0; i < np_; ++i)
             {
-                const int e = V.mesh().element_of(xs[i]);
+                const int e = elem[static_cast<std::size_t>(i)];
                 V.eval_on_element(e, xs[i], k, vals, raw);
                 const std::vector<int> &d = V.element_dofs(e);
                 const int na = static_cast<int>(d.size());
@@ -107,6 +115,7 @@ static nb::tuple basis_at(const FunctionSpace &V, DArr x, int k)
 {
     const double *xs = x.data();
     const long np_ = static_cast<long>(x.shape(0));
+    if (k < 0) throw std::invalid_argument("basis_at: the derivative order must be >= 0, got " + std::to_string(k));
     std::vector<int> rows, cols; std::vector<double> vals;
     {
         GilRelease release;

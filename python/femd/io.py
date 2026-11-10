@@ -520,6 +520,15 @@ def read_gmsh(filename, *, marker=0, tol=1e-9):
     report keys: "physical_names" {name: tag} of the 1D groups (the side markers),
     "region_names" {name: tag} of the 2D groups, "cell_markers" (the physical, or else the
     surface, tag of every cell, in the cells' order), "gmsh_version", "order" (of the elements)."""
+    try:
+        return _read_gmsh(filename, marker, tol)
+    except (IndexError, KeyError) as e:
+        # a section cut short, a count that does not match its lines, an element naming a node that is not there
+        raise ValueError(f"read_gmsh: {filename} is malformed or truncated ({type(e).__name__}: {e}); "
+                         "write it again from Gmsh as ASCII, format 4.1 or 2.2") from e
+
+
+def _read_gmsh(filename, marker, tol):
     from .mesh2d import mesh_from_arrays
     from .quadmesh import quad_mesh_from_arrays
     with open(os.fspath(filename), "r", errors="replace") as f:

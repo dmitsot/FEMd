@@ -208,7 +208,7 @@ public:
      */
     VertexLimiter2D(int k, int nc, int n, const std::vector<double> &mean, const std::vector<double> &Pi, const std::vector<double> &E,
                     const std::vector<int> &rv, int nv)
-        : k_(k), nc_(nc), n_(n), nv_(nv), mean_(mean), Pi_(Pi), E_(E), rv_(rv)
+        : k_(k), nc_(nc), n_(n), mean_(mean), Pi_(Pi), E_(E), rv_(rv)
     {
         if (static_cast<int>(mean.size()) != n || static_cast<int>(Pi.size()) != 3 * n || static_cast<int>(E.size()) != 3 * n || static_cast<int>(rv.size()) != 3 * nc)
             throw std::invalid_argument("VertexLimiter2D: table sizes do not match");
@@ -287,7 +287,7 @@ public:
     }
 
 private:
-    int k_, nc_, n_, nv_;
+    int k_, nc_, n_;
     std::vector<double> mean_, Pi_, E_;
     std::vector<int> rv_;
     mutable std::vector<double> ubar_, Uv_, umax_, umin_, alpha_;
