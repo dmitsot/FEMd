@@ -1,4 +1,4 @@
-# FEMd 0.8 manual
+# FEMd 0.9 manual
 
 FEMd is a Finite Element Library for problems in one and two space dimensions designed to run simulations efficiently on modern personal computers. Its core is header-only C++17 and is used from Python through bindings. The user provides a domain, a polynomial degree and boundary conditions, writes the equations in weak form using inner products, and FEMd does the rest. The design follows the FEniCS project, so users familiar with FEniCS will find the form language and the workflow familiar.
 
@@ -741,6 +741,7 @@ for n in range(nsteps):
 ```
 
 - **Systems.** `M` may be a matrix or form on a `ProductSpace` $W$. The state is then a `ProductFunction` of $W$ and the forms of `rhs` are written in its components, as in [Section 6.10](#610-interior-facets-ds-jump-avg). The stages live on one `ProductSpace` holding every field of $W$ once per stage, numbered by position, so each Newton iteration is still one banded solve. Boundary data are given per field, `left=[g_0, None]`, with `None` for a field without data. The state is then a `ProductFunction` of `W.unconstrained`, and the data of each field hold exactly.
+- **Relaxation.** `relax=` makes every step conserve an entropy $\eta$, or change it at exactly the rate the stages give, by taking $u_{n+1} = u_n + \gamma \Delta t \sum_i b_i K_i$ with $\gamma$ close to 1 and advancing the time by $\gamma \Delta t$. With `fd.IRK(M, f, dt, "radau", 2, relax=M)` Radau IIA keeps $\tfrac12 u^T M u$ for a problem that conserves it, instead of dissipating it. With `relax_conserved=True` Gauss keeps a conserved quantity to rounding even with a loose Newton tolerance. Relaxation is not available with boundary data. The method, the choice of entropy and the root solvers are described in [Section 7.9](#79-classical-explicit-runge-kutta), under Relaxation (RRK).
 
 With a time-dependent right-hand side the methods keep their classical order, $2s$ for Gauss and $2s - 1$ for Radau IIA. With time-dependent boundary data a stiff problem shows the usual order reduction of Runge-Kutta methods. For the heat equation above on four cubic elements, Gauss with 2 stages approaches order 4 as $\Delta t$ falls, Radau IIA with 2 stages keeps order 3, and Radau IIA with 3 stages gives about 4.2 instead of 5.
 
@@ -754,7 +755,7 @@ The pieces stay available for a scheme neither of these covers. For instance the
 
 **The residual has a floor.** $\|R\|$ cannot fall below the rounding error of evaluating it, roughly the machine precision times the largest terms of the operator times $\sqrt{n}$. For the KdV stages that floor is about $2 \cdot 10^{-13}$. A tolerance below it makes Newton stall at the floor until `maxiter`. Since convergence is quadratic, one iteration takes $10^{-7}$ to $10^{-13}$, and a tolerance a little above the floor costs nothing extra. In `fd.IRK` the default `xtol` stops on the step instead, so a `tol` below the floor is harmless there.
 
-**Invariants drift with the operators, not with the tolerance.** A scheme that conserves a quantity exactly does so through discrete identities. For KdV with $S_{ij} = (N_j'', N_i')$, the mass needs the column sums of $S$ to vanish and the $L^2$ norm needs $S$ to be skew-symmetric. Tightening the Newton tolerance does not touch these.
+**Invariants drift with the operators, not with the tolerance.** A scheme that conserves a quantity exactly does so through discrete identities. For KdV with $S_{ij} = (N_j'', N_i')$, the mass needs the column sums of $S$ to vanish and the $L^2$ norm needs $S$ to be skew-symmetric. Tightening the Newton tolerance does not touch these. Relaxation does: with `relax_conserved=True` a chosen invariant is restored at every step ([Section 7.9](#79-classical-explicit-runge-kutta)).
 
 **Apply operators in the residual through forms, not assembled matrices.** `S @ U` and the form $(U_{xx}, v_x)$ are equal in exact arithmetic but not in floating point. The entries $S_{ij}$ are $O(h^{-2})$ and each is rounded with an error of about $\varepsilon h^{-2}$, so the identities above hold only to that error, a fixed pattern. A solitary wave has positive coefficients, so in $e^{\mathsf T} S U$ and $U^{\mathsf T} S U$ the pattern adds up with the same sign step after step. The form instead sums $U_{xx} = \sum_j U_j N_j''$ at each quadrature point first, an $O(1)$ number, so the $O(h^{-2})$ values never appear, and its rounding errors multiply $U_{xx}$, which changes sign and cancels. For the solitary wave at 81 positions, one evaluation of the mass identity was off by $1.2 \cdot 10^{-13}$ on average with the matrix (the same sign at 80% of the positions) and by $1.8 \cdot 10^{-17}$ with the form. With the matrix it grows like $h^{-3}$ under refinement ($2 \cdot 10^{-14}$ at 200 elements, $3 \cdot 10^{-11}$ at 1600). With the form it stays below $10^{-15}$.
 
@@ -789,6 +790,8 @@ for n in range(nsteps):
 | 4, 10 (`order=4`) | Ketcheson, low storage | 6 |
 
 Each method is a convex combination of forward Euler steps. A property forward Euler has for $\Delta t \le \Delta t_{FE}$ (TVD in the means, a maximum principle, positivity) therefore holds for $\Delta t \le$ `rk.cfl` $\cdot \Delta t_{FE}$. For DG of degree $p$ with the Lax-Friedrichs flux, $\Delta t \approx 0.3\,h / \left((2p+1)\alpha\right)$ is a safe start. `time=` and `t0=` work as for `fd.IRK`, and the stages are evaluated at their own times, so a time-dependent source keeps the full order. `limiter=` is any callable, array in and array out, applied after every stage.
+
+Without a limiter, `relax=` makes an SSP step conserve an entropy, as for `fd.ERK` ([Section 7.9](#79-classical-explicit-runge-kutta)).
 
 **`fd.TVBLimiter(V, M=0.0)`** is the Cockburn-Shu TVB minmod limiter for a `DGSpace` of any degree and either basis. On each element it compares the jumps from the mean to the two end values with the jumps between neighboring means. When their minmod changes an end jump, the element keeps its mean, its slope becomes the minmod of the slope and the two mean jumps, and its higher modes are dropped. The TVB constant skips elements whose end jumps are below $M h^2$, which leaves smooth extrema alone when $M$ is about $|u_{xx}|$ there. `M = 0` is plain minmod, which also clips smooth extrema and costs an order of accuracy at them. The means never change, so the limiter conserves mass. On a `ProductSpace` it limits every DG field component by component (`fields=` picks some) and leaves the other fields alone. Characteristic limiting for systems is not provided. Call it on a Function to limit in place, `lim(u)`, or on an array for a limited copy. `lim.troubled` counts the elements the last call limited. The limiting runs in C++ (`fe/limiters.hpp`), in parallel over the elements, with the same result for any number of threads. `fd.SlopeLimiter` runs the same way.
 
@@ -846,9 +849,47 @@ Any other explicit tableau is given as `(A, b)` or `(A, b, c)`, with `A` strictl
   rk = fd.ERK(M, f, dt, "rk4", backend="cg", solver_options=dict(precond="ilu0", tol=1e-13))
   ```
 - **Time.** `time=` is a `fd.Constant` in the forms, set to $t_n + c_i \Delta t$ before each stage. A callable `rhs(t, U)` receives $t$ directly.
-- **Stability.** An explicit method is stable only below a step limit set by the fastest mode of $M^{-1} f'$, a CFL condition $\Delta t \lesssim h / |a|$ for advection and $\Delta t \lesssim h^2$ for diffusion. For stiff problems use `fd.IRK` with Radau IIA, and `fd.SSPRK` when a limiter or a strong stability property is needed. Unlike Gauss, the explicit methods do not conserve quadratic invariants exactly.
+- **Stability.** An explicit method is stable only below a step limit set by the fastest mode of $M^{-1} f'$, a CFL condition $\Delta t \lesssim h / |a|$ for advection and $\Delta t \lesssim h^2$ for diffusion. For stiff problems use `fd.IRK` with Radau IIA, and `fd.SSPRK` when a limiter or a strong stability property is needed. Unlike Gauss, the explicit methods do not conserve quadratic invariants exactly, unless relaxed (below).
 
 For Camassa-Holm on 400 cubic elements up to $t = 20$, RK4 with 400 steps of $\Delta t = 0.05$ is much cheaper than Gauss with 2 stages. It is less accurate at the same step, since the steepening peaks bring RK4 close to its stability limit. The error against a fine Gauss solution is $2.7\cdot10^{-1}$, $1.2\cdot10^{-2}$ and $4.2\cdot10^{-4}$ for $\Delta t = 0.05$, $0.025$ and $0.0125$, against $2.7\cdot10^{-3}$ for Gauss at $\Delta t = 0.05$. RK4 at $\Delta t = 0.0125$ is then both cheaper and more accurate.
+
+**Relaxation (RRK).** `relax=` makes every step conserve an entropy $\eta$, or change it at exactly the semi-discrete rate. The step is $u_{n+1} = u_n + \gamma \Delta t\, d$ with $d = \sum_i b_i k_i$, and $\gamma$ is the positive root of
+$$
+r(\gamma) = \eta(u_n + \gamma \Delta t\, d) - \eta(u_n) - \gamma \Delta t \sum_i b_i \left\langle \eta'(U_i), k_i \right\rangle = 0
+$$
+(Ketcheson 2019, Ranocha et al. 2020). The time advances by $\gamma \Delta t$, which keeps the order of the method, and $\gamma = 1 + O(\Delta t^{p-1})$. An entropy that $f$ conserves then stays constant to rounding. A dissipated one changes in each step by $\gamma$ times `rk.relax_info.production`, the Runge-Kutta approximation of $\int \langle \eta'(u), u' \rangle\, dt$.
+
+```python
+rk = fd.ERK(M, f, dt, "rk4", relax=M)                                    # eta = 1/2 u^T M u, gamma in closed form
+rk = fd.ERK(M, f, dt, "rk4", relax=fd.form((w**3/6 - D(w)**2/2) * dx))  # a functional of the unknown
+rk = fd.ERK(M, f, dt, "rk4", relax=(eta, grad), relax_solver="brent")
+while T - rk.t > dt:
+    rk.step(w)
+rk.step(w, T - rk.t, relax=False)                                        # land on T
+```
+
+| `relax` | entropy | derivative |
+|---|---|---|
+| symmetric `Matrix`, `SparseMatrix` or constant rank-2 `Form` $E$ | $\eta(u) = \tfrac12 u^T E u$ | exact, $\gamma$ in closed form |
+| rank-0 `Form` in the unknown | the functional | by the complex step |
+| `(eta, grad)`, two callables | `eta(U)` | `grad(U)`, an array |
+| a callable `eta` alone | `eta(U)`, conserved by $f$ | none needed |
+
+`relax_solver=` chooses how the root is found. `"auto"` takes the closed form for a quadratic entropy, Newton when the derivative is known and the secant method otherwise, and Brent's method when these fail. `"newton"` (needs the derivative), `"secant"` and `"brent"` force one. Brent works on a bracket around 1 that excludes the trivial root $\gamma = 0$. All of them give the same $\gamma$ to rounding. The iteration runs in C++ and calls back only $\eta$ and its derivative. `relax_tol` (`1e-14`, on $\gamma$) and `relax_maxiter` (20) bound it. Since $r'(\gamma) = O(\Delta t^2)$, $\gamma$ is determined only to about $\epsilon |\eta| / \Delta t^2$. For small steps the iteration therefore stops when $|r|$ has reached the rounding level of $\eta$ and stops falling, which is where the entropy is conserved anyway.
+
+`rk.gamma` and `rk.relax_info` (a `fd.RelaxInfo` with `gamma`, `iterations`, `converged`, `solver`, `residual`, `production`, `message`) report the last step. When no positive root exists, usually because $\Delta t$ is too large, `step` raises `RuntimeError` and leaves `u` and `rk.t` unchanged. `step(u, relax=False)` takes one plain step, for instance the last one to land on a given time. `relax_time="fixed"` advances the time by $\Delta t$ instead of $\gamma \Delta t$. The relaxation is then a projection and the method loses one order. One entropy is relaxed at a time. Linear invariants such as the mass are kept by every Runge-Kutta method anyway.
+
+**Relaxation in `fd.SSPRK` and `fd.IRK`.** Both take the same `relax=`, `relax_solver=`, `relax_tol=`, `relax_maxiter=` and `relax_time=` arguments, report through `gamma` and `relax_info`, and take `step(u, relax=False)`. The relaxation runs in C++ in each stepper (`timestep/relaxation.hpp`).
+
+- **`fd.SSPRK`** records the stages of its Shu-Osher form with the Butcher weights of the method, so the relaxed direction is exactly the increment of the plain step. It needs order 2 or more and no limiter, since a limiter changes the step after its stages. Forward Euler cannot be relaxed, as $r(\gamma) = \tfrac12 \gamma^2 \Delta t^2 \|k\|^2$ has no root but 0.
+- **`fd.IRK`** relaxes the converged stages, $u_{n+1} = u_n + \gamma \Delta t \sum_i b_i K_i$, in 1D and 2D. Radau IIA then conserves what it would otherwise dissipate, at no cost beyond the entropy evaluations. Boundary data (`left=`, `right=`, `dirichlet=`) are refused, because the entropy of $u_g(t) + Pc$ changes with the data.
+
+```python
+irk = fd.IRK(M, f, dt, "radau", 2, relax=M)                       # L-stable and conservative
+irk = fd.IRK(M, f, dt, "gauss", 2, newton="simplified", tol=1e-6, relax=M, relax_conserved=True)
+```
+
+**`relax_conserved=True`** (all three steppers) takes the stage sum as zero, for an entropy that $f$ conserves. Each step then returns the entropy to its old value to rounding, whatever error the stages carry. Gauss conserves quadratic invariants only up to the Newton tolerance ([Section 7.7](#77-tolerances-round-off-and-conservation)), and an explicit method with a Krylov mass solve only up to the Krylov tolerance. With `relax_conserved=True` a loose tolerance no longer shows in the invariant. For KdV with Gauss 2, simplified Newton and `tol=1e-6`, the $L^2$ norm drifts by $7 \cdot 10^{-9}$ in 50 steps without relaxation and by $10^{-15}$ with `relax_conserved=True`. Relaxation without it gives the same $7 \cdot 10^{-9}$, as the stage sum then carries the Newton error into the target.
 
 ### 7.10 Eigenproblems
 
@@ -1320,7 +1361,7 @@ On a curved wall the mesh sees a polygon, and no method that uses only the mesh 
 
 ### 12.6 Implicit time stepping
 
-`fd.IRK` ([Section 7.6](#76-implicit-runge-kutta-time-stepping-and-algebraic-systems)) works on 2D spaces and systems with the same call. It dispatches on the mass matrix: a `SparseMatrix`, or a rank-2 `Form`, on a 2D space. `fd.ERK` ([Section 7.9](#79-classical-explicit-runge-kutta)) and `fd.SSPRK` ([Section 7.8](#78-explicit-ssp-runge-kutta-and-limiting)) need nothing new either.
+`fd.IRK` ([Section 7.6](#76-implicit-runge-kutta-time-stepping-and-algebraic-systems)) works on 2D spaces and systems with the same call. It dispatches on the mass matrix: a `SparseMatrix`, or a rank-2 `Form`, on a 2D space. `fd.ERK` ([Section 7.9](#79-classical-explicit-runge-kutta)) and `fd.SSPRK` ([Section 7.8](#78-explicit-ssp-runge-kutta-and-limiting)) need nothing new either. Relaxation (`relax=`, [Section 7.9](#79-classical-explicit-runge-kutta)) works here too, but not with `dirichlet=` data.
 
 ```python
 V = fd.LagrangeSpace(m, 3, bc="dirichlet")

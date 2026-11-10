@@ -18,7 +18,8 @@
 | `butcher(method, stages)` | function | the tableau of a Gauss-Legendre, Radau IIA or named explicit method |
 | `SSPRK` | class | explicit SSP Runge-Kutta stepper for $M u' = f(t, u)$, with an optional limiter |
 | `VertexLimiter` | class | the vertex-based slope limiter for DG on triangles |
-| `ERK` | class | classical explicit Runge-Kutta stepper (RK2, RK4, ...) for non-stiff $M u' = f(t, u)$ |
+| `ERK` | class | classical explicit Runge-Kutta stepper (RK2, RK4, ...) for non-stiff $M u' = f(t, u)$, with optional relaxation (RRK) |
+| `RelaxInfo` | class | the report of a relaxed `ERK`, `SSPRK` or `IRK` step |
 | `TVBLimiter` | class | the Cockburn-Shu TVB minmod limiter for DG spaces |
 | `SlopeLimiter` | class | the minmod, Van Leer, MC and Van Albada slope limiters with the TVD2 or UNO2 reconstruction, for DG spaces in 1D |
 | `limited_slope(limiter, sm, sp, reconstruction, ...)` | function | the slope of one of these limiters |
@@ -161,7 +162,7 @@ use `newton`.
 | `krylov_iterations` | int | Krylov iterations over all steps. |
 | `residual` | float | $\lVert F(x) \rVert_2$ at the end. |
 
-### G.6 `IRK(M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0, left=None, right=None, dirichlet=None, newton="exact", tol=1e-12, rtol=0, xtol=1e-12, maxiter=20, line_search=False, backend="Auto", refresh="auto")`
+### G.6 `IRK(M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0, left=None, right=None, dirichlet=None, newton="exact", tol=1e-12, rtol=0, xtol=1e-12, maxiter=20, line_search=False, backend="Auto", refresh="auto", relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20, relax_time="idt", relax_conserved=False)`
 
 Implicit Runge-Kutta stepper for $M u' = f(t, u)$, with optional time-dependent
 data on the built-in boundary conditions (manual, Sections [7.6](../manual.md#76-implicit-runge-kutta-time-stepping-and-algebraic-systems) and [7.7](../manual.md#77-tolerances-round-off-and-conservation)). On a 2D mesh see [L.11](elements-2d.md#l11-irk-on-2d-meshes)
@@ -188,6 +189,7 @@ data on the built-in boundary conditions (manual, Sections [7.6](../manual.md#76
 | `line_search` | bool | `False` | Armijo backtracking in the stage solve: the Newton step is halved until the stage residual decreases. |
 | `backend` | `Solver` or name | `"Auto"` | Backend for the stage Jacobian. |
 | `refresh` | `"auto"` or int | `"auto"` | With `newton="frozen"`, when to factor anew at the next step. `"auto"`: after a step with more than `maxiter // 2` iterations, or after a step on an older factorization with more than the last new one's count plus half of it (at least 2 more). An int `k`: after a step with more than `k` iterations. The same rule in 1D and 2D. |
+| `relax`, `relax_solver`, `relax_tol`, `relax_maxiter`, `relax_time`, `relax_conserved` | as in `ERK` (G.10) | `None`, ... | Relaxation (RRK) of the converged stages, not with boundary data ([manual, Section 7.9](../manual.md#79-classical-explicit-runge-kutta)). |
 
 **Output.** An `IRK` object.
 
@@ -195,11 +197,12 @@ data on the built-in boundary conditions (manual, Sections [7.6](../manual.md#76
 
 | member | inputs | returns | meaning |
 |---|---|---|---|
-| `step(u, dt=None)` | `u` a Function, `ProductFunction` or array of $V$, or of `V.unconstrained` with boundary data, updated in place. `dt` float, a new step size from now on, `None` keeps the current one. | `NewtonInfo` | Advances one step and `t` by `dt`. Raises `RuntimeError` when Newton fails, with the reason. |
+| `step(u, dt=None, relax=True)` | `u` a Function, `ProductFunction` or array of $V$, or of `V.unconstrained` with boundary data, updated in place. `dt` float, a new step size from now on, `None` keeps the current one. `relax=False`: this step without relaxation. | `NewtonInfo` | Advances one step and `t` by `dt` (by $\gamma$ `dt` when relaxed). With relaxation, raises `RuntimeError` and leaves `u` unchanged when no $\gamma$ is found. Raises `RuntimeError` when Newton fails, with the reason. |
 | `t` | attribute | float | The current time, starting at `t0`. |
 | `times()` | none | array, length $s$ | The stage times $t + c_i \Delta t$ of the next step. |
 | `dt` | attribute | float | Current step. |
 | `history` | attribute | list of int | Newton iterations of each step. |
+| `gamma`, `relax_info` | attribute | float, `RelaxInfo` | The relaxation of the last step ([G.10a](#g10a-relaxinfo)). |
 | `factorizations` | attribute | int | Factorizations of the stage Jacobian so far. |
 | `refresh` | attribute | `"auto"` or int | The `refresh=` rule, can be changed between steps. |
 | `A`, `b`, `c` | attribute | arrays | The Butcher tableau. |
@@ -227,7 +230,7 @@ data on the built-in boundary conditions (manual, Sections [7.6](../manual.md#76
 | `b` | array, length $s$ | Weights. |
 | `c` | array, length $s$ | Nodes, the row sums of `A`. |
 
-### G.8 `SSPRK(M, rhs, dt, order=3, stages=None, *, limiter=None, unknown=None, time=None, t0=0.0, backend="Auto")`
+### G.8 `SSPRK(M, rhs, dt, order=3, stages=None, *, limiter=None, unknown=None, time=None, t0=0.0, backend="Auto", relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20, relax_time="idt", relax_conserved=False)`
 
 Explicit strong-stability-preserving Runge-Kutta stepper for $M u' = f(t, u)$
 ([manual, Section 7.8](../manual.md#78-explicit-ssp-runge-kutta-and-limiting)).
@@ -245,12 +248,14 @@ Explicit strong-stability-preserving Runge-Kutta stepper for $M u' = f(t, u)$
 | `unknown` | Function or str | `None` | Which Function of the forms is the state, when they contain more than one. |
 | `time`, `t0` | `Constant`, float | `None`, `0.0` | As for `IRK`. The Constant is set to each stage's time. |
 | `backend` | `Solver` or name | `"Auto"` | Backend for `M`. |
+| `relax`, `relax_solver`, `relax_tol`, `relax_maxiter`, `relax_time`, `relax_conserved` | as in `ERK` (G.10) | `None`, ... | Relaxation (RRK), order 2 or more and no limiter ([manual, Section 7.9](../manual.md#79-classical-explicit-runge-kutta)). |
 
 **Members**
 
 | member | inputs | returns | meaning |
 |---|---|---|---|
-| `step(u, dt=None)` | `u` a Function, `ProductFunction` or array of $V$, updated in place. `dt` a new step from now on. | `u` | Advances one step and `t` by `dt`. |
+| `step(u, dt=None, relax=True)` | `u` a Function, `ProductFunction` or array of $V$, updated in place. `dt` a new step from now on. `relax=False`: this step without relaxation. | `u` | Advances one step and `t` by `dt` (by $\gamma$ `dt` when relaxed). |
+| `gamma`, `relax_info` | attribute | float, `RelaxInfo` | The relaxation of the last step ([G.10a](#g10a-relaxinfo)). |
 | `rate(t, u)` | `t` float, `u` array | array | $M^{-1} f(t, u)$, the forward Euler direction. |
 | `t`, `dt` | attribute | float | Current time and step. |
 | `cfl` | attribute | float | The SSP coefficient: the method keeps a forward Euler property for $\Delta t \le$ `cfl` $\Delta t_{FE}$. |
@@ -325,7 +330,7 @@ $\alpha \le 1$ that keeps the vertex values within the means of the triangles ar
 part. Members as for `TVBLimiter`: `lim(u)` (in place), `limit(c)` (a copy), `troubled`, and
 `alpha`, the factors of the last call.
 
-### G.10 `ERK(M, rhs, dt, method="rk4", *, unknown=None, time=None, t0=0.0, backend="Auto", solver_options=None)`
+### G.10 `ERK(M, rhs, dt, method="rk4", *, unknown=None, time=None, t0=0.0, backend="Auto", solver_options=None, relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20, relax_time="idt", relax_conserved=False)`
 
 Explicit Runge-Kutta stepper for $M u' = f(t, u)$ ([manual, Section 7.9](../manual.md#79-classical-explicit-runge-kutta)).
 
@@ -342,21 +347,53 @@ Explicit Runge-Kutta stepper for $M u' = f(t, u)$ ([manual, Section 7.9](../manu
 | `t0` | float | `0.0` | Initial time. |
 | `backend` | solver backend | `"Auto"` | For `M`: a direct backend, factored once (1D `Solver` names, 2D `SparseSolver` backends), or `"cg"`, `"gmres"`, `"lgmres"`, an iterative solve at every stage with no factorization ([manual, Section 7.9](../manual.md#79-classical-explicit-runge-kutta)). |
 | `solver_options` | dict or `None` | `None` | Krylov backends only: `precond` (`"jacobi"`, `"ssor"`, `"ilu0"`, `None`, or a preconditioner), `tol` (`1e-12`), `maxiter`, `restart` (30), `k_aug` (2), `warm_start` (`True`). |
+| `relax` | `Matrix`, `SparseMatrix`, `Form`, callable, `(eta, grad)` or `None` | `None` | The entropy of relaxation (RRK, [manual, Section 7.9](../manual.md#79-classical-explicit-runge-kutta)): a symmetric matrix or constant rank-2 Form $E$ ($\eta = \tfrac12 u^T E u$), a rank-0 Form in the unknown, a pair of callables `eta(U)`, `grad(U)`, or a callable `eta` alone for an entropy that $f$ conserves. `None`: no relaxation. |
+| `relax_solver` | str | `"auto"` | The root solver of the relaxation equation: `"auto"` (closed form for a quadratic entropy, Newton with a derivative, secant without, Brent when these fail), `"newton"`, `"secant"`, `"brent"`. |
+| `relax_tol` | float | `1e-14` | Stop when the change of $\gamma$ is below `relax_tol` times $\max(1, |\gamma|)$, or when $|r(\gamma)|$ has reached the rounding level of $\eta$. |
+| `relax_maxiter` | int | `20` | Iterations of Newton or the secant method (Brent: five times as many). |
+| `relax_time` | str | `"idt"` | `"idt"`: the time advances by $\gamma \Delta t$ (order kept). `"fixed"`: by $\Delta t$ (one order lower). |
+| `relax_conserved` | bool | `False` | Take $\sum_i b_i \langle \eta'(U_i), k_i \rangle = 0$: the entropy returns to its old value at every step, whatever error the stages carry (a Krylov tolerance here, a Newton tolerance in `IRK`). |
 
 **Raises** `ValueError` for an unknown method name or a tableau that is not
-strictly lower triangular, or whose weights do not sum to 1, and `TypeError`
-for an `M` that is not a matrix of a known space.
+strictly lower triangular, or whose weights do not sum to 1, or for an unknown
+`relax_solver` or `relax_time`, or `"newton"` with an entropy that has no derivative,
+and `TypeError` for an `M` that is not a matrix of a known space or a `relax` of
+another kind.
 
 **Members**
 
 | member | inputs | returns | meaning |
 |---|---|---|---|
-| `step(u, dt=None)` | Function, ProductFunction or float64 array | `u` | One step in place. `dt` changes the step size from here on. |
+| `step(u, dt=None, relax=True)` | Function, ProductFunction or float64 array | `u` | One step in place. `dt` changes the step size from here on. `relax=False` takes this step without relaxation. With relaxation, raises `RuntimeError` when no positive $\gamma$ exists, leaving `u` and `t` unchanged. |
 | `rate(t, u)` | time, state | array | $M^{-1} f(t, u)$. |
 | `t`, `dt` | attribute | float | Current time and step size. |
 | `method`, `order`, `stages` | attribute | str, int, int | The tableau (`order` is 0 for a user tableau). |
+| `gamma`, `relax_info` | attribute | float, `RelaxInfo` | The relaxation parameter and report of the last relaxed step (`1.0` and `None` before one). |
 | `solver` | attribute | `SparseSolver`, `LinearSolver` or `None` | The factored solver of $M$ (`None` for $M = I$). On a 2D space `rk.solver.backend` is `"cholesky"`, `"ldlt"` or `"lu"` with `backend="Auto"`, and `rk.solver.factor` holds the Cholesky's `nnz_L`, `min_pivot`, `max_pivot`, `ordering`. With a Krylov backend a `KrylovMassSolver`: `backend`, `iterations` (per solve), `info` (the last `KrylovInfo`), `precond`, `tol`, `reset()` (drop the warm start). |
 
 The C++ class is `femd::ExplicitRK` in `timestep/explicit_rk.hpp`, with
 `ExplicitTableau::named(name)`. Its `step(u, t, dt, rate)` takes any callable
-`rate(t, U, k)` that sets $k = M^{-1} f(t, U)$.
+`rate(t, U, k)` that sets $k = M^{-1} f(t, U)$. `step_relaxed(u, t, dt, rate, H, opt)` is the
+relaxed step: `H` an `Entropy` (`Entropy::quadratic_form(E)` with `E(x, y)`
+setting $y = Ex$, or `Entropy::general(eta, deta)` with `deta(v, w)` $=
+\langle \eta'(v), w \rangle$, which may be empty), `opt` a `RelaxOptions`
+(`solver`, `tol`, `maxiter`). It returns a `RelaxInfo` and leaves `u` unchanged
+when `converged` is false. The caller advances the time by `gamma * dt`. The relaxation itself is `femd::Relaxation` in
+`timestep/relaxation.hpp` (`begin`, `stage(U_i, k_i, b_i)`, `finish(u, dt)`), shared with
+`SSPRK::step_relaxed(u, t, dt, rate, H, opt)` (`SSPRK::weights()` gives the Butcher weights of
+its stages) and `ImplicitRK::step_relaxed(u, t, dt, residual, mass, solve, H, opt, info, k0)`.
+`RelaxOptions::conserved` is `relax_conserved`.
+
+### G.10a `RelaxInfo`
+
+The report of a relaxed `ERK`, `SSPRK` or `IRK` step, `rk.relax_info`.
+
+| attribute | type | meaning |
+|---|---|---|
+| `gamma` | float | The relaxation parameter. |
+| `iterations` | int | Iterations of the root solver (entropy evaluations for Brent, 0 for the closed form). |
+| `converged` | bool | Whether a positive root was found. |
+| `solver` | str | `"closed form"`, `"newton"`, `"secant"` or `"brent"`, the method that produced `gamma`. |
+| `residual` | float | $|r(\gamma)|$ (0 for the closed form). |
+| `production` | float | $\Delta t \sum_i b_i \langle \eta'(U_i), k_i \rangle$. The step changed $\eta$ by `gamma * production` (0 for an entropy given without a derivative, and with `relax_conserved=True`). |
+| `message` | str | Why the step failed, empty on success. |

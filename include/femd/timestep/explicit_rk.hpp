@@ -20,12 +20,18 @@
 //  result has the same bits for any number of threads).  The work of a stage is in the
 //  rate, assembly and mass solve, not here.
 //
+//  step_relaxed() is the relaxation (RRK) version of a step, see relaxation.hpp.
+//
 #ifndef FEMD_TIMESTEP_EXPLICIT_RK_HPP
 #define FEMD_TIMESTEP_EXPLICIT_RK_HPP
 
+#include "femd/timestep/relaxation.hpp"
 #include "femd/util/omp.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <functional>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -139,10 +145,45 @@ public:
         }
     }
 
+    /**
+     * @brief One relaxed step (RRK): u <- u + gamma dt sum b_i k_i, with gamma from the entropy H.
+     *        The caller advances the time by info.gamma * dt.  When no admissible gamma is found
+     *        u is left unchanged and info.converged is false (info.message says why).
+     */
+    template <class Rate>
+    RelaxInfo step_relaxed(std::vector<double> &u, double t, double dt, Rate &&rate, const Entropy &H, const RelaxOptions &opt = {})
+    {
+        const std::size_t n = u.size();
+        const long nl = static_cast<long>(n);
+        const bool par = n > detail::vector_par_threshold;
+        const int s = T_.s;
+        relax_.begin(n, H, opt);
+        if (k_.size() != static_cast<std::size_t>(s)) k_.assign(static_cast<std::size_t>(s), std::vector<double>());
+        U_.resize(n);
+        for (int i = 0; i < s; ++i)
+        {
+            std::copy(u.begin(), u.end(), U_.begin());
+            for (int j = 0; j < i; ++j)
+            {
+                const double w = dt * T_.a(i, j);
+                if (w == 0.0) continue;
+                const double *kj = k_[j].data();
+                double *U = U_.data();
+                FEMD_OMP_FOR_IF(par)
+                for (long q = 0; q < nl; ++q) U[q] += w * kj[q];
+            }
+            rate(t + T_.c[i] * dt, U_, k_[i]);
+            if (k_[i].size() != n) throw std::invalid_argument("explicit RK: the rate returned the wrong length");
+            relax_.stage(U_, k_[i], T_.b[i]);
+        }
+        return relax_.finish(u, dt);
+    }
+
 private:
     ExplicitTableau T_;
     std::vector<std::vector<double>> k_;
     std::vector<double> U_;
+    Relaxation relax_;
 };
 
 } // namespace femd

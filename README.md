@@ -2,7 +2,7 @@
 
 ![FEMd](docs/mascot/femd_logo.svg)
 
-**Version 0.8** · [License: GPL v3 or later](LICENSE)
+**Version 0.9** · [License: GPL v3 or later](LICENSE)
 
 **FEMd** is a Finite Element Library for problems in one and two space dimensions designed to run simulations efficiently on modern personal computers. Its core is header-only C++17 and is used from Python. You give a domain, a polynomial degree and boundary conditions, write the equations in weak form, and FEMd assembles and solves them. The form language follows FEniCS, so FEniCS users will find the workflow familiar.
 

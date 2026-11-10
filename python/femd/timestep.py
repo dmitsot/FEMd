@@ -22,7 +22,7 @@ from ._util import _norm2
 
 from .newton import NewtonInfo
 
-__all__ = ["newton_system", "IRK", "SSPRK", "ERK", "butcher"]
+__all__ = ["newton_system", "IRK", "SSPRK", "ERK", "RelaxInfo", "butcher"]
 
 
 # --------------------------------------------------------------------------- Newton for F(x) = 0
@@ -100,18 +100,28 @@ def _core(A, b, c, name, tol, rtol, xtol, maxiter, line_search):
                          line_search=line_search, name=str(name))
 
 
-def _step_core(core, c, t, dt, F, M, solve, k0):
+def _step_core(core, c, t, dt, F, M, solve, k0, relax=None):
     """One step of the C++ stage iteration on the coefficients c (a float64 array, advanced in place
     when Newton converges).  F(t, c) is the semi-discrete right-hand side, M the C++ mass matrix (or a
-    callable), solve(K, r) the stage solver, k0 the first iterate for the stages.  Returns a NewtonInfo."""
+    callable), solve(K, r) the stage solver, k0 the first iterate for the stages.  Returns a NewtonInfo.
+    With relax (a _Relax) the converged stages are relaxed (RRK), c is advanced only when gamma is
+    found too, and the NewtonInfo carries the relaxation tuple as .relax."""
     from .newton import NewtonInfo
     if not (isinstance(c, np.ndarray) and c.dtype == np.float64 and c.flags.c_contiguous and c.flags.writeable):
         raise TypeError("IRK: the coefficients must be a contiguous writable float64 array")
     f = lambda tt, U: np.ascontiguousarray(F(tt, U), dtype=np.float64)                   # noqa: E731
     sv = lambda K, r: np.ascontiguousarray(solve(K, r), dtype=np.float64)                 # noqa: E731
-    converged, iterations, residuals, steps, message = core.step(c, t, dt, f, M, sv, np.ascontiguousarray(k0, dtype=np.float64))
-    return NewtonInfo(bool(converged), int(iterations), residuals=list(residuals), steps=list(steps),
+    k0 = np.ascontiguousarray(k0, dtype=np.float64)
+    rtuple = None
+    if relax is None:
+        converged, iterations, residuals, steps, message = core.step(c, t, dt, f, M, sv, k0)
+    else:
+        converged, iterations, residuals, steps, message, rtuple = core.step_relaxed(
+            c, t, dt, f, M, sv, k0, relax.E, relax.eta, relax.deta, *relax.options)
+    info = NewtonInfo(bool(converged), int(iterations), residuals=list(residuals), steps=list(steps),
                       linear_iterations=[0] * int(iterations), message=str(message))
+    info._relax_tuple = rtuple
+    return info
 
 
 # --------------------------------------------------------------------------- Butcher tableaus
@@ -408,6 +418,12 @@ class IRK:
       M may be singular, as for Stokes and Navier-Stokes (no pressure block): use Radau IIA.
       irk.factorizations counts the sparse factorizations.
 
+    relax, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved: relaxation (RRK), as in
+      ERK: the converged stages give u^{n+1} = u^n + gamma dt sum_i b_i K_i, with the entropy conserved
+      or changed by exactly gamma dt sum_i b_i <eta'(U_i), K_i>, and t advanced by gamma dt.  With
+      relax_conserved=True a conserved entropy returns to its old value whatever the Newton tolerance
+      left in the stages.  Not with boundary data.  irk.gamma and irk.relax_info report the last step.
+
     The stage equations  M K_i = F(t_n + c_i dt, u^n + dt sum_j a_ij K_j)  are solved together,
     their Jacobian  delta_ij M - dt a_ij F'(U_i)  assembled by fd.block into one banded matrix on
     ProductSpace(V, ..., V), so every Newton iteration is one direct O(n s^2 p) solve.  The
@@ -422,7 +438,8 @@ class IRK:
 
     def __init__(self, M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0,
                  left=None, right=None, dirichlet=None, newton="exact", tol=1e-12, rtol=0.0, xtol=1e-12, maxiter=20,
-                 line_search=False, backend="Auto", refresh="auto"):
+                 line_search=False, backend="Auto", refresh="auto", relax=None, relax_solver="auto", relax_tol=1e-14,
+                 relax_maxiter=20, relax_time="idt", relax_conserved=False):
         from . import Matrix, Form, ProductSpace, Transfer
         from .forms import Function
         if dirichlet is not None:
@@ -493,6 +510,18 @@ class IRK:
                 self._to_V = lambda u: T @ u                                                             # noqa: E731
             self._Mact = Mform.action(self._hold)
             self._prolong = self.V.prolongate
+        self._init_relax(relax, unknown, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved)
+
+    def _init_relax(self, relax, unknown, solver, tol, maxiter, rtime, conserved):
+        if relax is not None and self.lifted:
+            raise ValueError("IRK: relaxation with boundary data is not supported (the entropy of u_g(t) + P c changes "
+                             "with the data); relax a problem whose conditions are built into the space without data")
+        self.relax, self.gamma, self.relax_info = relax, 1.0, None
+        self._relax = None if relax is None else _Relax(relax, unknown, self.V, solver, tol, maxiter, rtime, conserved, "IRK")
+
+    def _finish_relaxed(self, info):
+        """The time after a relaxed step whose Newton iteration converged (raises when no gamma was found)."""
+        return self._relax.accept(self, info._relax_tuple)
 
     # ---- the semi-discrete right-hand side in the coefficients c of V --------------------------
     def _full(self, t, c):
@@ -577,8 +606,9 @@ class IRK:
         K.symmetric = False
         return Matrix(K, self.P.periodic, self.P)
 
-    def step(self, u, dt=None):
-        """Advance u by one step, in place, and irk.t by dt.  Returns the NewtonInfo.
+    def step(self, u, dt=None, relax=True):
+        """Advance u by one step, in place, and irk.t by dt (by gamma dt with relaxation).  Returns the
+        NewtonInfo.  relax=False takes this one step without relaxation.
 
         u is a Function (or array) of M's space, or of V.unconstrained when boundary data are given."""
         from .forms import Function, ProductFunction
@@ -601,8 +631,9 @@ class IRK:
         # stage Jacobian lives in the product numbering, so the solver converts both ways
         to_P = lambda Ks: self._gather(np.split(np.asarray(Ks, dtype=np.float64), self.s))        # noqa: E731
         to_stacked = lambda Kp: np.concatenate(self._split(Kp))                                   # noqa: E731
+        R = self._relax if relax else None
         run = lambda solve: _step_core(self._core, cn, self.t, self.dt, self._F, self.M._K, solve,   # noqa: E731
-                                       to_stacked(self.K))
+                                       to_stacked(self.K), R)
         if self.newton == "exact":
             def solve(Ks, r):
                 self.factorizations += 1
@@ -632,11 +663,11 @@ class IRK:
                                f" after {info.iterations} iterations{' (' + info.message + ')' if info.message else ''}; "
                                "reduce dt, raise maxiter, or loosen tol")
         self.K = to_P(self._core.stages)
-        self.t += self.dt
+        self.history.append(info.iterations)
+        self.t = self._finish_relaxed(info) if R is not None else self.t + self.dt
         vec[:] = self._full(self.t, cn)                                   # cn now holds c^{n+1}
         if self.time is not None:
             self.time.assign(self.t)
-        self.history.append(info.iterations)
         return info
 
     def _stale(self, iterations, fresh):
@@ -659,6 +690,8 @@ class IRK:
 
     def __repr__(self):
         extra = ", boundary data" if self.lifted else ""
+        if self._relax is not None:
+            extra += f", relaxed ({self._relax.solver})"
         return f"IRK({self.method}, dt={self.dt:g}, t={self.t:g}, newton={self.newton}{extra}, on {self.V!r})"
 
 
@@ -831,7 +864,8 @@ class _IRK2D(IRK):
 
     def __init__(self, M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0,
                  dirichlet=None, left=None, right=None, newton="simplified", tol=1e-12, rtol=0.0, xtol=1e-12, maxiter=20,
-                 line_search=False, backend="Auto", refresh="auto"):
+                 line_search=False, backend="Auto", refresh="auto", relax=None, relax_solver="auto", relax_tol=1e-14,
+                 relax_maxiter=20, relax_time="idt", relax_conserved=False):
         from . import Form
         from .sparse import SparseMatrix
         from .forms import Function
@@ -882,6 +916,7 @@ class _IRK2D(IRK):
                                     "lift's time derivative), not as an assembled SparseMatrix")
                 self._hold = Function(self.U, "_irk_lift_rate", _infer=False)
                 self._Mact = Mform.action(self._hold)
+        self._init_relax(relax, unknown, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved)
 
     # ---- the semi-discrete right-hand side in the coefficients c of V --------------------------
     def _full(self, t, c):
@@ -964,8 +999,9 @@ class _IRK2D(IRK):
         k = np.asarray(self._Msolver._solve_array(np.ascontiguousarray(F)), dtype=np.float64)
         return k if np.all(np.isfinite(k)) else np.zeros(self.n)
 
-    def step(self, u, dt=None):
-        """Advance u by one step, in place, and irk.t by dt.  Returns the NewtonInfo.
+    def step(self, u, dt=None, relax=True):
+        """Advance u by one step, in place, and irk.t by dt (by gamma dt with relaxation).  Returns the
+        NewtonInfo.  relax=False takes this one step without relaxation.
 
         u is a Function (ProductFunction, VectorFunction) or array of M's space, or of V.unconstrained
         when dirichlet= is given."""
@@ -987,8 +1023,9 @@ class _IRK2D(IRK):
         if self.K is None:
             self.K = np.tile(self._k0(cn), self.s)
         # the stage iteration runs in C++ (ImplicitRK); Python supplies f, M and the stage solver
+        R = self._relax if relax else None
         solve_with = lambda S: _step_core(self._core, cn, self.t, self.dt, self._F, self.M._K,     # noqa: E731
-                                          lambda K, r: np.asarray(S(K).solve(r), dtype=np.float64), self.K)
+                                          lambda K, r: np.asarray(S(K).solve(r), dtype=np.float64), self.K, R)
         if self.newton == "exact":
             def J(K):
                 self.factorizations += 1
@@ -1013,15 +1050,17 @@ class _IRK2D(IRK):
                                f" after {info.iterations} iterations{' (' + info.message + ')' if info.message else ''}; "
                                "reduce dt, raise maxiter, or loosen tol")
         self.K = self._core.stages
-        self.t += self.dt
+        self.history.append(info.iterations)
+        self.t = self._finish_relaxed(info) if R is not None else self.t + self.dt
         vec[:] = self._full(self.t, cn)                                   # cn now holds c^{n+1}
         if self.time is not None:
             self.time.assign(self.t)
-        self.history.append(info.iterations)
         return info
 
     def __repr__(self):
         extra = ", boundary data" if self.lifted else ""
+        if self._relax is not None:
+            extra += f", relaxed ({self._relax.solver})"
         return f"IRK({self.method}, dt={self.dt:g}, t={self.t:g}, newton={self.newton}{extra}, on {self.V!r})"
 
 
@@ -1054,10 +1093,14 @@ class SSPRK:
       fd.TVBLimiter.
     time: an fd.Constant in the forms, set to the time of each stage; t0 the initial time.
     unknown: which Function of the Forms is the unknown, when they have more than one.
-    backend: the solver backend for M (Auto measures it)."""
+    backend: the solver backend for M (Auto measures it).
+    relax, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved: relaxation (RRK), as
+      in ERK, for order 2 or more and without a limiter (a limiter changes the step after its
+      stages).  rk.gamma and rk.relax_info report the last step."""
 
     def __init__(self, M, rhs, dt, order: int = 3, stages=None, *, limiter=None, unknown=None, time=None,
-                 t0=0.0, backend="Auto"):
+                 t0=0.0, backend="Auto", relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20,
+                 relax_time="idt", relax_conserved=False):
         from . import Matrix, Form
         from .sparse import SparseMatrix
         if isinstance(M, Form):
@@ -1084,6 +1127,15 @@ class SSPRK:
             time.assign(t0)
         from . import _femd as _C
         self._core = _C.SSPRK(stages, order)                 # the stage loop in C++ (timestep/ssp_rk.hpp)
+        if relax is not None:
+            if limiter is not None:
+                raise ValueError("SSPRK: relaxation and a limiter do not go together (the limiter changes the step "
+                                 "after its stages); drop one")
+            if order == 1:
+                raise ValueError("SSPRK: relaxation needs order 2 or more; forward Euler has only the root gamma = 0")
+        self.relax, self.gamma, self.relax_info = relax, 1.0, None
+        self._relax = None if relax is None else _Relax(relax, unknown, self.V, relax_solver, relax_tol, relax_maxiter,
+                                                        relax_time, relax_conserved, "SSPRK")
 
     @property
     def solver(self):
@@ -1104,23 +1156,32 @@ class SSPRK:
         self._core.step(u0, self.t, self.dt, self.rate, self._lim if self.limiter is not None else None)
         return u0
 
-    def step(self, u, dt=None):
-        """Advance u by one step, in place, and rk.t by dt.  u is a Function, a ProductFunction or
-        an array of M's space."""
+    def step(self, u, dt=None, relax=True):
+        """Advance u by one step, in place, and rk.t by dt (by gamma dt with relaxation).  u is a
+        Function, a ProductFunction or an array of M's space.  relax=False takes this one step
+        without relaxation."""
         if dt is not None:
             self.dt = float(dt)
         vec = u.vector if hasattr(u, "vector") else u
         if np.size(vec) != self.V.dim:
             raise ValueError(f"SSPRK: u has {np.size(vec)} coefficients, M's space has {self.V.dim}")
-        vec[:] = self._advance(np.array(vec, dtype=np.float64).reshape(-1))
-        self.t += self.dt
+        if self._relax is not None and relax:
+            R = self._relax
+            u0 = np.array(vec, dtype=np.float64).reshape(-1)
+            info = self._core.step_relaxed(u0, self.t, self.dt, self.rate, R.E, R.eta, R.deta, *R.options)
+            self.t = R.accept(self, info)
+            vec[:] = u0
+        else:
+            vec[:] = self._advance(np.array(vec, dtype=np.float64).reshape(-1))
+            self.t += self.dt
         if self.time is not None:
             self.time.assign(self.t)
         return u
 
     def __repr__(self):
         lim = f", limiter={self.limiter!r}" if self.limiter is not None else ""
-        return f"SSPRK({self.method}, dt={self.dt:g}, t={self.t:g}{lim}, on {self.V!r})"
+        rx = f", relaxed ({self._relax.solver})" if self._relax is not None else ""
+        return f"SSPRK({self.method}, dt={self.dt:g}, t={self.t:g}{lim}{rx}, on {self.V!r})"
 
 
 class _KrylovMass:
@@ -1198,6 +1259,80 @@ class _KrylovMass:
 _KRYLOV = ("cg", "gmres", "lgmres")
 
 
+class _Relax:
+    """The entropy and options of a relaxed step (RRK), shared by ERK, SSPRK and IRK.
+
+    relax: a symmetric Matrix or SparseMatrix, or a constant rank-2 Form, E (eta = 1/2 u^T E u, applied
+    in C++); a rank-0 Form in the unknown (its derivative by the complex step); a pair (eta, grad) of
+    callables; or a callable eta alone, an entropy conserved by f.  E, eta, deta are what the C++
+    step_relaxed takes, options its (solver, tol, maxiter, conserved)."""
+
+    def __init__(self, relax, unknown, V, solver, tol, maxiter, rtime, conserved, who):
+        from . import Matrix, Form
+        from .sparse import SparseMatrix
+        self.who = who
+        solver = str(solver).lower()
+        if solver not in ("auto", "newton", "secant", "brent"):
+            raise ValueError(f"{who}: relax_solver must be 'auto', 'newton', 'secant' or 'brent', got {solver!r}")
+        if rtime not in ("idt", "fixed"):
+            raise ValueError(f"{who}: relax_time must be 'idt' or 'fixed', got {rtime!r}")
+        if not (float(tol) > 0) or int(maxiter) < 1:
+            raise ValueError(f"{who}: relax_tol must be > 0 and relax_maxiter >= 1")
+        self.solver, self.tol, self.maxiter, self.time = solver, float(tol), int(maxiter), rtime
+        self.conserved = bool(conserved)
+        self.E = self.eta = self.deta = None
+        n = V.dim if V is not None else None
+        E = relax
+        if isinstance(E, Form) and E.rank == 2:
+            if not E.constant:
+                raise TypeError(f"{who}: relax= as a rank-2 Form must not contain Functions or Constants (E is fixed)")
+            E = E.assemble()
+        if isinstance(E, (Matrix, SparseMatrix)):
+            if n is not None and E.shape != (n, n):
+                raise ValueError(f"{who}: relax= is {E.shape[0]} x {E.shape[1]}, the space has dim {n}")
+            self.E = E._K                                        # eta = 1/2 u^T E u, applied in C++
+        elif isinstance(relax, Form):
+            if relax.rank != 0:
+                raise TypeError(f"{who}: relax= as a Form must be a functional (rank 0) or a constant bilinear form (rank 2)")
+            name = _Rhs._unknown(relax, unknown)
+            if name is None:
+                raise ValueError(f"{who}: the entropy functional does not contain the unknown")
+            h = 1e-20
+            self.eta = lambda v: float(relax.assemble(**{name: v}))
+            self.deta = lambda v, w: float(np.imag(relax.assemble(**{name: v + (1j * h) * w}))) / h
+        elif isinstance(relax, (tuple, list)):
+            if len(relax) != 2 or not (callable(relax[0]) and callable(relax[1])):
+                raise TypeError(f"{who}: relax= as a pair must be (eta, grad), two callables")
+            from . import ddot
+            eta, grad = relax
+            self.eta = lambda v: float(eta(v))
+            self.deta = lambda v, w: ddot(np.ascontiguousarray(grad(v), dtype=np.float64), w)
+        elif callable(relax):
+            if solver == "newton":
+                raise ValueError(f"{who}: relax_solver='newton' needs the derivative of the entropy; give relax=(eta, grad), "
+                                 "a functional Form or a matrix")
+            self.eta = lambda v: float(relax(v))
+        else:
+            raise TypeError(f"{who}: relax= must be a Matrix, SparseMatrix, Form, callable or (eta, grad), got {type(relax).__name__}")
+
+    @property
+    def options(self):
+        return (self.solver, self.tol, self.maxiter, self.conserved)
+
+    def accept(self, stepper, info):
+        """Record the relaxation tuple of a step on the stepper (gamma, relax_info) and return its new
+        time; raise when no gamma was found (u is then unchanged)."""
+        g, its, ok, used, res, prod, msg = info
+        stepper.relax_info = RelaxInfo(g, its, ok, used, res, prod, msg)
+        if not ok:
+            if getattr(stepper, "time", None) is not None:
+                stepper.time.assign(stepper.t)
+            raise RuntimeError(f"{self.who}: no relaxation parameter at t = {stepper.t:g}, dt = {stepper.dt:g} ({msg}); "
+                               "u is unchanged.  Reduce dt, or take the step with step(u, relax=False)")
+        stepper.gamma = g
+        return stepper.t + (g * stepper.dt if self.time == "idt" else stepper.dt)
+
+
 class ERK:
     """An explicit Runge-Kutta stepper for non-stiff systems  M u' = f(t, u), the stage loop in C++.
 
@@ -1225,12 +1360,29 @@ class ERK:
       "ilu0", None, or a preconditioner object), tol (1e-12), maxiter, restart and k_aug (GMRES,
       LGMRES) and warm_start (True).  rk.solver.iterations lists the iterations of every solve.
 
+    relax: an entropy for relaxation (RRK), which makes every step conserve it, or change it by
+      exactly dt sum b_i <eta'(U_i), k_i>, and advances the time by gamma dt with gamma = 1 + O(dt^(p-1)):
+        * a symmetric Matrix, SparseMatrix or constant rank-2 Form E: eta(u) = 1/2 u^T E u, gamma
+          in closed form;
+        * a rank-0 Form (a functional) in the unknown: its derivative by the complex step;
+        * a pair of callables (eta, grad), eta(U) a float and grad(U) the gradient array;
+        * a callable eta alone: an entropy that f conserves (no derivative needed).
+    relax_solver: the root of the relaxation equation, "auto" (closed form for a quadratic entropy,
+      Newton when the derivative is known, else the secant method, Brent when they fail), "newton",
+      "secant" or "brent".  relax_tol (on gamma) and relax_maxiter bound the iteration.
+    relax_time: "idt" (default, t += gamma dt, the order of the method kept) or "fixed" (t += dt,
+      the relaxation as a projection, one order lower).
+    relax_conserved: True takes the entropy as conserved by f, so each step returns it to its old
+      value whatever error the stages carry (here the tolerance of a Krylov mass solve).  The
+      method needs order 2 or more (forward Euler cannot be relaxed).
+
     An explicit method is stable only for dt below a limit set by the fastest mode of M^{-1} f
     (a CFL condition for hyperbolic problems, dt ~ h^2 for diffusion).  For stiff problems use
     IRK (Radau IIA), and SSPRK when a limiter or a strong-stability property is needed."""
 
     def __init__(self, M, rhs, dt, method="rk4", *, unknown=None, time=None, t0=0.0, backend="Auto",
-                 solver_options=None):
+                 solver_options=None, relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20,
+                 relax_time="idt", relax_conserved=False):
         from . import _femd as _C
         from . import Matrix, Form
         from .sparse import SparseMatrix
@@ -1295,6 +1447,11 @@ class ERK:
         self.time, self.t = time, float(t0)
         if time is not None:
             time.assign(t0)
+        if relax is not None and self.order == 1:
+            raise ValueError("ERK: relaxation needs a method of order 2 or more; forward Euler has only the root gamma = 0")
+        self.relax, self.gamma, self.relax_info = relax, 1.0, None
+        self._relax = None if relax is None else _Relax(relax, unknown, self.V, relax_solver, relax_tol, relax_maxiter,
+                                                        relax_time, relax_conserved, "ERK")
 
     @property
     def solver(self):
@@ -1312,9 +1469,10 @@ class ERK:
             return self._Minv(r)
         return np.asarray(self._Minv.solve(r), dtype=np.float64)
 
-    def step(self, u, dt=None):
-        """Advance u by one step, in place, and rk.t by dt.  u is a Function, a ProductFunction or a
-        float64 array (of M's space).  Returns u."""
+    def step(self, u, dt=None, relax=True):
+        """Advance u by one step, in place, and rk.t by dt (by gamma dt with relaxation, see rk.gamma
+        and rk.relax_info).  u is a Function, a ProductFunction or a float64 array (of M's space).
+        relax=False takes this one step without relaxation, to land on a given time.  Returns u."""
         if dt is not None:
             self.dt = float(dt)
         vec = u.vector if hasattr(u, "vector") else u
@@ -1322,12 +1480,39 @@ class ERK:
             raise TypeError("ERK.step: u must be a Function, a ProductFunction or a contiguous float64 array")
         if self.V is not None and vec.size != self.V.dim:
             raise ValueError(f"ERK: u has {vec.size} coefficients, M's space has {self.V.dim}")
-        self._rk.step(vec, self.t, self.dt, self._f, self._Minv)
-        self.t += self.dt
+        if self._relax is not None and relax:
+            R = self._relax
+            info = self._rk.step_relaxed(vec, self.t, self.dt, self._f, self._Minv, R.E, R.eta, R.deta, *R.options)
+            self.t = R.accept(self, info)
+        else:
+            self._rk.step(vec, self.t, self.dt, self._f, self._Minv)
+            self.t += self.dt
         if self.time is not None:
             self.time.assign(self.t)
         return u
 
     def __repr__(self):
         on = f" on {self.V!r}" if self.V is not None else ""
-        return f"ERK({self.method}, order {self.order}, {self.stages} stages, dt={self.dt:g}, t={self.t:g}{on})"
+        rx = f", relaxed ({self._relax.solver})" if self._relax is not None else ""
+        return f"ERK({self.method}, order {self.order}, {self.stages} stages, dt={self.dt:g}, t={self.t:g}{rx}{on})"
+
+
+class RelaxInfo:
+    """The report of a relaxed ERK step (rk.relax_info).
+
+    gamma: the relaxation parameter.  iterations: of the root solver (entropy evaluations for
+    Brent).  converged: bool.  solver: "closed form", "newton", "secant" or "brent", the method
+    that produced gamma.  residual: |r(gamma)|.  production: dt sum b_i <eta'(U_i), k_i>, so the
+    entropy changed by gamma * production in the step (0 for a conserved entropy).  message: why
+    it failed, empty on success."""
+
+    __slots__ = ("gamma", "iterations", "converged", "solver", "residual", "production", "message")
+
+    def __init__(self, gamma, iterations, converged, solver, residual, production, message):
+        self.gamma, self.iterations, self.converged, self.solver = gamma, iterations, converged, solver
+        self.residual, self.production, self.message = residual, production, message
+
+    def __repr__(self):
+        st = "converged" if self.converged else f"FAILED: {self.message}"
+        return (f"RelaxInfo(gamma={self.gamma:.16g}, {self.solver}, {self.iterations} iterations, "
+                f"|r|={self.residual:.2e}, {st})")

@@ -242,6 +242,37 @@ static KOp as_precon(nb::handle M, std::size_t n)
     return callable_op(nb::cast<nb::callable>(M), n, "krylov preconditioner");
 }
 
+// The entropy of a relaxed step (timestep/relaxation.hpp): E (an AssembledMatrix, CSRMatrix or callable,
+// eta = 1/2 v.E v), or eta(v) with deta(v, w) = <eta'(v), w> or None.
+static Entropy make_entropy(nb::handle E, nb::handle eta, nb::handle deta, std::size_t n)
+{
+    Entropy H;
+    if (!E.is_none()) { H.E = as_operator(E, n); return H; }
+    if (eta.is_none()) throw std::invalid_argument("relaxation: give E or eta");
+    nb::callable fe = nb::cast<nb::callable>(eta);
+    H.eta = [fe](const std::vector<double> &v) { return nb::cast<double>(fe(to_np(v))); };
+    if (!deta.is_none())
+    {
+        nb::callable fd = nb::cast<nb::callable>(deta);
+        H.deta = [fd](const std::vector<double> &v, const std::vector<double> &w) { return nb::cast<double>(fd(to_np(v), to_np(w))); };
+    }
+    return H;
+}
+
+static RelaxOptions make_relax_options(const std::string &solver, double tol, int maxiter, bool conserved)
+{
+    RelaxOptions o;
+    o.solver = relax_solver(solver); o.tol = tol; o.maxiter = maxiter; o.conserved = conserved;
+    return o;
+}
+
+// (gamma, iterations, converged, solver used, |r(gamma)|, dt e, message)
+static nb::tuple relax_tuple(const RelaxInfo &I)
+{
+    return nb::make_tuple(I.gamma, I.iterations, I.converged, std::string(relax_solver_name(I.solver)), I.residual, I.production,
+                          I.message);
+}
+
 void bind_2d(nb::module_ &m);     // femd_bindings_2d.cpp
 
 NB_MODULE(_femd, m)
@@ -822,7 +853,32 @@ NB_MODULE(_femd, m)
                  std::copy(uv.begin(), uv.end(), u.data());
              }, "u"_a, "t"_a, "dt"_a, "f"_a, "Minv"_a.none(),
              "One step in place: u <- u + dt sum b_i k_i, k_i = M^{-1} f(t + c_i dt, U_i).  Minv: None (M = I), a "
-             "LinearSolver (the factored mass matrix, applied in C++) or a callable r -> M^{-1} r.");
+             "LinearSolver (the factored mass matrix, applied in C++) or a callable r -> M^{-1} r.")
+        .def("step_relaxed",
+             [](ExplicitRK &rk, Vec u, double t, double dt, nb::callable f, nb::handle Minv, nb::handle E, nb::handle eta,
+                nb::handle deta, const std::string &solver, double tol, int maxiter, bool conserved) {
+                 const std::size_t n = u.shape(0);
+                 KOp Mop = as_precon(Minv, n);
+                 std::vector<double> uv(u.data(), u.data() + n), fb;
+                 auto rate = [&](double tt, const std::vector<double> &U, std::vector<double> &k) {
+                     nb::object r = f(tt, to_np(U));
+                     DArr a = nb::cast<DArr>(r);
+                     if (a.shape(0) != n) throw std::invalid_argument("ExplicitRK: f(t, U) returned the wrong length");
+                     fb.assign(a.data(), a.data() + n);
+                     Mop(fb, k);
+                 };
+                 Entropy H = make_entropy(E, eta, deta, n);
+                 RelaxInfo I = rk.step_relaxed(uv, t, dt, rate, H, make_relax_options(solver, tol, maxiter, conserved));
+                 if (I.converged) std::copy(uv.begin(), uv.end(), u.data());
+                 return relax_tuple(I);
+             },
+             "u"_a, "t"_a, "dt"_a, "f"_a, "Minv"_a.none(), "E"_a.none(), "eta"_a.none(), "deta"_a.none(), "solver"_a = "auto",
+             "tol"_a = 1e-14, "maxiter"_a = 20, "conserved"_a = false,
+             "One relaxed step (RRK) in place: u <- u + gamma dt sum b_i k_i, gamma the root of eta(u + gamma dt d) = "
+             "eta(u) + gamma dt sum b_i <eta'(U_i), k_i> (that sum taken as 0 with conserved=True).  The entropy: E (an "
+             "AssembledMatrix, CSRMatrix or callable, symmetric: eta = 1/2 v.E v), or eta(v) with deta(v, w) = <eta'(v), w> "
+             "(None: eta conserved).  solver: auto, newton, secant, brent.  u is left unchanged when no gamma is found.  "
+             "Returns (gamma, iterations, converged, solver used, |r(gamma)|, dt e, message).");
     // ---- compiled integrands ---------------------------------------------------------
     nb::class_<Integrand>(m, "Integrand",
             "The coefficient of a form as a short program over registers, evaluated at all quadrature points in C++ "
@@ -965,7 +1021,29 @@ NB_MODULE(_femd, m)
                  }
                  std::copy(uv.begin(), uv.end(), u.data());
              }, "u"_a, "t"_a, "dt"_a, "rate"_a, "limiter"_a.none() = nb::none(),
-             "One step in place.  rate(t, u) -> M^{-1} f(t, u); limiter(u) -> u, applied to every stage value, or None.");
+             "One step in place.  rate(t, u) -> M^{-1} f(t, u); limiter(u) -> u, applied to every stage value, or None.")
+        .def_prop_ro("weights", [](const SSPRK &rk) { return to_np(rk.weights()); }, nb::rv_policy::move,
+                     "The Butcher weights b, in the order the stages are evaluated.")
+        .def("step_relaxed",
+             [](SSPRK &rk, Vec u, double t, double dt, nb::callable rate, nb::handle E, nb::handle eta, nb::handle deta,
+                const std::string &solver, double tol, int maxiter, bool conserved) {
+                 const std::size_t n = u.shape(0);
+                 std::vector<double> uv(u.data(), u.data() + n);
+                 auto r = [&](double tt, const std::vector<double> &U, std::vector<double> &k) {
+                     nb::object o = rate(tt, to_np(U));
+                     DArr a = nb::cast<DArr>(o);
+                     if (a.shape(0) != n) throw std::invalid_argument("SSPRK: rate(t, u) returned the wrong length");
+                     k.assign(a.data(), a.data() + n);
+                 };
+                 Entropy H = make_entropy(E, eta, deta, n);
+                 RelaxInfo I = rk.step_relaxed(uv, t, dt, r, H, make_relax_options(solver, tol, maxiter, conserved));
+                 if (I.converged) std::copy(uv.begin(), uv.end(), u.data());
+                 return relax_tuple(I);
+             },
+             "u"_a, "t"_a, "dt"_a, "rate"_a, "E"_a.none(), "eta"_a.none(), "deta"_a.none(), "solver"_a = "auto", "tol"_a = 1e-14,
+             "maxiter"_a = 20, "conserved"_a = false,
+             "One relaxed step (RRK) in place, no limiter; the entropy and options as in ExplicitRK.step_relaxed.  "
+             "Returns (gamma, iterations, converged, solver used, |r(gamma)|, dt e, message).");
     // ---- implicit Runge-Kutta ------------------------------------------------------
     m.def("implicit_tableau", [](const std::string &name, int stages) {
               ImplicitTableau T = ImplicitTableau::named(name, stages);
@@ -1031,7 +1109,40 @@ NB_MODULE(_femd, m)
              "One step in place when Newton converges (u is left alone otherwise).  f(t, U) -> array; M an AssembledMatrix, "
              "a CSRMatrix or a callable K -> M K; solve(K, r) -> array, the approximate inverse of the stage Jacobian at the "
              "stages K applied to r; k0 the first iterate for the stages (default: the last step's, or zero).  Returns "
-             "(converged, iterations, residuals, steps, message).");
+             "(converged, iterations, residuals, steps, message).")
+        .def("step_relaxed",
+             [](ImplicitRK &rk, Vec u, double t, double dt, nb::callable f, nb::handle M, nb::callable solve, nb::handle k0,
+                nb::handle E, nb::handle eta, nb::handle deta, const std::string &solver, double tol, int maxiter, bool conserved) {
+                 const std::size_t n = u.shape(0);
+                 KOp Mop = as_operator(M, n);
+                 std::vector<double> uv(u.data(), u.data() + n);
+                 auto residual = [&](double tt, const std::vector<double> &U, std::vector<double> &out) {
+                     nb::object r = f(tt, to_np(U));
+                     DArr a = nb::cast<DArr>(r);
+                     if (a.shape(0) != n) throw std::invalid_argument("ImplicitRK: f(t, U) returned the wrong length");
+                     out.assign(a.data(), a.data() + n);
+                 };
+                 auto stage_solve = [&](const std::vector<double> &K, const std::vector<double> &r, std::vector<double> &d) {
+                     nb::object x = solve(to_np(K), to_np(r));
+                     DArr a = nb::cast<DArr>(x);
+                     d.assign(a.data(), a.data() + a.shape(0));
+                 };
+                 std::vector<double> K0;
+                 if (!k0.is_none()) K0 = to_vec(nb::cast<DArr>(k0));
+                 Entropy H = make_entropy(E, eta, deta, n);
+                 RelaxInfo I;
+                 NewtonReport rep = rk.step_relaxed(uv, t, dt, residual, Mop, stage_solve, H,
+                                                    make_relax_options(solver, tol, maxiter, conserved), I, K0);
+                 if (rep.converged && I.converged) std::copy(uv.begin(), uv.end(), u.data());
+                 return nb::make_tuple(rep.converged, rep.iterations, to_np(rep.residuals), to_np(rep.steps), rep.message,
+                                       relax_tuple(I));
+             },
+             "u"_a, "t"_a, "dt"_a, "f"_a, "M"_a, "solve"_a, "k0"_a.none() = nb::none(), "E"_a.none() = nb::none(),
+             "eta"_a.none() = nb::none(), "deta"_a.none() = nb::none(), "solver"_a = "auto", "tol"_a = 1e-14, "maxiter"_a = 20,
+             "conserved"_a = false,
+             "step() followed by the relaxation (RRK) of the converged stages: u <- u + gamma dt sum b_i K_i.  u is changed "
+             "only when Newton converges and gamma is found.  Returns the tuple of step() with the relaxation tuple "
+             "(gamma, iterations, converged, solver used, |r(gamma)|, dt e, message) appended.");
     m.def("csnewton",
           [](nb::callable F, nb::handle M, DArr x0, int max_newton, double tol, double h, int restart,
              int gmres_max_iter, double gmres_tol, bool lgmres, int k_aug)

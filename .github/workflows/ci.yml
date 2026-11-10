@@ -67,7 +67,8 @@ jobs:
             python -m jupyter nbconvert --to notebook --execute "$nb" --output-dir /tmp/nb --ExecutePreprocessor.timeout=1200
           done
 
-  # Pushing a tag such as v0.1.0 makes a GitHub release with the CHANGELOG entry, once the builds pass.
+  # Pushing a tag such as v0.1.0 makes a GitHub release, once the builds pass. Its notes are
+  # .github/release-notes.md, the CHANGELOG entry of this version written there by release.sh.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build, openmp]
@@ -76,11 +77,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Check the tag against the version and take the notes from CHANGELOG.md
+      - name: Check the tag against the version and take the release notes
         run: |
           V=$(sed -n 's/^#define FEMD_VERSION "\(.*\)"/\1/p' include/femd/version.hpp)
           test "v$V" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, but version.hpp says $V"; exit 1; }
-          awk -v v="## $V " 'index($0, v) == 1 {f = 1; next} /^## / {f = 0} f' CHANGELOG.md > notes.md
+          if [ -s .github/release-notes.md ]; then cp .github/release-notes.md notes.md; else echo "FEMd $V" > notes.md; fi
           cat notes.md
       - uses: softprops/action-gh-release@v2
         with:

@@ -10,9 +10,15 @@
 //  Methods (stages, order): (1,1) forward Euler, (2,2) Heun, (3,3) Shu-Osher, (4,3) with the
 //  SSP coefficient 2, and (10,4), Ketcheson's low-storage method with SSP coefficient 6.
 //
+//  step_relaxed() is the relaxation (RRK) version of a step without a limiter (relaxation.hpp):
+//  the stages are those of step(), recorded with the Butcher weights b of each method, and the
+//  new value is u + gamma dt sum_i b_i k_i.  A limiter would change the step after the stages,
+//  so the two do not go together.
+//
 #ifndef FEMD_TIMESTEP_SSP_RK_HPP
 #define FEMD_TIMESTEP_SSP_RK_HPP
 
+#include "femd/timestep/relaxation.hpp"
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -113,9 +119,45 @@ public:
         }
     }
 
+    /// @brief The Butcher weights b of the method, in the order step() evaluates its stages.
+    std::vector<double> weights() const
+    {
+        switch (key())
+        {
+        case 11: return {1.0};
+        case 22: return {0.5, 0.5};
+        case 33: return {1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0};
+        case 43: return {1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 0.5};
+        default: return std::vector<double>(10, 0.1);
+        }
+    }
+
+    /**
+     * @brief One relaxed step (RRK), no limiter: u <- u + gamma dt sum_i b_i k_i.  The caller advances
+     *        the time by info.gamma * dt; u is left alone when info.converged is false.
+     */
+    template <class Rate>
+    RelaxInfo step_relaxed(std::vector<double> &u, double t, double dt, Rate &&rate, const Entropy &H, const RelaxOptions &opt = {})
+    {
+        const std::vector<double> b = weights();
+        relax_.begin(u.size(), H, opt);
+        w_ = u;
+        int i = 0;
+        auto recorded = [&](double tt, const std::vector<double> &U, std::vector<double> &k) {
+            rate(tt, U, k);
+            if (i >= static_cast<int>(b.size())) throw std::logic_error("SSPRK: more stages than weights");
+            if (k.size() != U.size()) throw std::invalid_argument("SSPRK: the rate returned the wrong length");
+            relax_.stage(U, k, b[static_cast<std::size_t>(i++)]);
+        };
+        step(w_, t, dt, recorded, [](std::vector<double> &) {});
+        if (i != s_) throw std::logic_error("SSPRK: the step evaluated " + std::to_string(i) + " stages, not " + std::to_string(s_));
+        return relax_.finish(u, dt);
+    }
+
 private:
     int s_, p_;
-    std::vector<double> k_, u1_, u2_, t_;
+    std::vector<double> k_, u1_, u2_, t_, w_;
+    Relaxation relax_;
     int key() const { return 10 * s_ + p_; }
 };
 

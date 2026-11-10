@@ -29,9 +29,12 @@
 //  "radau" (Radau IIA, s = 1, 2, 3, order 2s-1, L-stable, stiffly accurate, the choice for
 //  differential-algebraic systems).  Any other tableau goes in as (A, b).
 //
+//  step_relaxed() is the relaxation (RRK) version of step(), see relaxation.hpp.
+//
 #ifndef FEMD_TIMESTEP_IMPLICIT_RK_HPP
 #define FEMD_TIMESTEP_IMPLICIT_RK_HPP
 
+#include "femd/timestep/relaxation.hpp"
 #include "femd/solve/newton.hpp"
 #include "femd/util/omp.hpp"
 #include <algorithm>
@@ -207,7 +210,40 @@ public:
         return rep;
     }
 
+    /**
+     * @brief One relaxed step (RRK, relaxation.hpp): the stages as in step(), then
+     *        u <- u + gamma dt sum_i b_i K_i with gamma from the entropy H.  `info` reports the
+     *        relaxation.  u is left alone when Newton fails or no gamma is found
+     *        (info.converged false); the stages are kept in both cases.  The caller advances the
+     *        time by info.gamma * dt.
+     */
+    template <class Residual, class Mass, class Solve>
+    NewtonReport step_relaxed(std::vector<double> &u, double t, double dt, Residual &&residual, Mass &&mass, Solve &&solve,
+                              const Entropy &H, const RelaxOptions &ropt, RelaxInfo &info,
+                              const std::vector<double> &k0 = std::vector<double>())
+    {
+        const std::size_t n = u.size(), N = n * static_cast<std::size_t>(T_.s);
+        std::vector<double> K = !k0.empty() ? k0 : (K_.size() == N ? K_ : std::vector<double>(N, 0.0));
+        if (K.size() != N) throw std::invalid_argument("implicit RK: k0 must have s n values");
+        info = RelaxInfo();
+        relax_.begin(n, H, ropt);
+        NewtonReport rep = newton(u, t, dt, K, residual, mass, solve);
+        if (!rep.converged) { info.message = "the stage iteration did not converge"; return rep; }
+        K_ = K;
+        stage_values(u, dt, K, U_);
+        for (int i = 0; i < T_.s; ++i)
+        {
+            const std::size_t off = static_cast<std::size_t>(i) * n;
+            Ui_.assign(U_.begin() + static_cast<std::ptrdiff_t>(off), U_.begin() + static_cast<std::ptrdiff_t>(off + n));
+            Ki_.assign(K.begin() + static_cast<std::ptrdiff_t>(off), K.begin() + static_cast<std::ptrdiff_t>(off + n));
+            relax_.stage(Ui_, Ki_, T_.b[i]);
+        }
+        info = relax_.finish(u, dt);
+        return rep;
+    }
+
 private:
+    Relaxation relax_;
     ImplicitTableau T_;
     ImplicitRKOptions opt_;
     std::vector<double> K_;
