@@ -162,7 +162,7 @@ use `newton`.
 | `krylov_iterations` | int | Krylov iterations over all steps. |
 | `residual` | float | $\lVert F(x) \rVert_2$ at the end. |
 
-### G.6 `IRK(M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0, left=None, right=None, dirichlet=None, newton="exact", tol=1e-12, rtol=0, xtol=1e-12, maxiter=20, line_search=False, backend="Auto", refresh="auto", relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20, relax_time="idt", relax_conserved=False)`
+### G.6 `IRK(M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0, left=None, right=None, dirichlet=None, newton="exact", tol=1e-12, rtol=0, xtol=1e-12, maxiter=20, line_search=False, backend="Auto", refresh="auto", relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20, relax_time="idt", relax_conserved=False, relax_reference=None)`
 
 Implicit Runge-Kutta stepper for $M u' = f(t, u)$, with optional time-dependent
 data on the built-in boundary conditions (manual, Sections [7.6](../manual.md#76-implicit-runge-kutta-time-stepping-and-algebraic-systems) and [7.7](../manual.md#77-tolerances-round-off-and-conservation)). On a 2D mesh see [L.11](elements-2d.md#l11-irk-on-2d-meshes)
@@ -189,7 +189,7 @@ data on the built-in boundary conditions (manual, Sections [7.6](../manual.md#76
 | `line_search` | bool | `False` | Armijo backtracking in the stage solve: the Newton step is halved until the stage residual decreases. |
 | `backend` | `Solver` or name | `"Auto"` | Backend for the stage Jacobian. |
 | `refresh` | `"auto"` or int | `"auto"` | With `newton="frozen"`, when to factor anew at the next step. `"auto"`: after a step with more than `maxiter // 2` iterations, or after a step on an older factorization with more than the last new one's count plus half of it (at least 2 more). An int `k`: after a step with more than `k` iterations. The same rule in 1D and 2D. |
-| `relax`, `relax_solver`, `relax_tol`, `relax_maxiter`, `relax_time`, `relax_conserved` | as in `ERK` (G.10) | `None`, ... | Relaxation (RRK) of the converged stages, not with boundary data ([manual, Section 7.9](../manual.md#79-classical-explicit-runge-kutta)). |
+| `relax`, `relax_solver`, `relax_tol`, `relax_maxiter`, `relax_time`, `relax_conserved`, `relax_reference` | as in `ERK` (G.10) | `None`, ... | Relaxation (RRK) of the converged stages, not with boundary data ([manual, Section 7.9](../manual.md#79-classical-explicit-runge-kutta)). |
 
 **Output.** An `IRK` object.
 
@@ -230,7 +230,7 @@ data on the built-in boundary conditions (manual, Sections [7.6](../manual.md#76
 | `b` | array, length $s$ | Weights. |
 | `c` | array, length $s$ | Nodes, the row sums of `A`. |
 
-### G.8 `SSPRK(M, rhs, dt, order=3, stages=None, *, limiter=None, unknown=None, time=None, t0=0.0, backend="Auto", relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20, relax_time="idt", relax_conserved=False)`
+### G.8 `SSPRK(M, rhs, dt, order=3, stages=None, *, limiter=None, unknown=None, time=None, t0=0.0, backend="Auto", relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20, relax_time="idt", relax_conserved=False, relax_reference=None)`
 
 Explicit strong-stability-preserving Runge-Kutta stepper for $M u' = f(t, u)$
 ([manual, Section 7.8](../manual.md#78-explicit-ssp-runge-kutta-and-limiting)).
@@ -248,7 +248,7 @@ Explicit strong-stability-preserving Runge-Kutta stepper for $M u' = f(t, u)$
 | `unknown` | Function or str | `None` | Which Function of the forms is the state, when they contain more than one. |
 | `time`, `t0` | `Constant`, float | `None`, `0.0` | As for `IRK`. The Constant is set to each stage's time. |
 | `backend` | `Solver` or name | `"Auto"` | Backend for `M`. |
-| `relax`, `relax_solver`, `relax_tol`, `relax_maxiter`, `relax_time`, `relax_conserved` | as in `ERK` (G.10) | `None`, ... | Relaxation (RRK), order 2 or more and no limiter ([manual, Section 7.9](../manual.md#79-classical-explicit-runge-kutta)). |
+| `relax`, `relax_solver`, `relax_tol`, `relax_maxiter`, `relax_time`, `relax_conserved`, `relax_reference` | as in `ERK` (G.10) | `None`, ... | Relaxation (RRK), order 2 or more and no limiter ([manual, Section 7.9](../manual.md#79-classical-explicit-runge-kutta)). |
 
 **Members**
 
@@ -330,7 +330,7 @@ $\alpha \le 1$ that keeps the vertex values within the means of the triangles ar
 part. Members as for `TVBLimiter`: `lim(u)` (in place), `limit(c)` (a copy), `troubled`, and
 `alpha`, the factors of the last call.
 
-### G.10 `ERK(M, rhs, dt, method="rk4", *, unknown=None, time=None, t0=0.0, backend="Auto", solver_options=None, relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20, relax_time="idt", relax_conserved=False)`
+### G.10 `ERK(M, rhs, dt, method="rk4", *, unknown=None, time=None, t0=0.0, backend="Auto", solver_options=None, relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20, relax_time="idt", relax_conserved=False, relax_reference=None)`
 
 Explicit Runge-Kutta stepper for $M u' = f(t, u)$ ([manual, Section 7.9](../manual.md#79-classical-explicit-runge-kutta)).
 
@@ -353,6 +353,7 @@ Explicit Runge-Kutta stepper for $M u' = f(t, u)$ ([manual, Section 7.9](../manu
 | `relax_maxiter` | int | `20` | Iterations of Newton or the secant method (Brent: five times as many). |
 | `relax_time` | str | `"idt"` | `"idt"`: the time advances by $\gamma \Delta t$ (order kept). `"fixed"`: by $\Delta t$ (one order lower). |
 | `relax_conserved` | bool | `False` | Take $\sum_i b_i \langle \eta'(U_i), k_i \rangle = 0$: the entropy returns to its old value at every step, whatever error the stages carry (a Krylov tolerance here, a Newton tolerance in `IRK`). |
+| `relax_reference` | float or `None` | `None` | The value $\eta_{\mathrm{ref}}$ the entropy returns to, usually $\eta(u_0)$: $\gamma$ solves $\eta(u_n + \gamma \Delta t\, d) = \eta_{\mathrm{ref}} + \gamma \Delta t\, e$. The rounding of the entropy then does not add up from step to step. `None`: $\eta(u_n)$. Also the attribute `rk.relax_reference`, which can be set between steps. |
 
 **Raises** `ValueError` for an unknown method name or a tableau that is not
 strictly lower triangular, or whose weights do not sum to 1, or for an unknown
@@ -382,7 +383,7 @@ when `converged` is false. The caller advances the time by `gamma * dt`. The rel
 `timestep/relaxation.hpp` (`begin`, `stage(U_i, k_i, b_i)`, `finish(u, dt)`), shared with
 `SSPRK::step_relaxed(u, t, dt, rate, H, opt)` (`SSPRK::weights()` gives the Butcher weights of
 its stages) and `ImplicitRK::step_relaxed(u, t, dt, residual, mass, solve, H, opt, info, k0)`.
-`RelaxOptions::conserved` is `relax_conserved`.
+`RelaxOptions::conserved` is `relax_conserved`. `RelaxOptions::reference` is `relax_reference` (NaN when not set).
 
 ### G.10a `RelaxInfo`
 

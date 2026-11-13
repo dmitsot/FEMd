@@ -421,8 +421,8 @@ class IRK:
       M may be singular, as for Stokes and Navier-Stokes (no pressure block): use Radau IIA.
       irk.factorizations counts the sparse factorizations.
 
-    relax, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved: relaxation (RRK), as in
-      ERK: the converged stages give u^{n+1} = u^n + gamma dt sum_i b_i K_i, with the entropy conserved
+    relax, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved, relax_reference:
+      relaxation (RRK), as in ERK: the converged stages give u^{n+1} = u^n + gamma dt sum_i b_i K_i, with the entropy conserved
       or changed by exactly gamma dt sum_i b_i <eta'(U_i), K_i>, and t advanced by gamma dt.  With
       relax_conserved=True a conserved entropy returns to its old value whatever the Newton tolerance
       left in the stages.  Not with boundary data.  irk.gamma and irk.relax_info report the last step.
@@ -442,7 +442,8 @@ class IRK:
     def __init__(self, M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0,
                  left=None, right=None, dirichlet=None, newton="exact", tol=1e-12, rtol=0.0, xtol=1e-12, maxiter=20,
                  line_search=False, backend="Auto", refresh="auto", relax=None, relax_solver="auto", relax_tol=1e-14,
-                 relax_maxiter=20, relax_time="idt", relax_conserved=False):
+                 relax_maxiter=20, relax_time="idt", relax_conserved=False,
+                 relax_reference=None):
         from . import Matrix, Form, ProductSpace, Transfer
         from .forms import Function
         if dirichlet is not None:
@@ -513,14 +514,18 @@ class IRK:
                 self._to_V = lambda u: T @ u                                                             # noqa: E731
             self._Mact = Mform.action(self._hold)
             self._prolong = self.V.prolongate
-        self._init_relax(relax, unknown, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved)
+        self._init_relax(relax, unknown, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved, relax_reference)
 
-    def _init_relax(self, relax, unknown, solver, tol, maxiter, rtime, conserved):
+    def _init_relax(self, relax, unknown, solver, tol, maxiter, rtime, conserved, reference=None):
         if relax is not None and self.lifted:
             raise ValueError("IRK: relaxation with boundary data is not supported (the entropy of u_g(t) + P c changes "
                              "with the data); relax a problem whose conditions are built into the space without data")
         self.relax, self.gamma, self.relax_info = relax, 1.0, None
-        self._relax = None if relax is None else _Relax(relax, unknown, self.V, solver, tol, maxiter, rtime, conserved, "IRK")
+        self._relax = None if relax is None else _Relax(relax, unknown, self.V, solver, tol, maxiter, rtime, conserved, "IRK",
+                                                        reference)
+
+    relax_reference = property(lambda self: _get_reference(self), lambda self, value: _set_reference(self, value),
+                               doc="The value every relaxed step returns the entropy to (None: its value before the step).")
 
     def _finish_relaxed(self, info):
         """The time after a relaxed step whose Newton iteration converged (raises when no gamma was found)."""
@@ -867,7 +872,8 @@ class _IRK2D(IRK):
     def __init__(self, M, rhs, dt, method="gauss", stages=2, *, jacobian=None, unknown=None, time=None, t0=0.0,
                  dirichlet=None, left=None, right=None, newton="simplified", tol=1e-12, rtol=0.0, xtol=1e-12, maxiter=20,
                  line_search=False, backend="Auto", refresh="auto", relax=None, relax_solver="auto", relax_tol=1e-14,
-                 relax_maxiter=20, relax_time="idt", relax_conserved=False):
+                 relax_maxiter=20, relax_time="idt", relax_conserved=False,
+                 relax_reference=None):
         from . import Form
         from .sparse import SparseMatrix
         from .forms import Function
@@ -918,7 +924,7 @@ class _IRK2D(IRK):
                                     "lift's time derivative), not as an assembled SparseMatrix")
                 self._hold = Function(self.U, "_irk_lift_rate", _infer=False)
                 self._Mact = Mform.action(self._hold)
-        self._init_relax(relax, unknown, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved)
+        self._init_relax(relax, unknown, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved, relax_reference)
 
     # ---- the semi-discrete right-hand side in the coefficients c of V --------------------------
     def _full(self, t, c):
@@ -1096,13 +1102,14 @@ class SSPRK:
     time: an fd.Constant in the forms, set to the time of each stage; t0 the initial time.
     unknown: which Function of the Forms is the unknown, when they have more than one.
     backend: the solver backend for M (Auto measures it).
-    relax, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved: relaxation (RRK), as
-      in ERK, for order 2 or more and without a limiter (a limiter changes the step after its
+    relax, relax_solver, relax_tol, relax_maxiter, relax_time, relax_conserved, relax_reference:
+      relaxation (RRK), as in ERK, for order 2 or more and without a limiter (a limiter changes the step after its
       stages).  rk.gamma and rk.relax_info report the last step."""
 
     def __init__(self, M, rhs, dt, order: int = 3, stages=None, *, limiter=None, unknown=None, time=None,
                  t0=0.0, backend="Auto", relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20,
-                 relax_time="idt", relax_conserved=False):
+                 relax_time="idt", relax_conserved=False,
+                 relax_reference=None):
         from . import Matrix, Form
         from .sparse import SparseMatrix
         if isinstance(M, Form):
@@ -1137,7 +1144,10 @@ class SSPRK:
                 raise ValueError("SSPRK: relaxation needs order 2 or more; forward Euler has only the root gamma = 0")
         self.relax, self.gamma, self.relax_info = relax, 1.0, None
         self._relax = None if relax is None else _Relax(relax, unknown, self.V, relax_solver, relax_tol, relax_maxiter,
-                                                        relax_time, relax_conserved, "SSPRK")
+                                                        relax_time, relax_conserved, "SSPRK", relax_reference)
+
+    relax_reference = property(lambda self: _get_reference(self), lambda self, value: _set_reference(self, value),
+                               doc="The value every relaxed step returns the entropy to (None: its value before the step).")
 
     @property
     def solver(self):
@@ -1261,6 +1271,18 @@ class _KrylovMass:
 _KRYLOV = ("cg", "gmres", "lgmres")
 
 
+def _get_reference(stepper):
+    return None if stepper._relax is None else stepper._relax.reference
+
+
+def _set_reference(stepper, value):
+    if stepper._relax is None:
+        if value is not None:
+            raise ValueError("relax_reference needs relax= (there is no entropy to return to it)")
+        return
+    stepper._relax.reference = value
+
+
 class _Relax:
     """The entropy and options of a relaxed step (RRK), shared by ERK, SSPRK and IRK.
 
@@ -1269,7 +1291,7 @@ class _Relax:
     callables; or a callable eta alone, an entropy conserved by f.  E, eta, deta are what the C++
     step_relaxed takes, options its (solver, tol, maxiter, conserved)."""
 
-    def __init__(self, relax, unknown, V, solver, tol, maxiter, rtime, conserved, who):
+    def __init__(self, relax, unknown, V, solver, tol, maxiter, rtime, conserved, who, reference=None):
         from . import Matrix, Form
         from .sparse import SparseMatrix
         self.who = who
@@ -1282,6 +1304,7 @@ class _Relax:
             raise ValueError(f"{who}: relax_tol must be > 0 and relax_maxiter >= 1")
         self.solver, self.tol, self.maxiter, self.time = solver, float(tol), int(maxiter), rtime
         self.conserved = bool(conserved)
+        self.reference = reference
         self.E = self.eta = self.deta = None
         n = V.dim if V is not None else None
         E = relax
@@ -1318,8 +1341,21 @@ class _Relax:
             raise TypeError(f"{who}: relax= must be a Matrix, SparseMatrix, Form, callable or (eta, grad), got {type(relax).__name__}")
 
     @property
+    def reference(self):
+        """The value every relaxed step returns the entropy to, or None for its value before the step."""
+        return self._reference
+
+    @reference.setter
+    def reference(self, value):
+        if value is not None:
+            value = float(value)
+            if not np.isfinite(value):
+                raise ValueError(f"{self.who}: relax_reference must be a finite number or None, got {value!r}")
+        self._reference = value
+
+    @property
     def options(self):
-        return (self.solver, self.tol, self.maxiter, self.conserved)
+        return (self.solver, self.tol, self.maxiter, self.conserved, np.nan if self._reference is None else self._reference)
 
     def accept(self, stepper, info):
         """Record the relaxation tuple of a step on the stepper (gamma, relax_info) and return its new
@@ -1377,6 +1413,13 @@ class ERK:
     relax_conserved: True takes the entropy as conserved by f, so each step returns it to its old
       value whatever error the stages carry (here the tolerance of a Krylov mass solve).  The
       method needs order 2 or more (forward Euler cannot be relaxed).
+    relax_reference: a number eta_ref, usually eta(u_0), that takes the place of eta(u_n) in the
+      relaxation equation: gamma solves eta(u_n + gamma dt d) = eta_ref (+ gamma dt e when the
+      entropy is not conserved).  Every step then returns the entropy to the same value, so the
+      rounding of the entropy evaluations does not add up from step to step (without it each step
+      aims at the value after the step before, and a conserved entropy drifts by about one rounding
+      error per step).  u_n must already have an entropy close to eta_ref.  None (default):
+      eta(u_n).  Also an attribute, rk.relax_reference, that can be set or changed between steps.
 
     An explicit method is stable only for dt below a limit set by the fastest mode of M^{-1} f
     (a CFL condition for hyperbolic problems, dt ~ h^2 for diffusion).  For stiff problems use
@@ -1384,7 +1427,8 @@ class ERK:
 
     def __init__(self, M, rhs, dt, method="rk4", *, unknown=None, time=None, t0=0.0, backend="Auto",
                  solver_options=None, relax=None, relax_solver="auto", relax_tol=1e-14, relax_maxiter=20,
-                 relax_time="idt", relax_conserved=False):
+                 relax_time="idt", relax_conserved=False,
+                 relax_reference=None):
         from . import _femd as _C
         from . import Matrix, Form
         from .sparse import SparseMatrix
@@ -1453,7 +1497,10 @@ class ERK:
             raise ValueError("ERK: relaxation needs a method of order 2 or more; forward Euler has only the root gamma = 0")
         self.relax, self.gamma, self.relax_info = relax, 1.0, None
         self._relax = None if relax is None else _Relax(relax, unknown, self.V, relax_solver, relax_tol, relax_maxiter,
-                                                        relax_time, relax_conserved, "ERK")
+                                                        relax_time, relax_conserved, "ERK", relax_reference)
+
+    relax_reference = property(lambda self: _get_reference(self), lambda self, value: _set_reference(self, value),
+                               doc="The value every relaxed step returns the entropy to (None: its value before the step).")
 
     @property
     def solver(self):

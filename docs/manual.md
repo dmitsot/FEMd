@@ -893,6 +893,15 @@ irk = fd.IRK(M, f, dt, "gauss", 2, newton="simplified", tol=1e-6, relax=M, relax
 
 **`relax_conserved=True`** (all three steppers) takes the stage sum as zero, for an entropy that $f$ conserves. Each step then returns the entropy to its old value to rounding, whatever error the stages carry. Gauss conserves quadratic invariants only up to the Newton tolerance ([Section 7.7](#77-tolerances-round-off-and-conservation)), and an explicit method with a Krylov mass solve only up to the Krylov tolerance. With `relax_conserved=True` a loose tolerance no longer shows in the invariant. For KdV with Gauss 2, simplified Newton and `tol=1e-6`, the $L^2$ norm drifts by $7 \cdot 10^{-9}$ in 50 steps without relaxation and by $10^{-15}$ with `relax_conserved=True`. Relaxation without it gives the same $7 \cdot 10^{-9}$, as the stage sum then carries the Newton error into the target.
 
+**`relax_reference=`** (all three steppers) gives the value the entropy returns to, usually $\eta(u_0)$. Without it each step solves $\eta(u_{n+1}) = \eta(u_n)$, so it aims at the value left by the step before, and the rounding error of every entropy evaluation is carried into the next step. Over many steps these errors add up, often with one sign, and a conserved entropy drifts linearly at the level of the rounding. With `relax_reference=eta0` every step solves $\eta(u_{n+1}) = \eta_0$ (plus $\gamma \Delta t\, e$ when the entropy is not conserved), nothing is carried over, and the entropy stays within a few units of rounding of $\eta_0$ for any number of steps. For a quadratic entropy $\gamma$ is still in closed form, the root of a quadratic equation. For $u' = S \nabla\eta(u)$ with $S$ skew-symmetric, $\eta(u) = \sum_i w_i \cosh u_i$ and 3000 steps of RK4, the relative change of $\eta$ is $4 \cdot 10^{-14}$ and growing without the reference, and at most $4 \cdot 10^{-16}$ with it.
+
+```python
+eta0 = eta(u.vector)
+rk = fd.ERK(M, f, dt, "rk4", relax=(eta, grad), relax_conserved=True, relax_reference=eta0)
+```
+
+The state must already have an entropy close to the reference, since the step is brought to it whatever the distance. `rk.relax_reference` reads the value and can be set between steps, or to `None` to go back to $\eta(u_n)$.
+
 ### 7.10 Eigenproblems
 
 **`fd.eigs(a, m, k=6, sigma=0.0)`** computes the $k$ eigenpairs of $A x = \lambda M x$ nearest the shift $\sigma$, for any space in 1D or 2D. `a` and `m` are bilinear forms, their expressions, or assembled matrices, and `m=None` gives the standard problem $A x = \lambda x$, but only for a 2D `SparseMatrix`. In 1D pass a mass matrix, or the identity, as `m`.

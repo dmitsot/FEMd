@@ -24,6 +24,11 @@
 //  returns to eta(u_n) to rounding, whatever error the stages carry (a Newton tolerance in an
 //  implicit method, a Krylov tolerance in the mass solves).
 //
+//  RelaxOptions::reference, when set (not NaN), replaces eta(u_n) in r(gamma) by a given value,
+//  usually eta(u_0): every step then returns the entropy to that same value, so the rounding of
+//  the entropy evaluations does not add up over the steps as it does when each step aims at the
+//  value of the step before.  (With a production e != 0 the step aims at reference + gamma dt e.)
+//
 //  Used by ExplicitRK::step_relaxed, SSPRK::step_relaxed and ImplicitRK::step_relaxed.
 //
 #ifndef FEMD_TIMESTEP_RELAXATION_HPP
@@ -88,6 +93,7 @@ struct RelaxOptions {
     bool conserved = false;          ///< take e = 0: the entropy is conserved by f, whatever the stages say
     double tol = 1e-14;              ///< stop when |gamma_{k+1} - gamma_k| <= tol max(1, |gamma|)
     int maxiter = 20;                ///< iterations of Newton or the secant method (Brent: 5 maxiter)
+    double reference = std::numeric_limits<double>::quiet_NaN();   ///< the value the entropy returns to; NaN: eta(u_n)
 };
 
 struct RelaxInfo {
@@ -333,6 +339,7 @@ public:
         RelaxInfo I;
         I.production = dt * e;
         const double eps = std::numeric_limits<double>::epsilon();
+        const bool has_ref = !std::isnan(opt_.reference);
         bool ok = false;
         if (H.quadratic() && (opt_.solver == RelaxSolver::Auto || opt_.solver == RelaxSolver::Closed))
         {
@@ -340,6 +347,24 @@ public:
             const double dEd = dot(d_, Ev_), uEd = dot(u, Ev_);
             I.solver = RelaxSolver::Closed;
             if (dEd == 0.0) { I.gamma = 1.0; ok = true; }        // nothing moves the entropy
+            else if (has_ref)
+            {
+                // 1/2 <u,Eu> - ref + gamma dt (<u,Ed> - e) + 1/2 gamma^2 dt^2 <d,Ed> = 0: the root that
+                // tends to 2 (e - <u,Ed>) / (dt <d,Ed>) as 1/2 <u,Eu> -> ref, in the form without cancellation
+                apply_E(u, W_);
+                const double c0 = 0.5 * dot(u, W_) - opt_.reference;
+                const double B = dt * (uEd - e), A = 0.5 * dt * dt * dEd;
+                const double disc = B * B - 4.0 * A * c0;
+                if (disc < 0.0 || B == 0.0) I.message = "closed form: no real root for the reference entropy " + detail::relax_num(opt_.reference);
+                else
+                {
+                    const double q = -0.5 * (B + (B > 0.0 ? 1.0 : -1.0) * std::sqrt(disc));
+                    I.gamma = q / A;
+                    I.residual = std::abs(c0 + I.gamma * B + I.gamma * I.gamma * A);
+                    ok = detail::RelaxRoot::admissible(I.gamma);
+                    if (!ok) I.message = "closed form: gamma = " + detail::relax_num(I.gamma) + " is not a positive root (dt too large?)";
+                }
+            }
             else
             {
                 I.gamma = 2.0 * (e - uEd) / (dt * dEd);
@@ -350,7 +375,7 @@ public:
         else
         {
             const bool deriv = H.has_derivative();
-            const double eta0 = eta(u);
+            const double eta0 = has_ref ? opt_.reference : eta(u);
             W_.resize(n);
             auto trial = [&](double g) {                         // W = u + g dt d
                 const double w = g * dt;

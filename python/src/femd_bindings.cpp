@@ -268,10 +268,11 @@ static Entropy make_entropy(nb::handle E, nb::handle eta, nb::handle deta, std::
     return H;
 }
 
-static RelaxOptions make_relax_options(const std::string &solver, double tol, int maxiter, bool conserved)
+static RelaxOptions make_relax_options(const std::string &solver, double tol, int maxiter, bool conserved,
+                                       double reference = std::numeric_limits<double>::quiet_NaN())
 {
     RelaxOptions o;
-    o.solver = relax_solver(solver); o.tol = tol; o.maxiter = maxiter; o.conserved = conserved;
+    o.solver = relax_solver(solver); o.tol = tol; o.maxiter = maxiter; o.conserved = conserved; o.reference = reference;
     return o;
 }
 
@@ -865,7 +866,7 @@ NB_MODULE(_femd, m)
              "LinearSolver (the factored mass matrix, applied in C++) or a callable r -> M^{-1} r.")
         .def("step_relaxed",
              [](ExplicitRK &rk, Vec u, double t, double dt, nb::callable f, nb::handle Minv, nb::handle E, nb::handle eta,
-                nb::handle deta, const std::string &solver, double tol, int maxiter, bool conserved) {
+                nb::handle deta, const std::string &solver, double tol, int maxiter, bool conserved, double reference) {
                  const std::size_t n = u.shape(0);
                  KOp Mop = as_precon(Minv, n);
                  std::vector<double> uv(u.data(), u.data() + n), fb;
@@ -877,14 +878,15 @@ NB_MODULE(_femd, m)
                      Mop(fb, k);
                  };
                  Entropy H = make_entropy(E, eta, deta, n);
-                 RelaxInfo I = rk.step_relaxed(uv, t, dt, rate, H, make_relax_options(solver, tol, maxiter, conserved));
+                 RelaxInfo I = rk.step_relaxed(uv, t, dt, rate, H, make_relax_options(solver, tol, maxiter, conserved, reference));
                  if (I.converged) std::copy(uv.begin(), uv.end(), u.data());
                  return relax_tuple(I);
              },
              "u"_a, "t"_a, "dt"_a, "f"_a, "Minv"_a.none(), "E"_a.none(), "eta"_a.none(), "deta"_a.none(), "solver"_a = "auto",
-             "tol"_a = 1e-14, "maxiter"_a = 20, "conserved"_a = false,
+             "tol"_a = 1e-14, "maxiter"_a = 20, "conserved"_a = false, "reference"_a = std::numeric_limits<double>::quiet_NaN(),
              "One relaxed step (RRK) in place: u <- u + gamma dt sum b_i k_i, gamma the root of eta(u + gamma dt d) = "
-             "eta(u) + gamma dt sum b_i <eta'(U_i), k_i> (that sum taken as 0 with conserved=True).  The entropy: E (an "
+             "eta(u) + gamma dt sum b_i <eta'(U_i), k_i> (that sum taken as 0 with conserved=True; reference, when not NaN, "
+             "takes the place of eta(u)).  The entropy: E (an "
              "AssembledMatrix, CSRMatrix or callable, symmetric: eta = 1/2 v.E v), or eta(v) with deta(v, w) = <eta'(v), w> "
              "(None: eta conserved).  solver: auto, newton, secant, brent.  u is left unchanged when no gamma is found.  "
              "Returns (gamma, iterations, converged, solver used, |r(gamma)|, dt e, message).");
@@ -1035,7 +1037,7 @@ NB_MODULE(_femd, m)
                      "The Butcher weights b, in the order the stages are evaluated.")
         .def("step_relaxed",
              [](SSPRK &rk, Vec u, double t, double dt, nb::callable rate, nb::handle E, nb::handle eta, nb::handle deta,
-                const std::string &solver, double tol, int maxiter, bool conserved) {
+                const std::string &solver, double tol, int maxiter, bool conserved, double reference) {
                  const std::size_t n = u.shape(0);
                  std::vector<double> uv(u.data(), u.data() + n);
                  auto r = [&](double tt, const std::vector<double> &U, std::vector<double> &k) {
@@ -1045,12 +1047,12 @@ NB_MODULE(_femd, m)
                      k.assign(a.data(), a.data() + n);
                  };
                  Entropy H = make_entropy(E, eta, deta, n);
-                 RelaxInfo I = rk.step_relaxed(uv, t, dt, r, H, make_relax_options(solver, tol, maxiter, conserved));
+                 RelaxInfo I = rk.step_relaxed(uv, t, dt, r, H, make_relax_options(solver, tol, maxiter, conserved, reference));
                  if (I.converged) std::copy(uv.begin(), uv.end(), u.data());
                  return relax_tuple(I);
              },
              "u"_a, "t"_a, "dt"_a, "rate"_a, "E"_a.none(), "eta"_a.none(), "deta"_a.none(), "solver"_a = "auto", "tol"_a = 1e-14,
-             "maxiter"_a = 20, "conserved"_a = false,
+             "maxiter"_a = 20, "conserved"_a = false, "reference"_a = std::numeric_limits<double>::quiet_NaN(),
              "One relaxed step (RRK) in place, no limiter; the entropy and options as in ExplicitRK.step_relaxed.  "
              "Returns (gamma, iterations, converged, solver used, |r(gamma)|, dt e, message).");
     // ---- implicit Runge-Kutta ------------------------------------------------------
@@ -1121,7 +1123,8 @@ NB_MODULE(_femd, m)
              "(converged, iterations, residuals, steps, message).")
         .def("step_relaxed",
              [](ImplicitRK &rk, Vec u, double t, double dt, nb::callable f, nb::handle M, nb::callable solve, nb::handle k0,
-                nb::handle E, nb::handle eta, nb::handle deta, const std::string &solver, double tol, int maxiter, bool conserved) {
+                nb::handle E, nb::handle eta, nb::handle deta, const std::string &solver, double tol, int maxiter, bool conserved,
+                double reference) {
                  const std::size_t n = u.shape(0);
                  KOp Mop = as_operator(M, n);
                  std::vector<double> uv(u.data(), u.data() + n);
@@ -1141,14 +1144,14 @@ NB_MODULE(_femd, m)
                  Entropy H = make_entropy(E, eta, deta, n);
                  RelaxInfo I;
                  NewtonReport rep = rk.step_relaxed(uv, t, dt, residual, Mop, stage_solve, H,
-                                                    make_relax_options(solver, tol, maxiter, conserved), I, K0);
+                                                    make_relax_options(solver, tol, maxiter, conserved, reference), I, K0);
                  if (rep.converged && I.converged) std::copy(uv.begin(), uv.end(), u.data());
                  return nb::make_tuple(rep.converged, rep.iterations, to_np(rep.residuals), to_np(rep.steps), rep.message,
                                        relax_tuple(I));
              },
              "u"_a, "t"_a, "dt"_a, "f"_a, "M"_a, "solve"_a, "k0"_a.none() = nb::none(), "E"_a.none() = nb::none(),
              "eta"_a.none() = nb::none(), "deta"_a.none() = nb::none(), "solver"_a = "auto", "tol"_a = 1e-14, "maxiter"_a = 20,
-             "conserved"_a = false,
+             "conserved"_a = false, "reference"_a = std::numeric_limits<double>::quiet_NaN(),
              "step() followed by the relaxation (RRK) of the converged stages: u <- u + gamma dt sum b_i K_i.  u is changed "
              "only when Newton converges and gamma is found.  Returns the tuple of step() with the relaxation tuple "
              "(gamma, iterations, converged, solver used, |r(gamma)|, dt e, message) appended.");
